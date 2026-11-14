@@ -1,0 +1,47 @@
+# Copy to config.yaml and edit. Credentials are read from environment variables,
+# never from this file:  JIRA_EMAIL, JIRA_API_TOKEN, ADO_PAT
+
+jira:
+  base_url: https://yoursite.atlassian.net
+  # Must name a project or other bound. Jira rejects unbounded queries.
+  jql: "project = ABC ORDER BY key ASC"
+
+ado:
+  org_url: https://dev.azure.com/yourorg
+  project: Your Project
+  # area_path: Your Project\Team A      # default is the project root
+
+paths:
+  export_dir: ./export
+  users_file: ./users.csv
+
+# Everything below is optional. These are the defaults for the Scrum process.
+# Run "jira2ado check" after exporting to see what still needs a mapping.
+mapping:
+  types:
+    Epic: Epic
+    Story: Product Backlog Item
+    Task: Product Backlog Item
+    Bug: Bug
+    Sub-task: Task
+  default_type: Product Backlog Item
+
+  # Explicit status mappings, per ADO type. Statuses not listed here fall back
+  # to their Jira category (To Do / In Progress / Done).
+  states:
+    default:
+      # "Ready for Dev": Approved
+      # "Won't Do": Removed
+    Task: {}
+
+  priority: {Highest: 1, High: 2, Medium: 3, Low: 4, Lowest: 4}
+
+  tags:
+    labels: true
+    components: "component:"   # prefix; set to false to drop components
+    versions: "version:"       # prefix; set to false to drop fix versions
+    jira_key: true             # adds the Jira key as a tag so items are searchable
+
+  # jira_key_field: Custom.JiraKey   # if you add this field to the ADO process
+
+  history_notes: true   # Jira field changes with no ADO field are kept as history notes

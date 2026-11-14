@@ -1,0 +1,39 @@
+# Virtual environments & Python cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+*.spec
+
+# Local credentials, settings, & user identity maps (NEVER commit PII or tokens)
+.env
+.env.*
+!.env.example
+ui-settings.json
+*users*.csv
+configs/local/
+
+# Exported Jira tickets, attachments, & migration run logs
+runs/
+export/
+export-*/
+sprint*/
+pilot/
+*.jsonl
+duplicates.csv
+duplicates.json
+verify.csv
+verify-report.csv
+preview.json
+import-result.json
+import-warnings.json
+link-report.json
+
+# Archives & OS metadata
+*.zip
+.DS_Store
+Thumbs.db

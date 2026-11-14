@@ -1,0 +1,49 @@
+# Settings for each Azure DevOps project that run.sh can import into.
+# run.sh --to "<project>" uses the section with that project's name, on top of
+# configs/enterprise-development.yaml. A project with no section here gets that
+# file's mapping, with the area and iteration at the project root. The preview
+# then shows any Jira status that has no matching state in that project, and the
+# import stops before writing anything if one is left.
+#
+# confirm_with_project_name: true means you type the project's name, not "yes",
+# before anything is written. Keep it true for any project that people work in.
+
+Enterprise Development:
+  ado:
+    area_path: Enterprise Development\Fin Corp SC Merch
+    confirm_with_project_name: true
+  mapping:
+    iteration_parent: Fin Corp SC Merch    # sprints go under the team's iteration folder
+
+Digital Project - ADO - Sandbox:
+  ado:
+    area_path: null                        # project root
+    create_area: false
+    confirm_with_project_name: false       # a test project, so "yes" is enough
+  mapping:
+    iteration_parent: null                 # sprints go directly under the project's iterations
+    note_jira_status: true                 # the exact Jira status goes into the note on each item
+    points_field:
+      default: Microsoft.VSTS.Scheduling.Effort
+      Task: null
+    states:
+      default:                             # Product Backlog Item and Bug in plain Scrum
+        To Do: New
+        READY: Approved
+        Development: Committed
+        Ready for PR Review: Committed
+        PR Review: Committed
+        Ready for QA: Committed
+        QA: Committed
+        PO/BA Review: Committed
+        Done: Done
+        In Progress: Committed
+        Ready for Release to Production: Committed
+        Released to Production: Done
+        Blocked: Committed
+        In QA: Committed
+        UAT: Committed
+        Change Release Ready: Committed
+        Ready for Pre-Prod Promotion: Committed
+      Task: {To Do: To Do, READY: To Do, Development: In Progress, Ready for PR Review: In Progress, PR Review: In Progress,
+             Ready for QA: In Progress, QA: In Progress, PO/BA Review: In Progress, In Progress: In Progress, Done: Done}

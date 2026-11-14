@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jira2ado"
+version = "2.0.0"
+description = "Full-fidelity Jira Cloud to Azure DevOps migration tool with interactive browser UI"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31.0",
+    "PyYAML>=6.0.1",
+]
+
+[project.scripts]
+jira2ado = "jira2ado.cli:main"
+jira2ado-ui = "jira2ado.ui.server:main"
+
+[tool.setuptools.packages.find]
+include = ["jira2ado*"]
+
+[tool.setuptools.package-data]
+"jira2ado.ui" = ["static/*"]

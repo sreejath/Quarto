@@ -25,28 +25,27 @@ Your default browser will automatically open the Jira2ADO web interface. You can
 
 ---
 
-## 2. Credentials & Required Admin Permissions
+## 2. Credentials & Minimum Permissions
 
-### 2.1 Atlassian Jira Cloud
-1. **Atlassian URL**: Your Jira Cloud instance URL (e.g., `https://your-company.atlassian.net`).
+### 2.1 Atlassian Jira Cloud (100% Read-Only)
+1. **Atlassian URL**: Your Jira Cloud instance URL (`https://your-company.atlassian.net` — HTTPS required).
 2. **Jira Email**: The email address of your Atlassian account.
 3. **Jira API Token**: Generate one at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
-4. **Recommended Permissions**:
+4. **Permissions**:
+   - Jira2ADO is **strictly read-only on Jira** and never modifies your Jira issues.
    - **Browse Projects** & **View Development Tools** on the source Jira projects (to read issues, sprints, boards, attachments, comments, worklogs, and Git PR/branch/commit links).
-   - **Organization / Jira Admin** (recommended): Allows seeing user email addresses for automatic Azure DevOps identity matching and optional back-stamping of migrated Jira tickets (`stamp_jira_migrated`).
 
 ### 2.2 Azure DevOps Services
-1. **Azure DevOps Organization URL**: Your organization URL (e.g., `https://dev.azure.com/your-org`).
+1. **Azure DevOps Organization URL**: Your organization URL (`https://dev.azure.com/your-org` — HTTPS required).
 2. **Personal Access Token (PAT)**: Click **User Settings (top-right gear icon in ADO) → Personal access tokens → + New Token**.
-3. **Required PAT Scopes**:
-   - **Work Items**: `Read, write, & manage`
-   - **Project and Team**: `Read, write, & manage` (required to create Sprint Iterations, Area Paths, and subscribe Team Boards)
-   - **Process**: `Read, write, & manage` (optional — enables creating missing workflow states directly from the UI on Inherited processes)
-   - **Graph / User Profile**: `Read` (optional — enables automatic discovery of ADO users for assignee/author resolution)
-4. **Bypass Rules Permission (For Full History Replay & Backdated Timestamps)**:
-   - To preserve original Jira `System.CreatedDate`, `System.ChangedDate`, `System.CreatedBy`, and `System.ChangedBy` timestamps and authors across revision history, Azure DevOps uses `bypassRules=true`.
-   - Ensure your ADO Admin account has **"Bypass rules on work item updates" = Allow**:
-     1. Open **Project Settings → Permissions → Project Collection Administrators** (or your user's permissions under **Users**).
+3. **Minimum PAT Scopes**:
+   - **Work Items**: `Read & write` (required)
+   - **Project and Team**: `Read & write` (optional — needed only when auto-creating Sprint Iterations, Area Paths, and subscribing Team Boards)
+   - **Graph / User Profile**: `Read` (optional — enables automatic verification of ADO user identities for assignee/author resolution)
+4. **Bypass Rules Permission (Required for Work Item Creation & History Replay)**:
+   - Jira2ADO uses `bypassRules=true` on work item writes so that migrated items preserve their original Jira `System.CreatedDate`, `System.ChangedDate`, `Microsoft.VSTS.Common.ClosedDate`, `System.CreatedBy`, and target workflow states (including setting completed/in-progress states directly on creation when full history replay is turned off).
+   - Ensure your ADO user account has **"Bypass rules on work item updates" = Allow**:
+     1. Open **Project Settings → Permissions → Users** (or your security group).
      2. Set **Bypass rules on work item updates** to **Allow**.
 
 ---
@@ -94,7 +93,7 @@ During **Validate**, Jira2ADO checks every ticket against the destination ADO pr
 For any duplicate or existing ticket, you can choose its action **per-ticket** in the **Outcome** column or in bulk using the toolbar:
 - **Skip (`skip`)**: Do not create a new work item in ADO.
 - **Create Duplicate (`duplicate`)**: Create a new work item in ADO anyway, tag it `Possible duplicate`, and add a `Related` link to the existing ADO work item so teams can review or merge them.
-- **Sync Delta (`sync`)**: Update the existing ADO work item in place with the latest Jira status, fields, new comments, worklogs, and attachments without duplicating existing comments or attachments.
+- **Sync Delta (`sync` — exact key matches only)**: Safely update an existing ADO work item that already carries the exact Jira key with the latest Jira status, fields, new comments, worklogs, and attachments without overwriting unrelated title-matched work items.
 
 ---
 
@@ -108,7 +107,7 @@ For any duplicate or existing ticket, you can choose its action **per-ticket** i
 | **Full Changelog / Revision History** | Chronological Work Item Revisions | Replays status transitions, assignee changes, sprint moves, description edits, and unmapped field changes in time order |
 | **Worklogs & Time Tracking** | `OriginalEstimate`, `CompletedWork`, `RemainingWork` + History Notes | Converts seconds to hours and logs each worklog entry with author, timestamp, duration, and comment |
 | **Parent / Child & Epic Hierarchy** | `System.LinkTypes.Hierarchy-Reverse` | Sub-task → Story/Bug and Story → Epic/Feature links preserved (with optional out-of-sprint parent auto-fetch) |
-| **Issue Links** | `Dependency-Forward/Reverse`, `Related`, `Duplicate` | `Blocks`, `Relates`, `Clones`, and `Duplicates` links mapped to native ADO link types |
+| **Issue Links & Cross-Ticket Links** | `Dependency-Forward/Reverse`, `Related`, `Duplicate` + HTML Link Rewriting | `Blocks`, `Relates`, `Clones`, and `Duplicates` links mapped to native ADO link types; inline Jira browse URLs rewritten to ADO work item links |
 | **Confluence & Remote Web Links** | `Hyperlink` relations | Preserves linked Confluence pages, specs, and external URLs |
 | **Git PRs, Branches & Commits** | `Hyperlink` relations | Extracts GitHub, Bitbucket, and GitLab PR/branch/commit URLs from Jira's development panel |
 | **Sprints & Iterations** | `System.IterationPath` + Team Sprint Subscription | Creates missing sprint iterations with start/end dates and subscribes the target ADO team board |
@@ -116,18 +115,19 @@ For any duplicate or existing ticket, you can choose its action **per-ticket** i
 
 ---
 
-## 6. Post-Migration Verification & One-Click Rollback
+## 6. Post-Migration Verification, Idempotent Retry & Confirmed Rollback
 
-- **Automatic Verification (`verify.csv`)**: Immediately after migration, Jira2ADO reads back every migrated work item from Azure DevOps and verifies its title, state, iteration, assignee, attachment count, comment count, and links.
-- **One-Click Rollback**: If you did a test run into a sandbox project and want to undo it, click **Rollback Created Items** in the UI (or run `python -m jira2ado -c <config> rollback`) to move all work items created by that run to the Azure DevOps Recycle Bin.
+- **Automatic Verification (`verify.csv`)**: Immediately after migration, Jira2ADO reads back every migrated work item from Azure DevOps and verifies its title, state, iteration path, assignee, attachment count, comment count, and links.
+- **Idempotent Retry / Self-Healing Resume**: If a migration is stopped or encounters a network error, click **Retry / Resume Remaining**. Jira2ADO reconciles the local journal with live Azure DevOps revisions and resumes without creating duplicates.
+- **Confirmed Rollback**: If you did a test run into a sandbox project and want to undo it, click **Undo / Rollback Run** and confirm the project name to move all work items created by that run to the Azure DevOps Recycle Bin.
 
 ---
 
 ## 7. Troubleshooting Common Messages
 
 - **"Azure DevOps did not accept the access token (HTTP 203 / 401)"**:
-  - Your PAT may be expired, scoped to a different organization, or pasted twice. Create a PAT scoped to your target organization with `Work Items (Read, write, & manage)` and `Project and Team (Read, write, & manage)`.
+  - Your PAT may be expired, scoped to a different organization, or pasted twice. Create a PAT scoped to your target organization with `Work Items (Read & write)` (and `Project and Team (Read & write)` if auto-creating sprint iterations).
 - **"VS403474: You do not have permission to bypass rules"**:
-  - Grant **"Bypass rules on work item updates = Allow"** to your user in Azure DevOps Project Settings → Permissions, or uncheck **"Replay full revision history"** to import current values without rule bypass.
-- **"Ticket has an unmapped status"**:
-  - Use the **Status dropdown** in the Validation table to pick any valid state from the destination ADO project, or set up the matching state name in your ADO Process settings.
+  - Grant **"Bypass rules on work item updates = Allow"** to your user in Azure DevOps Project Settings → Permissions → Users so Jira2ADO can write historical `CreatedDate`, `ChangedDate`, `ClosedDate`, and workflow states.
+- **"★ Highlighted Statuses"**:
+  - Statuses marked with **`★ Recommended`** do not have an identically named state in the destination ADO project and are mapped to the closest matching state automatically. You can override any status using the dropdown in the Validation table, or add custom states in Azure DevOps (Organization Settings → Process) and click **Validate again**.

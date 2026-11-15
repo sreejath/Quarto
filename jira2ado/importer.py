@@ -22,17 +22,17 @@ def journal_path(cfg):
     return os.path.join(state_dir(cfg), "import-state.jsonl")
 
 
-def build_ops(rev, users, att_urls, jira_base, when, issue_url=None):
+def build_ops(rev, users, att_urls, jira_base, when, issue_url=None, key_to_ado=None, ado_edit_base=""):
     ops = []
     add = lambda path, value: ops.append({"op": "add", "path": path, "value": value})
     ident = users["ids"].get(rev["author"]) if rev["author"] else None
     for ref, val in rev["fields"].items():
         if isinstance(val, str) and "<" in val:
-            val = rewrite_html(val, att_urls, jira_base)
+            val = rewrite_html(val, att_urls, jira_base, key_to_ado=key_to_ado, ado_edit_base=ado_edit_base)
         add(f"/fields/{ref}", val)
     comment = rev["comment"]
     if comment:
-        comment = rewrite_html(comment, att_urls, jira_base)
+        comment = rewrite_html(comment, att_urls, jira_base, key_to_ado=key_to_ado, ado_edit_base=ado_edit_base)
         if rev["author"] and not ident:
             comment = f"<div><i>Jira author: {esc(rev['author_name'] or rev['author'])}</i></div>" + comment
         add("/fields/System.History", comment)
@@ -225,57 +225,108 @@ def mark_possible_duplicate(rev, matches, ado):
     return out
 
 
-def sync_existing_item(ado, item_id, plan, supported, cfg, users, journal, base, planner, log=print):
-    """Delta Sync (Golden Quadrant #4): update an existing ADO work item with the latest Jira state,
-    new attachments, and a delta sync note."""
+def _create_item_idempotent(ado, wit, ops, key, title, key_ref):
+    """Create a work item in ADO, checking by exact Jira key if a transient server error occurred
+    after the item was already created on the server so retries never produce duplicates."""
+    finder = getattr(ado, "find_duplicates", None)
+    try:
+        return ado.create_item(wit, ops)["id"]
+    except AdoError:
+        if finder:
+            try:
+                found = finder([(key, title)], key_ref, titles=False)
+                same = [m for m in (found.get(key) or []) if m["kind"] == SAME_KEY]
+                if same:
+                    return same[0]["id"]
+            except Exception:
+                pass
+        raise
+
+
+def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal, base, planner,
+                       key_to_ado=None, ado_edit_base="", log=print):
+    """Delta Sync (for exact Jira key matches only): update an existing ADO work item with the latest
+    Jira state, non-blank fields, new attachments, and any missing comments without clearing existing
+    ADO assignees or overwriting title-only matches."""
     key = plan["key"]
     out = cfg["paths"]["export_dir"]
     revs = plan["revisions"]
+    live = ado.get_item(item_id) if getattr(ado, "get_item", None) else {"fields": {}, "relations": []}
+    live_fields = live.get("fields") or {}
+    live_rel_urls = {r.get("url") for r in (live.get("relations") or []) if r.get("url")}
+    new_atts = []
     for rev in revs:
         for a in rev["attachments"]:
-            if a["id"] in journal.atts:
-                continue
-            path = os.path.join(out, a["local_path"])
-            if os.path.exists(path) and os.path.getsize(path) <= MAX_ATTACHMENT:
-                journal.log(t="att", a=a["id"], u=ado.upload_attachment(path, a["filename"]))
+            if a["id"] not in journal.atts:
+                path = os.path.join(out, a["local_path"])
+                if os.path.exists(path) and os.path.getsize(path) <= MAX_ATTACHMENT:
+                    journal.log(t="att", a=a["id"], u=ado.upload_attachment(path, a["filename"]))
+            if a["id"] in journal.atts and journal.atts[a["id"]] not in live_rel_urls:
+                new_atts.append(a)
+                live_rel_urls.add(journal.atts[a["id"]])
     final_fields = {}
     for rev in revs:
         adapted = adapt_to_type(rev, supported, key, plan["type"], cfg, planner)
         final_fields.update(adapted["fields"])
     final_fields.pop("System.AreaPath", None)
-    when = datetime.now(timezone.utc)
+    # Never wipe an existing ADO assignee simply because the Jira assignee has no ADO mapping
+    if final_fields.get("System.AssignedTo") == "" and live_fields.get("System.AssignedTo") and (issue.get("fields") or {}).get("assignee"):
+        final_fields.pop("System.AssignedTo", None)
+    live_last = parse_dt(live_fields.get("System.ChangedDate")) if live_fields.get("System.ChangedDate") else None
+    when = bump(datetime.now(timezone.utc), live_last)
     sync_rev = {
         "date": iso(when),
         "author": None,
         "author_name": None,
         "fields": final_fields,
         "comment": f"<div><i>Delta synced from Jira issue {esc(key)} on {iso(when)[:10]}.</i></div>",
-        "attachments": [],
+        "attachments": new_atts,
     }
-    ops = build_ops(sync_rev, users, journal.atts, base, when)
+    ops = build_ops(sync_rev, users, journal.atts, base, when, key_to_ado=key_to_ado, ado_edit_base=ado_edit_base)
     ado.update_item(item_id, ops)
-    journal.log(t="rev", k=key, id=item_id, n=len(revs), d=iso(when), found=True)
+    last = when
+    # Append any Jira comments beyond what the item already has
+    existing_comments = ado.comment_count(item_id) if getattr(ado, "comment_count", None) else 0
+    comment_revs = [r for r in revs[1:] if r.get("comment")]
+    for crev in comment_revs[max(0, existing_comments - 1):]:
+        when = bump(datetime.now(timezone.utc), last)
+        c_ops = build_ops(
+            {"date": iso(when), "author": crev.get("author"), "author_name": crev.get("author_name"),
+             "fields": {}, "comment": crev["comment"], "attachments": []},
+            users, journal.atts, base, when, key_to_ado=key_to_ado, ado_edit_base=ado_edit_base,
+        )
+        ado.update_item(item_id, c_ops)
+        last = when
+    journal.log(t="rev", k=key, id=item_id, n=len(revs), d=iso(last), found=True)
     log(f"  {key} delta-synced onto existing #{item_id}")
 
 
 def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_duplicates=None, jira=None):
     """possible_duplicates: 'skip' leaves out tickets that may already be in the target (the default),
-    'create' creates them tagged 'Possible duplicate' with a Related link to each match,
-    'sync' updates the matched ADO item in place. Per-ticket overrides in cfg['mapping']['ticket_actions']
-    take precedence for individual keys."""
+    'create' creates them tagged 'Possible duplicate' with a Related link to each match.
+    Per-ticket overrides in cfg['mapping']['ticket_actions'] take precedence for individual keys.
+    Note: 'sync' is only permitted on exact Jira key matches (existing), never on title-only matches."""
+    from urllib.parse import quote
     out = cfg["paths"]["export_dir"]
     meta = read_json(os.path.join(out, "meta.json"), {})
     journal = Journal(journal_path(cfg))
-    planner = Planner(cfg, meta, users)
+    available_wits = meta.get("available_wits") or (ado.work_item_types() if getattr(ado, "work_item_types", None) else None)
+    planner = Planner(cfg, meta, users, available_wits=available_wits)
     base = meta.get("base_url") or cfg["jira"]["base_url"]
+    org_url = (cfg["ado"].get("org_url") or "").rstrip("/")
+    proj_name = cfg["ado"].get("project") or ""
+    ado_edit_base = f"{org_url}/{quote(proj_name)}/_workitems/edit/" if (org_url and proj_name and cfg["mapping"].get("rewrite_cross_references", True)) else ""
     policy = possible_duplicates or cfg["mapping"].get("possible_duplicates") or "skip"
+    if policy == "sync":
+        policy = "skip"  # never bulk-sync title-only possible duplicates
     existing_policy = cfg["mapping"].get("existing_duplicates") or "skip"
     ticket_actions = cfg["mapping"].get("ticket_actions") or {}
     stats = {"created": 0, "resumed": 0, "complete": 0, "revisions": 0, "failed": [], "existing": {},
              "possible": {}, "held": [], "synced": []}
     type_fields = {}
     try:
-        plans = [planner.plan(i) for i in load_issues(out) if not only or i["key"] in only]
+        issues_list = [i for i in load_issues(out) if not only or i["key"] in only]
+        plans = [planner.plan(i) for i in issues_list]
         preflight_states(ado, plans)
         planner.warnings.clear()
         existing, possible = check_duplicates(ado, cfg, plans, journal)
@@ -302,9 +353,8 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                 why = "; ".join(describe(m) for m in possible[key])
                 if eff in ("create", "duplicate"):
                     log(f"  {key} may be a duplicate ({why}); creating it tagged 'Possible duplicate'")
-                elif eff == "sync" and possible[key]:
-                    sync_targets[key] = possible[key][0]["id"]
                 else:
+                    # Possible duplicates (title/key-in-title) are never overwritten via sync
                     journal.log(t="held", k=key, why=why)
                     stats["held"].append(key)
                     log(f"  {key} left out, possible duplicate: {why}")
@@ -317,10 +367,9 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
         create_area(ado, cfg, journal, log)
         create_iterations(ado, cfg, meta, journal, log)
         n = 0
-        for issue in load_issues(out):
+        key_ref = cfg["mapping"].get("jira_key_field")
+        for issue in issues_list:
             key = issue["key"]
-            if only and key not in only:
-                continue
             if limit and n >= limit:
                 break
             if key in held:
@@ -331,9 +380,12 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                 getter = getattr(ado, "type_fields", None)
                 type_fields[plan["type"]] = getter(plan["type"]) if getter else None
             supported = type_fields[plan["type"]]
+            has_key_field = bool(key_ref and supported and key_ref in supported)
+            key_to_ado = {k: v["id"] for k, v in journal.items.items() if v.get("id")} if ado_edit_base else None
             if key in sync_targets:
                 try:
-                    sync_existing_item(ado, sync_targets[key], plan, supported, cfg, users, journal, base, planner, log)
+                    sync_existing_item(ado, sync_targets[key], issue, plan, supported, cfg, users, journal, base, planner,
+                                       key_to_ado=key_to_ado, ado_edit_base=ado_edit_base, log=log)
                     stats["synced"].append(key)
                     stats["revisions"] += 1
                 except (AdoError, OSError) as e:
@@ -358,15 +410,32 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                 # Inline images can point at any attachment, so all uploads happen before the first write.
                 last = parse_dt(st["last"]) if st.get("last") else None
                 item_id = st.get("id")
+                # Self-healing resume: reconcile against live ADO item if resuming a partial import
+                if item_id is not None and done > 0 and getattr(ado, "get_item", None):
+                    try:
+                        live = ado.get_item(item_id)
+                        live_changed = (live.get("fields") or {}).get("System.ChangedDate")
+                        if live_changed:
+                            live_dt = parse_dt(live_changed)
+                            if live_dt and (not last or live_dt > last):
+                                last = live_dt
+                        live_rev = live.get("rev") or 0
+                        if live_rev > done and done < len(plan["revisions"]):
+                            done = min(live_rev, len(plan["revisions"]))
+                            journal.log(t="rev", k=key, id=item_id, n=done, d=iso(last or datetime.now(timezone.utc)))
+                    except Exception:
+                        pass
                 for i in range(done, len(plan["revisions"])):
                     rev = adapt_to_type(plan["revisions"][i], supported, key, plan["type"], cfg, planner)
                     if key in possible and (rev.get("create") or "System.Tags" in rev["fields"]):
                         rev = mark_possible_duplicate(rev, possible[key], ado)
                     when = min(bump(parse_dt(rev["date"]), last), datetime.now(timezone.utc))
                     when = bump(when, last)
-                    ops = build_ops(rev, users, journal.atts, base, when, f"{base}/browse/{key}")
+                    ops = build_ops(rev, users, journal.atts, base, when, f"{base}/browse/{key}",
+                                    key_to_ado=key_to_ado, ado_edit_base=ado_edit_base)
                     if item_id is None:
-                        item_id = ado.create_item(plan["type"], ops)["id"]
+                        item_id = _create_item_idempotent(ado, plan["type"], ops, key, plan_title(plan),
+                                                          key_ref if has_key_field else None)
                         stats["created"] += 1
                     else:
                         ado.update_item(item_id, ops)
@@ -378,10 +447,6 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                     log(f"  {key} finished on #{item_id}")
                 else:
                     log(f"  {key} created as #{item_id}")
-                if cfg["mapping"].get("stamp_jira_migrated") and jira and item_id:
-                    org = cfg["ado"]["org_url"].rstrip("/")
-                    proj = cfg["ado"]["project"]
-                    jira.stamp_migrated(key, f"{org}/{proj}/_workitems/edit/{item_id}", item_id)
             except (AdoError, OSError) as e:
                 stats["failed"].append(key)
                 log(f"  {key} FAILED: {e}")

@@ -9,7 +9,9 @@ class JiraClient:
     """Jira Cloud REST v3 + Agile 1.0 client with paging, retry, boards, worklogs, and remote/dev links."""
 
     def __init__(self, base_url, email, token, session=None):
-        self.base = (base_url or "").rstrip("/")
+        self.base = (base_url or "").strip().rstrip("/")
+        if self.base.lower().startswith("http://"):
+            raise RuntimeError("Jira URL must use https:// so your API token is never sent over plain HTTP.")
         self.s = session or requests.Session()
         self.s.auth = (email, token)
         self.s.headers.update({"Accept": "application/json"})
@@ -201,27 +203,6 @@ class JiraClient:
                 except Exception:
                     continue
         return links
-
-    def stamp_migrated(self, key, ado_edit_url, ado_id, add_label=True):
-        """Add a remote link (and optional 'migrated-to-ado' label) on the Jira ticket pointing to ADO."""
-        try:
-            self._request("POST", f"/rest/api/3/issue/{key}/remotelink", json={
-                "globalId": f"ado-workitem-{ado_id}",
-                "object": {
-                    "url": ado_edit_url,
-                    "title": f"Azure DevOps Work Item #{ado_id}",
-                    "summary": "Migrated via Jira2ADO",
-                },
-            })
-        except Exception:
-            pass
-        if add_label:
-            try:
-                self._request("PUT", f"/rest/api/3/issue/{key}", json={
-                    "update": {"labels": [{"add": "migrated-to-ado"}]}
-                })
-            except Exception:
-                pass
 
     def fields(self):
         return self._request("GET", "/rest/api/3/field").json()

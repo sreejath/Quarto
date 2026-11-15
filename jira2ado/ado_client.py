@@ -26,7 +26,9 @@ class AdoClient:
     'Bypass rules on work item updates' permission on the project."""
 
     def __init__(self, org_url, project, pat, api_version="7.1", session=None):
-        self.org, self.project, self.v = (org_url or "").rstrip("/"), project or "", api_version
+        self.org, self.project, self.v = (org_url or "").strip().rstrip("/"), project or "", api_version
+        if self.org.lower().startswith("http://"):
+            raise AdoError("Azure DevOps URL must use https:// so your access token is never sent over plain HTTP.")
         self.s = session or requests.Session()
         self.s.headers["Authorization"] = "Basic " + base64.b64encode(f":{pat}".encode()).decode()
         self.proj = f"{self.org}/{quote(self.project)}" if self.project else self.org
@@ -35,6 +37,11 @@ class AdoClient:
         params = dict(kw.pop("params", None) or {})
         params.setdefault("api-version", self.v)
         for attempt in range(8):
+            if hasattr(kw.get("data"), "seek"):
+                try:
+                    kw["data"].seek(0)
+                except Exception:
+                    pass
             r = self.s.request(method, url, params=params, timeout=300, **kw)
             if r.status_code == 429 or r.status_code >= 500:
                 backoff_sleep(attempt, r.headers.get("Retry-After"))
@@ -113,8 +120,8 @@ class AdoClient:
             return []
 
     def discover_users(self):
-        """Discover ADO users (email -> identity, display_name -> identity) from project teams."""
-        by_email, by_name = {}, {}
+        """Discover ADO users (email -> identity, display_name -> unique identity) from project teams."""
+        by_email, by_name, ambiguous_names = {}, {}, set()
         if not self.project:
             return {"by_email": by_email, "by_name": by_name}
         try:
@@ -127,7 +134,14 @@ class AdoClient:
                     if unique:
                         by_email[unique.lower()] = unique
                         if disp:
-                            by_name[disp.lower()] = unique
+                            k = disp.lower()
+                            if k in ambiguous_names:
+                                continue
+                            if k in by_name and by_name[k].lower() != unique.lower():
+                                del by_name[k]
+                                ambiguous_names.add(k)
+                            else:
+                                by_name[k] = unique
         except Exception:
             pass
         return {"by_email": by_email, "by_name": by_name}
@@ -299,30 +313,11 @@ class AdoClient:
         run()
         return found
 
-    def states(self, wit):
+    def state_details(self, wit):
+        """Return [{"name": state_name, "category": state_category}] for a work item type."""
         url = f"{self.proj}/_apis/wit/workitemtypes/{quote(wit)}/states"
-        return [s["name"] for s in self._request("GET", url).json().get("value", [])]
+        return [{"name": s["name"], "category": s.get("category", "")}
+                for s in self._request("GET", url).json().get("value", []) if s.get("name")]
 
-    def ensure_process_state(self, wit_name, state_name, state_category="InProgress", color="007acc"):
-        """Admin feature: Add a missing state to an Inherited Process work item type in ADO."""
-        proj_info = self._request("GET", f"{self.org}/_apis/projects/{quote(self.project)}",
-                                  params={"includeCapabilities": "true"}).json()
-        caps = proj_info.get("capabilities") or {}
-        proc_id = (caps.get("processTemplate") or {}).get("templateTypeId")
-        if not proc_id:
-            raise AdoError("Could not determine the Process Template ID for this project.")
-        wits = self._request("GET", f"{self.org}/_apis/work/processes/{proc_id}/workitemtypes").json().get("value") or []
-        wit_obj = next((w for w in wits if w.get("name", "").lower() == wit_name.lower()), None)
-        if not wit_obj:
-            raise AdoError(f"Work item type '{wit_name}' not found in process {proc_id}.")
-        if wit_obj.get("customization") == "system":
-            raise AdoError(f"Project '{self.project}' uses a locked System process. Switch it to an Inherited process in ADO Organization Settings to create custom states.")
-        ref_name = wit_obj["referenceName"]
-        cat_map = {"new": "Proposed", "indeterminate": "InProgress", "done": "Completed"}
-        ado_cat = cat_map.get(str(state_category).lower(), state_category)
-        return self._request(
-            "POST",
-            f"{self.org}/_apis/work/processes/{proc_id}/workItemTypes/{quote(ref_name)}/states",
-            json={"name": state_name, "color": color, "stateCategory": ado_cat},
-            params={"api-version": "7.1-preview.1"},
-        ).json()
+    def states(self, wit):
+        return [s["name"] for s in self.state_details(wit)]

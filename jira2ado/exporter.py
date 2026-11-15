@@ -169,17 +169,20 @@ def write_users_file(export_dir, path, domains=None, ado_discovered=None):
     users = collect_users(export_dir)
     disc_email = (ado_discovered or {}).get("by_email") or {}
     disc_name = (ado_discovered or {}).get("by_name") or {}
+    has_ado_directory = bool(disc_email or disc_name)
 
     def guess(email, name=""):
         if email and "@" in email:
             local, dom = email.rsplit("@", 1)
             rewritten = f"{local}@{(domains or {}).get(dom.lower(), dom)}"
-            if rewritten.lower() in disc_email:
-                return disc_email[rewritten.lower()]
-            if email.lower() in disc_email:
-                return disc_email[email.lower()]
-            return rewritten
-        if name and name.lower() in disc_name:
+            if has_ado_directory:
+                if rewritten.lower() in disc_email:
+                    return disc_email[rewritten.lower()]
+                if email.lower() in disc_email:
+                    return disc_email[email.lower()]
+            else:
+                return rewritten
+        if has_ado_directory and name and name.lower() in disc_name:
             return disc_name[name.lower()]
         return ""
 

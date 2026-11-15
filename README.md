@@ -1,24 +1,28 @@
 # Jira2ADO — High-Fidelity Jira Cloud to Azure DevOps Migration App
 
+![Jira2ADO Banner](assets/banner.svg)
+
 **Jira2ADO** is a zero-command-line, browser-driven migration application and CLI toolkit that migrates **everything** associated with Jira tickets into **Azure DevOps Services** — including full revision history, comments, inline images, attachments, worklogs, parent/child hierarchies, Confluence/web links, Git PR/branch/commit links, sprint iterations, and custom fields.
 
-It runs 100% locally on your machine (`127.0.0.1`) on **macOS, Windows, and Linux** so your credentials and ticket data never leave your computer.
+It runs 100% locally on your machine (`127.0.0.1`) on **macOS, Windows, and Linux**, is **100% read-only on Jira**, and never writes your credentials to disk.
 
 ---
 
 ## Key Capabilities
 
 1. **100% Browser-Driven Workflow (Zero CLI / Zero YAML Editing Required)**
-   - Connect directly with your **Atlassian Jira URL**, **Jira Email**, **Jira API Token**, **Azure DevOps Org URL**, and **ADO PAT**.
-   - Select **Jira Project → Jira Board → One or more Sprints → Destination ADO Project**.
+   - Connect directly with your **Atlassian Jira URL**, **Jira Email**, **Jira API Token**, **Azure DevOps Org URL**, and **ADO PAT** (HTTPS enforced).
+   - Select **Jira Project → Jira Board → One or more Sprints (with Filter & Select All Displayed) → Destination ADO Project**.
 2. **Interactive Validate & Ticket Review Table**
    - Press **Validate** to fetch and preview all sprint tickets before anything is written to Azure DevOps.
    - Displays **Issue Key**, **Issue Type**, **Summary**, **Assignee**, **Status (Interactive Dropdown)**, and **Outcome**.
-   - **Intelligent Closest-State Matching**: Automatically maps each Jira status to the closest matching state in the destination ADO project (supporting identically named states, semantic/fuzzy matching, and **Scrum**, **Agile**, **Basic**, **CMMI**, and **Inherited** process templates).
+   - **Dynamic Status Discovery & Highlighted Recommendations**: Queries both Jira and your destination Azure DevOps project for live workflow states and state categories (`Proposed`, `InProgress`, `Resolved`, `Completed`), prioritizing exact 1:1 state matches and highlighting recommended closest states with a **`★ Recommended`** badge when no identically named state exists in ADO.
    - **Per-Ticket & Bulk Status Overrides**: Change the target ADO state on any individual ticket or apply a status mapping across all tickets with one click.
-3. **3-Way Duplicate Detection & Resolution**
-   - Automatically highlights tickets that already exist in ADO (by **Jira Key tag/field**, **Jira Key in Title**, or **Matching Summary**) as well as duplicate summaries within the same sprint.
-   - Choose per-ticket or in bulk: **Skip**, **Create Duplicate** (tagged & linked), or **Sync Delta (Update Existing)**.
+3. **3-Way Duplicate Detection & Safe Resolution**
+   - Automatically highlights tickets that already exist in ADO (by **Exact Jira Key tag/field**, **Jira Key in Title**, or **Matching Summary**) as well as duplicate summaries within the same sprint.
+   - Choose per-ticket or in bulk: **Skip**, **Create Duplicate** (tagged & linked), or **Sync Delta** (safely restricted to exact Jira key matches).
+4. **Idempotent Retry & Self-Healing Resume**
+   - Every work item creation and revision is journaled and verified against live Azure DevOps revisions before writing. If a run is stopped or interrupted, clicking **Retry / Resume Remaining** safely continues without creating duplicates.
 4. **Complete Data Fidelity ("EVERYTHING" Migrated)**
    - **Descriptions & Comments**: Full Atlassian Document Format (ADF) and Jira Wiki Markup converted to HTML with resolved `@mentions` (`[~accountid:...]` → human display names) and rewritten cross-ticket links.
    - **Attachments & Inline Images**: Uploaded to Azure DevOps with inline `<img>` and file links rewritten to the uploaded ADO URLs.

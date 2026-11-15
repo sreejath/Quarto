@@ -54,6 +54,7 @@ jobs:
           pyinstaller --onefile --name "${{ matrix.artifact_name }}" \
             --add-data "jira2ado/ui/static${{ matrix.sep }}jira2ado/ui/static" \
             --add-data "configs${{ matrix.sep }}configs" \
+            --add-data "assets${{ matrix.sep }}assets" \
             jira2ado/ui/__main__.py
       - name: Upload Release Asset
         uses: actions/upload-artifact@v4

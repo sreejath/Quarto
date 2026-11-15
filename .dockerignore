@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+.env
+.DS_Store
+runs/
+export/
+users.csv
+configs/local/
+dist/
+build/
+*.spec

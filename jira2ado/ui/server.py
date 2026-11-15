@@ -25,16 +25,27 @@ from .. import config
 from ..ado_client import AdoClient, AdoError
 from ..jira_client import JiraClient
 
-KIT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    KIT = os.path.dirname(os.path.abspath(sys.executable))
+    STATIC = os.path.join(BUNDLE_DIR, "jira2ado", "ui", "static")
+    if not os.path.isdir(STATIC):
+        STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    CMD = [sys.executable, "--cli"]
+else:
+    BUNDLE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    KIT = BUNDLE_DIR
+    STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    CMD = [sys.executable, "-m", "jira2ado"]  # the tests swap this for a stand-in Azure DevOps
+
 BASE = os.path.join("configs", "enterprise-development.yaml")
 TARGETS = os.path.join("configs", "targets.yaml")
 SETTINGS = "ui-settings.json"          # last email, URLs, and choices; never tokens
-CMD = [sys.executable, "-m", "jira2ado"]  # the tests swap this for a stand-in Azure DevOps
 
 FILES = {"/": ("index.html", "text/html; charset=utf-8"),
          "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-         "/app.css": ("app.css", "text/css; charset=utf-8")}
+         "/app.css": ("app.css", "text/css; charset=utf-8"),
+         "/logo.svg": ("logo.svg", "image/svg+xml")}
 
 
 class State:
@@ -54,17 +65,27 @@ S = State()
 
 def _norm_url(u):
     u = (u or "").strip().rstrip("/")
-    if u and not u.startswith(("http://", "https://")):
+    if u.lower().startswith("http://"):
+        raise ApiError("Use an https:// URL so your API tokens are encrypted in transit.")
+    if u and not u.lower().startswith("https://"):
         u = "https://" + u
     return u
 
 
+def _is_double_paste(tok):
+    return len(tok) >= 8 and len(tok) % 2 == 0 and tok[:len(tok) // 2] == tok[len(tok) // 2:]
+
+
 def _cfg_path(rel):
-    return rel if os.path.exists(rel) else os.path.join(KIT, rel)
+    for root in (os.getcwd(), KIT, BUNDLE_DIR):
+        cand = os.path.join(root, rel) if root else rel
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(KIT, rel)
 
 
 def base_cfg():
-    local_base = _cfg_path(os.path.join("configs", "local", "petvalu-enterprise.yaml"))
+    local_base = _cfg_path(os.path.join("configs", "local", "base.yaml"))
     if os.path.exists(local_base):
         return config.load(local_base)
     return config.load(_cfg_path(BASE))
@@ -156,6 +177,9 @@ def env_with_tokens():
 def run_step(job, index, args, ok=(0,)):
     """Run one jira2ado command and stream its output into the job log. Returns (exit code, stdout of prepare)."""
     step = job.steps[index]
+    if job.stopped:
+        step["status"] = "stopped"
+        raise StopRun()
     step["status"] = "running"
     job.log.append(f"$ jira2ado {' '.join(args)}")
     capture = args and args[0] == "prepare"  # prepare prints only the config path on stdout
@@ -252,31 +276,38 @@ def check_job(params):
 
 def apply_overrides_to_config(cfg_path, body):
     """Persist per-ticket status overrides, global status overrides, and duplicate action overrides into config.yaml
-    and preview.json before running import."""
+    and preview.json after validating values."""
     full_cfg = inside_runs(cfg_path)
+    if isinstance(body.get("ticket_actions"), dict):
+        for k, v in body["ticket_actions"].items():
+            if v and v not in ("create", "skip", "duplicate", "sync"):
+                raise ApiError(f"Invalid duplicate action '{v}' for {k}.")
+    for field_name in ("ticket_states", "ticket_types", "status_overrides"):
+        if field_name in body and body[field_name] is not None:
+            if not isinstance(body[field_name], dict):
+                raise ApiError(f"{field_name} must be an object.")
+            for k, v in body[field_name].items():
+                if v is not None and not isinstance(v, str):
+                    raise ApiError(f"Invalid value in {field_name} for {k}.")
     with open(full_cfg, encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
     m = raw.setdefault("mapping", {})
     changed = False
     if isinstance(body.get("ticket_states"), dict):
-        m.setdefault("ticket_states", {}).update({k: v for k, v in body["ticket_states"].items() if v})
+        m.setdefault("ticket_states", {}).update({k: v.strip() for k, v in body["ticket_states"].items() if v and v.strip()})
         changed = True
     if isinstance(body.get("ticket_types"), dict):
-        m.setdefault("ticket_types", {}).update({k: v for k, v in body["ticket_types"].items() if v})
+        m.setdefault("ticket_types", {}).update({k: v.strip() for k, v in body["ticket_types"].items() if v and v.strip()})
         changed = True
     if isinstance(body.get("ticket_actions"), dict):
         m.setdefault("ticket_actions", {}).update({k: v for k, v in body["ticket_actions"].items() if v})
         changed = True
     if isinstance(body.get("status_overrides"), dict):
-        m.setdefault("status_overrides", {}).update({k: v for k, v in body["status_overrides"].items() if v})
-        changed = True
-    if "stamp_jira_migrated" in body:
-        m["stamp_jira_migrated"] = bool(body["stamp_jira_migrated"])
+        m.setdefault("status_overrides", {}).update({k: v.strip() for k, v in body["status_overrides"].items() if v and v.strip()})
         changed = True
     if changed:
         with open(full_cfg, "w", encoding="utf-8") as fh:
             yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True, width=120)
-        # Also update preview.json in-place so UI reflects the saved overrides immediately
         pv_path = os.path.join(os.path.dirname(full_cfg), "preview.json")
         pv = read_json_file(pv_path)
         if pv and isinstance(pv.get("tickets"), list):
@@ -304,15 +335,15 @@ def apply_overrides_to_config(cfg_path, body):
 def import_job(params):
     cfg_path = params.get("config") or ""
     full_cfg = inside_runs(cfg_path)
-    apply_overrides_to_config(cfg_path, params)
     cfg = config.load(full_cfg)
     project = cfg["ado"]["project"]
     want = project if cfg["ado"].get("confirm_with_project_name") else "yes"
     if (params.get("confirm") or "").strip() != want:
         raise ApiError(f"Type {project} exactly to confirm." if want == project else "Confirm the import first.", 400)
     choice = params.get("possible_duplicates") or "skip"
-    if choice not in ("skip", "create", "sync"):
-        raise ApiError("possible_duplicates must be skip, create, or sync.")
+    if choice not in ("skip", "create"):
+        raise ApiError("possible_duplicates must be skip or create.")
+    apply_overrides_to_config(cfg_path, params)
     job = Job("import", ["Apply status & duplicate overrides", "Create & sync work items in Azure DevOps", "Verify migrated items"])
 
     def work(job):
@@ -320,28 +351,34 @@ def import_job(params):
         if code != 0:
             job.status, job.error = "failed", last_message(job)
             return
-        code, _ = run_step(job, 1, ["-c", cfg_path, "import", "--possible-duplicates", choice], ok=(0, 1))
-        if code not in (0, 1):
+        code, _ = run_step(job, 1, ["-c", cfg_path, "import", "--possible-duplicates", choice], ok=(0,))
+        report = os.path.join(os.path.dirname(cfg_path), "verify.csv")
+        if os.path.exists(os.path.join(os.path.dirname(full_cfg), "import-state.jsonl")):
+            run_step(job, 2, ["-c", cfg_path, "verify", "--report", report], ok=(0, 1))
+        job.result["run"] = run_data(cfg_path)
+        if code != 0:
             job.status, job.error = "failed", last_message(job)
             return
-        report = os.path.join(os.path.dirname(cfg_path), "verify.csv")
-        run_step(job, 2, ["-c", cfg_path, "verify", "--report", report], ok=(0, 1))
-        job.result["run"] = run_data(cfg_path)
 
     return start(job, work)
 
 
 def rollback_job(params):
     cfg_path = params.get("config") or ""
-    inside_runs(cfg_path)
+    full_cfg = inside_runs(cfg_path)
+    cfg = config.load(full_cfg)
+    project = cfg["ado"]["project"]
+    want = project if cfg["ado"].get("confirm_with_project_name") else "yes"
+    if (params.get("confirm") or "").strip() != want:
+        raise ApiError(f"Type {project} exactly to confirm rollback." if want == project else "Confirm the rollback first.", 400)
     job = Job("rollback", ["Delete work items created by this run in Azure DevOps"])
 
     def work(job):
-        code, _ = run_step(job, 0, ["-c", cfg_path, "rollback"], ok=(0, 1))
+        code, _ = run_step(job, 0, ["-c", cfg_path, "rollback"], ok=(0,))
+        job.result["run"] = run_data(cfg_path)
         if code != 0:
             job.status, job.error = "failed", last_message(job)
             return
-        job.result["run"] = run_data(cfg_path)
 
     return start(job, work)
 
@@ -424,17 +461,23 @@ def api(method, path, query, body):
         if not j_url or not a_url:
             raise ApiError("Provide both the Atlassian Jira URL and Azure DevOps Organization URL.")
         out, problems = {}, {}
-        try:
-            out["jira"] = JiraClient(j_url, email, jt).myself()
-        except Exception as e:
-            problems["jira"] = ("Jira did not accept the email and API token. Check both and paste the token once."
-                                if " 401 " in str(e) or " 403 " in str(e) else f"Could not reach Jira at {j_url}: {e}")
-        try:
-            out["ado"] = AdoClient(a_url, "", at).whoami() or "your account"
-        except AdoError as e:
-            problems["ado"] = str(e)
-        except Exception as e:
-            problems["ado"] = f"Could not reach Azure DevOps at {a_url}: {e}"
+        if _is_double_paste(jt):
+            problems["jira"] = "That looks like the Jira API token pasted twice. Paste it once."
+        else:
+            try:
+                out["jira"] = JiraClient(j_url, email, jt).myself()
+            except Exception as e:
+                problems["jira"] = ("Jira did not accept the email and API token. Check both and paste the token once."
+                                    if " 401 " in str(e) or " 403 " in str(e) else f"Could not reach Jira at {j_url}: {e}")
+        if _is_double_paste(at):
+            problems["ado"] = "That looks like the Azure DevOps token pasted twice. Paste it once."
+        else:
+            try:
+                out["ado"] = AdoClient(a_url, "", at).whoami() or "your account"
+            except AdoError as e:
+                problems["ado"] = str(e)
+            except Exception as e:
+                problems["ado"] = f"Could not reach Azure DevOps at {a_url}: {e}"
         if "jira" in out:
             S.tokens.update(jira_url=j_url, jira_email=email, jira_token=jt)
             S.names["jira"] = out["jira"]
@@ -491,6 +534,10 @@ def api(method, path, query, body):
         if os.path.exists(t_path):
             with open(t_path, encoding="utf-8") as fh:
                 targets = yaml.safe_load(fh) or {}
+        local_t_path = _cfg_path(os.path.join("configs", "local", "targets.yaml"))
+        if os.path.exists(local_t_path):
+            with open(local_t_path, encoding="utf-8") as fh:
+                targets.update(yaml.safe_load(fh) or {})
         by_name = {
             name: {
                 "name": name,
@@ -499,7 +546,8 @@ def api(method, path, query, body):
             }
             for name, spec in targets.items()
         }
-        # Dynamically discover all projects in the connected ADO organization
+        # Dynamically discover projects in the connected ADO organization; all unconfigured
+        # projects require typing the project name before importing (S7).
         if S.tokens.get("ado_token"):
             try:
                 client = ado()
@@ -510,7 +558,7 @@ def api(method, path, query, body):
                             by_name[pname] = {
                                 "name": pname,
                                 "description": p.get("description", ""),
-                                "confirm_with_project_name": False,
+                                "confirm_with_project_name": True,
                                 "configured": False,
                             }
             except Exception:
@@ -525,16 +573,6 @@ def api(method, path, query, body):
         c = ado(canonical)
         areas = c.area_paths() if getattr(c, "area_paths", None) else []
         return {"project": canonical, "iterations": c.iteration_paths(), "areas": areas}
-
-    if path == "/api/ado/create-state" and method == "POST":
-        project = (body.get("project") or "").strip()
-        wit = (body.get("wit") or "").strip()
-        state_name = (body.get("state") or "").strip()
-        category = (body.get("category") or "InProgress").strip()
-        if not (project and wit and state_name):
-            raise ApiError("Project, work item type, and state name are required.")
-        res = ado(project).ensure_process_state(wit, state_name, category)
-        return {"ok": True, "state": res}
 
     if path == "/api/check" and method == "POST":
         if not (S.tokens.get("jira_token") and S.tokens.get("ado_token")):
@@ -652,7 +690,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _host_ok(self):
-        return self.headers.get("Host", "") in (f"127.0.0.1:{S.port}", f"localhost:{S.port}")
+        extra_host = os.environ.get("JIRA2ADO_UI_HOST") or "127.0.0.1"
+        return self.headers.get("Host", "") in (
+            f"127.0.0.1:{S.port}",
+            f"localhost:{S.port}",
+            f"{extra_host}:{S.port}",
+        )
 
     def _handle(self, method):
         if not self._host_ok():
@@ -664,9 +707,8 @@ class Handler(BaseHTTPRequestHandler):
             name, ctype = FILES[url.path]
             with open(os.path.join(STATIC, name), "rb") as fh:
                 return self._send(200, fh.read(), ctype)
-        # Allow CSV download via GET with key in query or header
         qs = parse_qs(url.query)
-        req_key = self.headers.get("X-Jira2ado-Key", "") or (qs.get("key") or [""])[0]
+        req_key = self.headers.get("X-Jira2ado-Key", "")
         if not hmac.compare_digest(req_key, S.key):
             return self._send(403, {"error": "This page has an old key. Open the address shown in the Terminal window."})
         if url.path == "/api/download" and method == "GET":
@@ -707,9 +749,10 @@ class Handler(BaseHTTPRequestHandler):
         self._handle("POST")
 
 
-def serve(port=0, open_browser=True):
+def serve(port=0, open_browser=True, host=None):
     os.chdir(KIT)
-    S.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    bind_host = host or os.environ.get("JIRA2ADO_UI_HOST") or "127.0.0.1"
+    S.server = ThreadingHTTPServer((bind_host, port), Handler)
     S.port = S.server.server_address[1]
     url = f"http://127.0.0.1:{S.port}/#key={S.key}"
     print(f"jira2ado is open in your browser at {url}")
@@ -729,7 +772,8 @@ def serve(port=0, open_browser=True):
 
 def main():
     port = int(os.environ.get("JIRA2ADO_UI_PORT") or 0)
-    serve(port, open_browser=os.environ.get("JIRA2ADO_UI_NO_BROWSER") != "1")
+    host = os.environ.get("JIRA2ADO_UI_HOST") or "127.0.0.1"
+    serve(port, open_browser=os.environ.get("JIRA2ADO_UI_NO_BROWSER") != "1", host=host)
 
 
 if __name__ == "__main__":

@@ -280,10 +280,10 @@ class ProjectNameTests(unittest.TestCase):
                 calls.append(url)
                 if "Nope" in url:
                     return Resp(404, {"message": "TF200016: The following project does not exist: Nope"})
-                return Resp(200, {"name": "Digital Project - ADO - Sandbox", "structureType": "iteration"})
+                return Resp(200, {"name": "Sandbox", "structureType": "iteration"})
 
-        c = AdoClient("https://dev.azure.com/contoso", "digital project - ado - sandbox", "t", session=Session())
-        self.assertEqual(c.project_name(), "Digital Project - ADO - Sandbox")
+        c = AdoClient("https://dev.azure.com/contoso", "sandbox", "t", session=Session())
+        self.assertEqual(c.project_name(), "Sandbox")
         self.assertIn("/_apis/wit/classificationnodes/Iterations", calls[0])
         with self.assertRaises(AdoError) as ctx:
             AdoClient("https://dev.azure.com/contoso", "Nope", "t", session=Session()).project_name()
@@ -336,7 +336,7 @@ class AccessCommandTests(unittest.TestCase):
 
 
 class ScopeTests(unittest.TestCase):
-    """Current-values mode and the Enterprise Development style options."""
+    """Current-values mode and custom field mapping options."""
 
     def setUp(self):
         self.cfg = cfg_for("x")
@@ -345,7 +345,7 @@ class ScopeTests(unittest.TestCase):
         m["custom_fields"] = [
             {"ado": "Custom.BusinessAnalysts", "jira": ["Business Analyst"], "kind": "user"},
             {"ado": "Custom.Developers", "jira": ["Developer(s)", "Developer"], "kind": "users"},
-            {"ado": "Custom.CABTicket#", "jira": ["CAB Ticket #"], "kind": "text"},
+            {"ado": "Custom.ChangeRequest", "jira": ["Change Request #"], "kind": "text"},
             {"ado": "Custom.ReleaseNotes", "jira": ["Release Notes"], "kind": "html"},
         ]
         m["resolution_states"] = {"default": {"Won't Do": "Removed"}}
@@ -355,15 +355,15 @@ class ScopeTests(unittest.TestCase):
         m["jira_key_field"] = "Custom.JiraKey"
         m["tags"]["jira_key"] = False
         self.meta = dict(sample.META, field_names={
-            "customfield_10330": "Business Analyst", "customfield_10454": "Developer(s)", "customfield_10331": "Developer",
-            "customfield_10440": "CAB Ticket #", "customfield_10438": "Release Notes"})
+            "customfield_20001": "Business Analyst", "customfield_20002": "Developer(s)", "customfield_20003": "Developer",
+            "customfield_20004": "Change Request #", "customfield_20005": "Release Notes"})
 
     def story(self, **extra):
         issue = sample.story()
-        issue["fields"].update({"customfield_10330": sample.U1, "customfield_10454": [sample.U1, sample.U2],
-                                "customfield_10440": "CAB-77", "customfield_10438": "*bold* note",
+        issue["fields"].update({"customfield_20001": sample.U1, "customfield_20002": [sample.U1, sample.U2],
+                                "customfield_20004": "CHG-77", "customfield_20005": "*bold* note",
                                 "resolution": {"name": "Done"}, "resolutiondate": "2024-01-05T09:00:00.000-0500"})
-        issue["renderedFields"]["customfield_10438"] = "<p><b>bold</b> note</p>"
+        issue["renderedFields"]["customfield_20005"] = "<p><b>bold</b> note</p>"
         issue["fields"]["customfield_10020"][0]["state"] = "closed"
         issue["fields"]["customfield_10020"][1].update(state="closed", startDate="2024-01-15T00:00:00.000Z",
                                                        endDate="2024-01-28T00:00:00.000Z")
@@ -384,7 +384,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(f["Custom.JiraKey"], "DEMO-1")
         self.assertEqual(f["Custom.BusinessAnalysts"], "ana@contoso.com")
         self.assertEqual(f["Custom.Developers"], "ana@contoso.com")
-        self.assertEqual(f["Custom.CABTicket#"], "CAB-77")
+        self.assertEqual(f["Custom.ChangeRequest"], "CHG-77")
         self.assertEqual(f["Custom.ReleaseNotes"], "<p><b>bold</b> note</p>")
         self.assertIn("Developers also: Raj Rao", revs[0]["comment"])
         self.assertEqual([bool(r["comment"]) for r in revs[1:]], [False, True, True])  # in time order
@@ -415,8 +415,8 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(revs[0]["fields"]["System.IterationPath"], "Shop\\Team A\\Sprint 2")
 
     def test_first_points_field_wins(self):
-        meta = dict(self.meta, points_fields=["customfield_10016", "customfield_10325"])
-        revs = Planner(self.cfg, meta, USERS).plan(self.story(customfield_10325=8))["revisions"]
+        meta = dict(self.meta, points_fields=["customfield_10016", "customfield_20009"])
+        revs = Planner(self.cfg, meta, USERS).plan(self.story(customfield_20009=8))["revisions"]
         self.assertEqual(revs[0]["fields"]["Microsoft.VSTS.Scheduling.Effort"], 5.0)
 
     def test_import_checks_fields_per_type(self):
@@ -430,7 +430,7 @@ class ScopeTests(unittest.TestCase):
         self.cfg["mapping"]["link_mode"] = "parent"
         ado = sample.FakeAdo()
         pbi = {"Microsoft.VSTS.Common.ValueArea", "Microsoft.VSTS.Common.Priority", "Microsoft.VSTS.Scheduling.Effort",
-               "Custom.BusinessAnalysts", "Custom.Developers", "Custom.CABTicket#", "Custom.ReleaseNotes",
+               "Custom.BusinessAnalysts", "Custom.Developers", "Custom.ChangeRequest", "Custom.ReleaseNotes",
                "Microsoft.VSTS.Common.ClosedDate"}
         ado.type_field_map = {"Product Backlog Item": pbi, "Task": {"Microsoft.VSTS.Common.Priority"}}
         q = lambda *a, **k: None
@@ -441,7 +441,7 @@ class ScopeTests(unittest.TestCase):
         story, task = ado.items[101], ado.items[102]
         self.assertNotIn("Custom.JiraKey", story["fields"])            # not on this type ...
         self.assertTrue(story["fields"]["System.Tags"].endswith("DEMO-1"))  # ... so it became a tag
-        self.assertEqual(story["fields"]["Custom.CABTicket#"], "CAB-77")
+        self.assertEqual(story["fields"]["Custom.ChangeRequest"], "CHG-77")
         self.assertEqual(story["fields"]["System.AreaPath"], "Shop\\Migration Test")
         self.assertNotIn("Microsoft.VSTS.Common.ValueArea", task["fields"])
         self.assertFalse(any("Custom.JiraKey" in w for w in stats["warnings"]))  # the key fallback is silent
@@ -461,7 +461,7 @@ class ScopeTests(unittest.TestCase):
     def test_fields_the_target_lacks_go_into_a_note(self):
         self._export()
         self.cfg["mapping"]["note_jira_status"] = True
-        self.cfg["mapping"]["custom_fields"][2]["label"] = "CAB Ticket #"
+        self.cfg["mapping"]["custom_fields"][2]["label"] = "Change Request #"
         ado = sample.FakeAdo()
         ado.type_field_map = {"Product Backlog Item": {"Microsoft.VSTS.Common.ValueArea", "Microsoft.VSTS.Common.Priority",
                                                        "Microsoft.VSTS.Scheduling.Effort"}, "Task": set()}
@@ -470,10 +470,10 @@ class ScopeTests(unittest.TestCase):
         story = ado.items[101]
         note = story["comments"][0][1]
         self.assertIn("Jira status: Done (Done)", note)
-        self.assertIn("<b>CAB Ticket #:</b> CAB-77", note)
+        self.assertIn("<b>Change Request #:</b> CHG-77", note)
         self.assertIn("<b>ReleaseNotes:</b> <p><b>bold</b> note</p>", note)
         self.assertIn("<b>BusinessAnalysts:</b> ana@contoso.com", note)
-        self.assertNotIn("Custom.CABTicket#", story["fields"])
+        self.assertNotIn("Custom.ChangeRequest", story["fields"])
         self.assertIn("DEMO-1", story["fields"]["System.Tags"])
 
     def test_unknown_state_stops_before_any_write(self):
@@ -529,32 +529,32 @@ class ScopeTests(unittest.TestCase):
 
 
 SPRINTS = [
-    {"id": 5587, "name": "Fin&Corp Sprint 27", "state": "closed", "startDate": "2026-10-14T00:00:00.000Z",
+    {"id": 101, "name": "Platform&Core Sprint 27", "state": "closed", "startDate": "2026-10-14T00:00:00.000Z",
      "endDate": "2026-10-28T00:00:00.000Z"},
-    {"id": 5598, "name": "Fin&Corp Sprint 28", "state": "active", "startDate": "2026-10-28T00:00:00.000Z",
+    {"id": 102, "name": "Platform&Core Sprint 28", "state": "active", "startDate": "2026-10-28T00:00:00.000Z",
      "endDate": "2026-11-11T00:00:00.000Z"},
-    {"id": 7001, "name": "Merch Sprint 28", "state": "active", "startDate": "2026-10-28T00:00:00.000Z"},
+    {"id": 201, "name": "Checkout Sprint 28", "state": "active", "startDate": "2026-10-28T00:00:00.000Z"},
 ]
 
 
 class SprintLookupTests(unittest.TestCase):
     def test_names_match_the_way_ado_spells_them(self):
         from jira2ado.cli import resolve_sprint
-        self.assertEqual(resolve_sprint("Fin-Corp Sprint 28", SPRINTS, "DEA")["id"], 5598)
-        self.assertEqual(resolve_sprint("fin&corp sprint 28", SPRINTS, "DEA")["id"], 5598)
-        self.assertEqual(resolve_sprint("5587", SPRINTS, "DEA")["id"], 5587)
-        self.assertEqual(resolve_sprint("Corp Sprint 27", SPRINTS, "DEA")["id"], 5587)  # one partial match is fine
+        self.assertEqual(resolve_sprint("Platform-Core Sprint 28", SPRINTS, "PROJ")["id"], 102)
+        self.assertEqual(resolve_sprint("platform&core sprint 28", SPRINTS, "PROJ")["id"], 102)
+        self.assertEqual(resolve_sprint("101", SPRINTS, "PROJ")["id"], 101)
+        self.assertEqual(resolve_sprint("Core Sprint 27", SPRINTS, "PROJ")["id"], 101)  # one partial match is fine
 
     def test_unclear_or_unknown_names_stop_with_choices(self):
         from jira2ado.cli import resolve_sprint
         with self.assertRaises(SystemExit) as ctx:
-            resolve_sprint("Sprint 28", SPRINTS, "DEA")
+            resolve_sprint("Sprint 28", SPRINTS, "PROJ")
         self.assertIn("more than one sprint", str(ctx.exception))
-        self.assertIn("number 5598", str(ctx.exception))
+        self.assertIn("number 102", str(ctx.exception))
         with self.assertRaises(SystemExit) as ctx:
-            resolve_sprint("Fin-Corp Sprint 99", SPRINTS, "DEA")
-        self.assertIn("No sprint called 'Fin-Corp Sprint 99'", str(ctx.exception))
-        self.assertIn("Fin&Corp Sprint 28 (number 5598, active)", str(ctx.exception))
+            resolve_sprint("Platform-Core Sprint 99", SPRINTS, "PROJ")
+        self.assertIn("No sprint called 'Platform-Core Sprint 99'", str(ctx.exception))
+        self.assertIn("Platform&Core Sprint 28 (number 102, active)", str(ctx.exception))
 
 
 class PrepareTests(unittest.TestCase):
@@ -568,11 +568,14 @@ class PrepareTests(unittest.TestCase):
         os.makedirs(os.path.join(self.dir, "configs"))
         for name in ("enterprise-development.yaml", "targets.yaml"):
             shutil.copy(os.path.join(kit, "configs", name), os.path.join(self.dir, "configs", name))
-        os.makedirs(os.path.join(self.dir, "sprint28"))
-        with open(os.path.join(self.dir, "sprint28", "users.csv"), "w") as fh:
-            fh.write("account_id,display_name,jira_email,active,ado_identity\nacc-1,Ana Lee,,True,ana@contoso.com\n")
         os.chdir(self.dir)
-        os.environ.update(JIRA_EMAIL="me@example.com", JIRA_API_TOKEN="j", ADO_PAT="a")
+        os.environ.update(
+            JIRA_BASE_URL="https://demo.atlassian.net",
+            JIRA_EMAIL="me@example.com",
+            JIRA_API_TOKEN="j",
+            ADO_ORG_URL="https://dev.azure.com/contoso",
+            ADO_PAT="a",
+        )
         import jira2ado.ado_client as ac
         import jira2ado.jira_client as jc
         self.saved = ac.AdoClient, jc.JiraClient
@@ -581,7 +584,7 @@ class PrepareTests(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
-            def project_sprints(self, project):
+            def project_sprints(self, project, board_id=None):
                 return SPRINTS
 
         class FakeAdoClient:
@@ -589,7 +592,7 @@ class PrepareTests(unittest.TestCase):
                 self.project = project
 
             def project_name(self):
-                return {"digital project - ado - sandbox": "Digital Project - ADO - Sandbox"}.get(
+                return {"sandbox": "Sandbox", "production": "Production"}.get(
                     self.project.lower(), self.project)
 
         ac.AdoClient, jc.JiraClient = FakeAdoClient, FakeJira
@@ -612,35 +615,30 @@ class PrepareTests(unittest.TestCase):
         return path, config.load(path), err.getvalue()
 
     def test_sandbox_run(self):
-        path, cfg, notes = self._prepare("--from", "dea", "--to", "digital project - ado - sandbox",
-                                         "--sprint", "Fin-Corp Sprint 28")
-        self.assertEqual(path, os.path.join("runs", "dea", "fin-corp-sprint-28", "to-digital-project-ado-sandbox", "config.yaml"))
-        self.assertEqual(cfg["jira"]["jql"], 'project = "DEA" AND sprint in (5598) AND status != Done ORDER BY key ASC')
-        self.assertEqual(cfg["ado"]["project"], "Digital Project - ADO - Sandbox")  # spelled as ADO spells it
+        path, cfg, notes = self._prepare("--from", "proj", "--to", "sandbox",
+                                         "--sprint", "Platform-Core Sprint 28")
+        self.assertEqual(path, os.path.join("runs", "proj", "platform-core-sprint-28", "to-sandbox", "config.yaml"))
+        self.assertEqual(cfg["jira"]["jql"], 'project = "PROJ" AND sprint in (102) AND statusCategory != Done ORDER BY key ASC')
+        self.assertEqual(cfg["ado"]["project"], "Sandbox")  # spelled as ADO spells it
         self.assertIsNone(cfg["ado"]["area_path"])
         self.assertFalse(cfg["ado"]["confirm_with_project_name"])
-        self.assertEqual(cfg["paths"]["export_dir"], os.path.join("runs", "dea", "fin-corp-sprint-28", "export"))
+        self.assertEqual(cfg["paths"]["export_dir"], os.path.join("runs", "proj", "platform-core-sprint-28", "export"))
         self.assertEqual(cfg["paths"]["users_file"], "users.csv")
-        self.assertEqual(cfg["mapping"]["only_sprints"], ["Fin&Corp Sprint 28"])
+        self.assertEqual(cfg["mapping"]["only_sprints"], ["Platform&Core Sprint 28"])
         self.assertFalse(cfg["mapping"]["skip_future_sprints"])
-        self.assertEqual(cfg["mapping"]["states"]["default"]["READY"], "Approved")
         self.assertEqual(cfg["mapping"]["points_field"]["default"], "Microsoft.VSTS.Scheduling.Effort")
-        self.assertTrue(os.path.exists("users.csv"))  # started from sprint28/users.csv
-        self.assertIn("Fin&Corp Sprint 28 (number 5598, active, 2026-10-28 to 2026-11-11)", notes)
+        self.assertIn("Platform&Core Sprint 28 (number 102, active, 2026-10-28 to 2026-11-11)", notes)
 
     def test_two_sprints_an_iteration_and_done_tickets(self):
-        path, cfg, _ = self._prepare("--from", "DEA", "--to", "Enterprise Development", "--sprint", "5587",
-                                     "--sprint", "Fin-Corp Sprint 28", "--iteration", "Fin-Corp Sprint 28", "--include-done")
-        self.assertIn("fin-corp-sprint-27+fin-corp-sprint-28", path)
-        self.assertEqual(cfg["jira"]["jql"], 'project = "DEA" AND sprint in (5587, 5598) ORDER BY key ASC')
-        self.assertEqual(cfg["ado"]["area_path"], "Enterprise Development\\Fin Corp SC Merch")
+        path, cfg, _ = self._prepare("--from", "PROJ", "--to", "Production", "--sprint", "101",
+                                     "--sprint", "Platform-Core Sprint 28", "--iteration", "Platform-Core Sprint 28", "--include-done")
+        self.assertIn("platform-core-sprint-27+platform-core-sprint-28", path)
+        self.assertEqual(cfg["jira"]["jql"], 'project = "PROJ" AND sprint in (101, 102) ORDER BY key ASC')
         self.assertTrue(cfg["ado"]["confirm_with_project_name"])
-        self.assertEqual(cfg["mapping"]["iteration_override"], "Fin-Corp Sprint 28")
-        from jira2ado.planner import override_node
-        self.assertEqual(override_node(cfg), "Fin Corp SC Merch\\Fin-Corp Sprint 28")
+        self.assertEqual(cfg["mapping"]["iteration_override"], "Platform-Core Sprint 28")
 
     def test_a_project_with_no_settings_uses_the_project_root(self):
-        _, cfg, notes = self._prepare("--from", "DEA", "--to", "Other Project", "--sprint", "5598")
+        _, cfg, notes = self._prepare("--from", "PROJ", "--to", "Other Project", "--sprint", "102")
         self.assertIsNone(cfg["ado"]["area_path"])
         self.assertIsNone(cfg["mapping"]["iteration_parent"])
         self.assertTrue(cfg["ado"]["confirm_with_project_name"])
@@ -650,8 +648,8 @@ class PrepareTests(unittest.TestCase):
         import io
         from contextlib import redirect_stdout
         from jira2ado import cli
-        path, _, _ = self._prepare("--from", "DEA", "--to", "Digital Project - ADO - Sandbox", "--sprint", "5598")
-        for key, want in (("ado.project", "Digital Project - ADO - Sandbox"), ("ado.area_path", ""),
+        path, _, _ = self._prepare("--from", "PROJ", "--to", "Sandbox", "--sprint", "102")
+        for key, want in (("ado.project", "Sandbox"), ("ado.area_path", ""),
                           ("ado.confirm_with_project_name", "false")):
             buf = io.StringIO()
             with redirect_stdout(buf):
@@ -667,18 +665,18 @@ class PlacementTests(unittest.TestCase):
         self.cfg["mapping"]["history"] = False
         self.issue = sample.story()
         self.issue["fields"]["customfield_10020"] = [
-            {"id": 5598, "name": "Fin&Corp Sprint 28", "state": "active", "startDate": "2026-10-28T00:00:00.000Z",
+            {"id": 102, "name": "Platform&Core Sprint 28", "state": "active", "startDate": "2026-10-28T00:00:00.000Z",
              "endDate": "2026-11-11T00:00:00.000Z"},
-            {"id": 5587, "name": "Fin&Corp Sprint 27", "state": "closed", "startDate": "2026-10-14T00:00:00.000Z",
+            {"id": 101, "name": "Platform&Core Sprint 27", "state": "closed", "startDate": "2026-10-14T00:00:00.000Z",
              "endDate": "2026-10-28T00:00:00.000Z"}]
 
     def path(self):
         return Planner(self.cfg, sample.META, USERS).plan(self.issue)["revisions"][0]["fields"]["System.IterationPath"]
 
     def test_the_requested_sprint_wins_over_the_current_one(self):
-        self.assertEqual(self.path(), "Shop\\Fin-Corp Sprint 28")
-        self.cfg["mapping"]["only_sprints"] = ["Fin&Corp Sprint 27"]
-        self.assertEqual(self.path(), "Shop\\Fin-Corp Sprint 27")
+        self.assertEqual(self.path(), "Shop\\Platform-Core Sprint 28")
+        self.cfg["mapping"]["only_sprints"] = ["Platform&Core Sprint 27"]
+        self.assertEqual(self.path(), "Shop\\Platform-Core Sprint 27")
 
     def test_one_iteration_for_everything(self):
         m = self.cfg["mapping"]
@@ -697,12 +695,12 @@ class PlacementTests(unittest.TestCase):
         from jira2ado.util import write_json
         write_json(os.path.join(folder, "issues", "DEMO-1.json"), self.issue)
         self.cfg["paths"]["export_dir"] = folder
-        self.cfg["mapping"]["iteration_override"] = "Fin-Corp Sprint 28"
+        self.cfg["mapping"]["iteration_override"] = "Platform-Core Sprint 28"
         ado = sample.FakeAdo()
         stats = import_items(ado, self.cfg, USERS, log=lambda *a, **k: None)
         self.assertEqual(stats["failed"], [])
-        self.assertEqual(ado.iterations, [("Fin-Corp Sprint 28", "2026-10-28T00:00:00.000Z", "2026-11-11T00:00:00.000Z")])
-        self.assertEqual({it["fields"]["System.IterationPath"] for it in ado.items.values()}, {"Shop\\Fin-Corp Sprint 28"})
+        self.assertEqual(ado.iterations, [("Platform-Core Sprint 28", "2026-10-28T00:00:00.000Z", "2026-11-11T00:00:00.000Z")])
+        self.assertEqual({it["fields"]["System.IterationPath"] for it in ado.items.values()}, {"Shop\\Platform-Core Sprint 28"})
 
 
 class TargetSafetyTests(unittest.TestCase):
@@ -784,23 +782,23 @@ class DuplicateMatchTests(unittest.TestCase):
 
     def test_kinds_of_match(self):
         from jira2ado.duplicates import KEY_IN_TITLE, SAME_KEY, SAME_TITLE, classify
-        entries = [("DEA-3637", "Fix  the Banner"), ("DEA-3", "Other")]
-        items = [self.item(1, "Anything", "NAV; dea-3637"),
-                 self.item(2, "Anything", "", **{"Custom.JiraKey": "DEA-3637"}),
-                 self.item(3, "[DEA-3637] copied by hand"),
+        entries = [("PROJ-3637", "Fix  the Banner"), ("PROJ-3", "Other")]
+        items = [self.item(1, "Anything", "NAV; proj-3637"),
+                 self.item(2, "Anything", "", **{"Custom.JiraKey": "PROJ-3637"}),
+                 self.item(3, "[PROJ-3637] copied by hand"),
                  self.item(4, "fix the banner"),
-                 self.item(5, "DEA-36370 is a different ticket"),
-                 self.item(6, "Follow-up to DEA-3 work")]
+                 self.item(5, "PROJ-36370 is a different ticket"),
+                 self.item(6, "Follow-up to PROJ-3 work")]
         found = classify(entries, items, "Custom.JiraKey")
-        self.assertEqual([(m["id"], m["kind"]) for m in found["DEA-3637"]],
+        self.assertEqual([(m["id"], m["kind"]) for m in found["PROJ-3637"]],
                          [(1, SAME_KEY), (2, SAME_KEY), (3, KEY_IN_TITLE), (4, SAME_TITLE)])
-        self.assertEqual([(m["id"], m["kind"]) for m in found["DEA-3"]], [(6, KEY_IN_TITLE)])
-        self.assertNotIn(4, [m["id"] for m in classify(entries, items, titles=False).get("DEA-3637", [])])
+        self.assertEqual([(m["id"], m["kind"]) for m in found["PROJ-3"]], [(6, KEY_IN_TITLE)])
+        self.assertNotIn(4, [m["id"] for m in classify(entries, items, titles=False).get("PROJ-3637", [])])
 
     def test_descriptions_and_groups(self):
         from jira2ado.duplicates import classify, describe, same_summary_groups
-        m = classify([("DEA-9", "Release prep")], [self.item(17990, "Release Prep", "DEA-8")])["DEA-9"][0]
-        self.assertEqual(describe(m), "same title as #17990 (Committed, from DEA-8)")
+        m = classify([("PROJ-9", "Release prep")], [self.item(17990, "Release Prep", "PROJ-8")])["PROJ-9"][0]
+        self.assertEqual(describe(m), "same title as #17990 (Committed, from PROJ-8)")
         self.assertEqual(same_summary_groups([("A-1", "Release prep"), ("A-2", "release  PREP "), ("A-3", "Other")]),
                          [["A-1", "A-2"]])
 
@@ -827,17 +825,17 @@ class FindDuplicatesQueryTests(unittest.TestCase):
                                                             "System.State": "New"}}, None]})
 
         c = AdoClient("https://dev.azure.com/org", "Proj", "t", session=Session())
-        found = c.find_duplicates([("DEA-1", "It's  here")], "Custom.JiraKey")
+        found = c.find_duplicates([("PROJ-1", "It's  here")], "Custom.JiraKey")
         q = sent[0]
         self.assertIn("[System.TeamProject] = @project", q)
-        self.assertIn("[System.Tags] CONTAINS 'DEA-1'", q)
-        self.assertIn("[System.Title] CONTAINS 'DEA-1'", q)
-        self.assertIn("[Custom.JiraKey] = 'DEA-1'", q)
+        self.assertIn("[System.Tags] CONTAINS 'PROJ-1'", q)
+        self.assertIn("[System.Title] CONTAINS 'PROJ-1'", q)
+        self.assertIn("[Custom.JiraKey] = 'PROJ-1'", q)
         self.assertIn("[System.Title] = 'It''s  here'", q)   # quotes doubled
         self.assertIn("[System.Title] = 'It''s here'", q)    # and the version with single spaces
-        self.assertEqual(found["DEA-1"][0]["id"], 7)
+        self.assertEqual(found["PROJ-1"][0]["id"], 7)
         sent.clear()
-        c.find_duplicates([(f"DEA-{i}", "x" * 250) for i in range(300)])
+        c.find_duplicates([(f"PROJ-{i}", "x" * 250) for i in range(300)])
         self.assertGreater(len(sent), 1)
         self.assertTrue(all(len(q) < 32000 for q in sent))
 
@@ -1084,6 +1082,47 @@ class BrowserViewTests(unittest.TestCase):
         self.assertEqual(d["run"]["preview"]["tickets"][0]["ado_state"], "Done")
         self.assertEqual(d["run"]["preview"]["tickets"][0]["action"], "skip")
 
+    def test_s3_s6_m6_m8_d2_server_hardening(self):
+        # S3: /api/ado/create-state is removed (404)
+        self.assertEqual(self.call("/api/ado/create-state", {"project": "Shop", "wit": "Task", "state": "QA"})[0], 404)
+        # D2: Double-pasted tokens are caught immediately
+        status, d = self.call("/api/connect", {
+            "jira_url": "https://x.atlassian.net",
+            "ado_url": "https://dev.azure.com/o",
+            "jira_email": "me@x.com",
+            "jira_token": "secret123456secret123456",
+            "ado_token": "adotok123456adotok123456",
+        })
+        self.assertEqual(status, 200)
+        self.assertIn("pasted twice", d["problems"]["jira"])
+        self.assertIn("pasted twice", d["problems"]["ado"])
+        # Reconnect with valid tokens
+        self.call("/api/connect", {"jira_email": "me@x.com", "jira_token": "good", "ado_token": "good"})
+        os.makedirs(self.run_dir, exist_ok=True)
+        cfg = os.path.join(self.run_dir, "config.yaml")
+        with open(cfg, "w") as fh:
+            fh.write("ado: {org_url: 'https://dev.azure.com/o', project: Shop, confirm_with_project_name: true}\n"
+                     "jira: {base_url: 'https://x.atlassian.net', jql: 'project = X'}\n")
+        rel = os.path.relpath(cfg, self.server.KIT)
+        # M8: Unconfirmed import does NOT save overrides to config.yaml
+        status, _ = self.call("/api/import", {
+            "config": rel,
+            "confirm": "wrong",
+            "ticket_states": {"DEMO-1": "HackedState"},
+        })
+        self.assertEqual(status, 400)
+        with open(cfg) as fh:
+            self.assertNotIn("HackedState", fh.read())
+        # M8: Invalid ticket action is rejected
+        status, d = self.call("/api/override", {"config": rel, "ticket_actions": {"DEMO-1": "drop_database"}})
+        self.assertEqual(status, 400)
+        # S6: Rollback requires server-side confirmation
+        status, d = self.call("/api/rollback", {"config": rel})
+        self.assertEqual(status, 400)
+        self.assertIn("Type Shop exactly to confirm rollback", d["error"])
+        # M6: Session key in query string is rejected when X-Jira2ado-Key header is missing
+        self.assertEqual(self.call(f"/api/download?path={rel}&key={self.server.S.key}", key=False)[0], 403)
+
 
 class ClosestAdoStateTests(unittest.TestCase):
     def test_exact_synonym_and_category_matching(self):
@@ -1208,6 +1247,182 @@ class DeltaSyncAndRollbackTests(unittest.TestCase):
         rb = rollback_run(ado, self.cfg, log=self.q)
         self.assertEqual(len(rb["deleted"]), 2)
         self.assertEqual(len(ado.items), 0)
+
+    def test_sync_delta_never_overwrites_title_only_match_and_preserves_assignee(self):
+        ado = sample.FakeAdo()
+        # Unrelated work item that only shares the title (no DEMO-1 tag or JiraKey)
+        ado.create_item("Product Backlog Item", [
+            {"op": "add", "path": "/fields/System.Title", "value": "Checkout fails on retry"},
+            {"op": "add", "path": "/fields/System.State", "value": "New"},
+            {"op": "add", "path": "/fields/System.AssignedTo", "value": "existing.owner@contoso.com"},
+        ])
+        unrelated_id = max(ado.items)
+        sync_cfg = copy.deepcopy(self.cfg)
+        sync_cfg["mapping"]["ticket_actions"] = {"DEMO-1": "sync", "DEMO-2": "skip"}
+        stats = import_items(ado, sync_cfg, USERS, log=self.q)
+        # Must NOT overwrite the title-only match; it should hold DEMO-1 as a possible duplicate
+        self.assertEqual(stats["synced"], [])
+        self.assertIn("DEMO-1", stats["held"])
+        self.assertEqual(ado.items[unrelated_id]["fields"]["System.State"], "New")
+        self.assertEqual(ado.items[unrelated_id]["fields"]["System.AssignedTo"], "existing.owner@contoso.com")
+
+
+class CodeReviewRegressionTests(unittest.TestCase):
+    """Regression tests for S1-S7, M1-M9, D1-D4, and Smaller #1-#5."""
+
+    def test_s4_preview_and_import_agree_on_agile_and_custom_states(self):
+        # When check --online saves available_wits and valid_states_by_type into meta.json,
+        # Planner(cfg, meta, users) used by import_items must pick the exact same WIT and State.
+        meta = dict(
+            sample.META,
+            available_wits=["User Story", "Bug", "Task", "Epic", "Feature"],
+            valid_states_by_type={
+                "User Story": ["New", "Approved", "Active", "Resolved", "Closed"],
+                "Task": ["New", "Active", "Closed"],
+            },
+            state_categories_by_type={
+                "User Story": {"New": "Proposed", "Approved": "Proposed", "Active": "InProgress", "Resolved": "Resolved", "Closed": "Completed"},
+                "Task": {"New": "Proposed", "Active": "InProgress", "Closed": "Completed"},
+            },
+        )
+        cfg = cfg_for("x")
+        cfg["mapping"]["history"] = False
+        issue = sample.story()
+        issue["fields"]["status"] = {"name": "Approved"}
+        plan = Planner(cfg, meta, USERS).plan(issue)
+        self.assertEqual(plan["type"], "User Story")
+        # Exact 1:1 state "Approved" in User Story valid_states must win over "New"
+        self.assertEqual(plan["revisions"][0]["fields"]["System.State"], "Approved")
+
+    def test_s5_and_smaller1_idempotent_create_and_self_healing_resume(self):
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        cfg = cfg_for(folder)
+        q = lambda *a, **k: None
+        ado = sample.FakeAdo()
+        # Simulate that DEMO-1 was created on the server and advanced to rev 3,
+        # but the local journal only recorded rev 1 before a crash.
+        stats1 = import_items(ado, cfg, USERS, log=q)
+        self.assertEqual(stats1["created"], 2)
+        # Rewind the journal for DEMO-1 to n=1 with an outdated date
+        from jira2ado.importer import journal_path
+        jpath = journal_path(cfg)
+        with open(jpath, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": "rev", "k": "DEMO-1", "id": 101, "n": 1, "last": "2024-01-02T14:00:00.000Z"}) + "\n")
+            fh.write("{corrupt truncated json line\n")
+        # Running import_items again must reconcile from live ADO rev (7) and not duplicate or fail
+        stats2 = import_items(ado, cfg, USERS, log=q)
+        self.assertEqual(stats2["failed"], [])
+        self.assertEqual(len(ado.items), 2)
+        self.assertEqual(ado.items[101]["rev"], 7)
+
+    def test_m1_retried_attachment_upload_rewinds_file_stream(self):
+        import io
+        from unittest.mock import patch
+        from jira2ado.ado_client import AdoClient
+
+        sent_Payloads = []
+
+        class Resp:
+            def __init__(self, status, body=None):
+                self.status_code = status
+                self.headers = {"Content-Type": "application/json"}
+                self.text = json.dumps(body or {})
+                self._b = body or {}
+            def json(self):
+                return self._b
+
+        class Session:
+            headers = {}
+            def __init__(self):
+                self.calls = 0
+            def request(self, method, url, **kw):
+                self.calls += 1
+                data = kw.get("data")
+                raw = data.read() if hasattr(data, "read") else (data or b"")
+                sent_Payloads.append(raw)
+                if self.calls == 1:
+                    return Resp(503, {"message": "Service Unavailable"})
+                return Resp(201, {"url": "https://ado.example/_apis/wit/attachments/1"})
+
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(b"x" * 5000)
+        tmp.close()
+        try:
+            with patch("jira2ado.ado_client.backoff_sleep", return_value=None):
+                c = AdoClient("https://dev.azure.com/org", "Proj", "tok", session=Session())
+                url = c.upload_attachment(tmp.name, "test.bin")
+            self.assertEqual(url, "https://ado.example/_apis/wit/attachments/1")
+            self.assertEqual(len(sent_Payloads), 2)
+            self.assertEqual(len(sent_Payloads[0]), 5000)
+            self.assertEqual(len(sent_Payloads[1]), 5000)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_m2_and_m5_https_enforced_and_jira_is_readonly(self):
+        from jira2ado.ado_client import AdoClient, AdoError
+        from jira2ado.jira_client import JiraClient
+        with self.assertRaises(RuntimeError):
+            JiraClient("http://insecure.example.com", "a@b.com", "tok")
+        with self.assertRaises(AdoError):
+            AdoClient("http://insecure.example.com/org", "Proj", "tok")
+        self.assertFalse(hasattr(JiraClient, "stamp_migrated"))
+
+    def test_m4_identities_checked_against_ado_and_ambiguous_names_excluded(self):
+        import csv
+        from jira2ado.exporter import write_users_file
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        path = os.path.join(folder, "users.csv")
+        # Provide an online ado_discovered directory that does NOT contain ana@contoso.com
+        ado_discovered = {"by_email": {"someone.else@contoso.com": "someone.else@contoso.com"}, "by_name": {}}
+        write_users_file(folder, path, {"example.com": "contoso.com"}, ado_discovered=ado_discovered)
+        with open(path, newline="") as fh:
+            rows = {r["display_name"]: r["ado_identity"] for r in csv.DictReader(fh)}
+        # Unverified domain-rewritten guess must NOT be trusted when ado_discovered directory is provided
+        self.assertEqual(rows["Ana Lee"], "")
+
+    def test_smaller3_per_ticket_state_override_updates_closed_date(self):
+        cfg = cfg_for("x")
+        cfg["mapping"]["history"] = False
+        # Story is "Done" in Jira, override to "Committed" -> ClosedDate must be cleared
+        cfg["mapping"]["ticket_states"] = {"DEMO-1": "Committed", "DEMO-2": "Done"}
+        p = Planner(cfg, sample.META, USERS)
+        story_plan = p.plan(sample.story())
+        self.assertEqual(story_plan["revisions"][0]["fields"]["System.State"], "Committed")
+        self.assertNotIn("Microsoft.VSTS.Common.ClosedDate", story_plan["revisions"][0]["fields"])
+        # Subtask is "In Review" in Jira, override to "Done" -> ClosedDate must be populated
+        sub_plan = p.plan(sample.subtask())
+        self.assertEqual(sub_plan["revisions"][0]["fields"]["System.State"], "Done")
+        self.assertTrue(sub_plan["revisions"][0]["fields"].get("Microsoft.VSTS.Common.ClosedDate"))
+
+    def test_smaller5_http_date_retry_after_and_truncated_journal(self):
+        from unittest.mock import patch
+        from jira2ado.util import Journal, backoff_sleep
+        with patch("jira2ado.util.time.sleep") as mock_sleep:
+            backoff_sleep(0, "Wed, 21 Oct 2015 07:28:00 GMT")
+            self.assertTrue(mock_sleep.called)
+        jfile = os.path.join(tempfile.mkdtemp(), "state.jsonl")
+        with open(jfile, "w") as fh:
+            fh.write('{"t":"rev","k":"DEMO-1","id":101,"n":2}\n{"t":"rev","k":"BROKEN')
+        j = Journal(jfile, readonly=True)
+        self.assertEqual(j.items["DEMO-1"]["revs"], 2)
+
+    def test_d4_verify_checks_iteration_and_assignee(self):
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        cfg = cfg_for(folder)
+        q = lambda *a, **k: None
+        ado = sample.FakeAdo()
+        import_items(ado, cfg, USERS, log=q)
+        import_links(ado, cfg, log=q)
+        # Tamper with IterationPath on item 101
+        ado.items[101]["fields"]["System.IterationPath"] = "Shop\\WrongIteration"
+        report = os.path.join(folder, "verify.csv")
+        _, bad = verify(ado, cfg, USERS, report, log=q)
+        self.assertEqual(bad, 1)
+        with open(report) as fh:
+            self.assertIn("iteration is Shop\\WrongIteration, expected Shop\\Sprint 2-A", fh.read())
 
 
 if __name__ == "__main__":

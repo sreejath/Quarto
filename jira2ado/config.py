@@ -72,7 +72,7 @@ DEFAULTS = {
         # Put every item in this iteration instead of one named after its sprint (run.sh --iteration).
         "iteration_override": None,
         # Duplicate detection & policy:
-        # possible_duplicates: "skip" | "create" | "sync"
+        # possible_duplicates: "skip" | "create"
         # existing_duplicates: "skip" | "create" | "sync"
         "duplicate_check_titles": True,
         "possible_duplicates": "skip",
@@ -85,11 +85,9 @@ DEFAULTS = {
         "include_worklogs": True,
         "include_remote_links": True,
         "include_dev_links": True,
-        "include_unmapped_fields": True,
         "include_hierarchy": False,
         "preserve_rank": True,
         "rewrite_cross_references": True,
-        "stamp_jira_migrated": False,
         # Rewrite Jira email domains when building users.csv, for example {"company.com": "company.org"}.
         "identity_domains": {},
         # Add "Jira status: ..." to the note on each new item, useful when the target has fewer states.

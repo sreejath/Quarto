@@ -50,6 +50,15 @@ def verify(ado, cfg, users, report_path, log=print):
                 problems.append("title differs")
             if fields.get("System.State") != final.get("System.State"):
                 problems.append(f"state is {fields.get('System.State')}, expected {final.get('System.State')}")
+            if final.get("System.IterationPath") and fields.get("System.IterationPath") != final.get("System.IterationPath"):
+                problems.append(f"iteration is {fields.get('System.IterationPath')}, expected {final.get('System.IterationPath')}")
+            got_assigned = fields.get("System.AssignedTo")
+            if isinstance(got_assigned, dict):
+                got_assigned = got_assigned.get("uniqueName") or got_assigned.get("displayName") or ""
+            got_assigned = (got_assigned or "").strip().lower()
+            exp_assigned = (final.get("System.AssignedTo") or "").strip().lower()
+            if exp_assigned and got_assigned != exp_assigned:
+                problems.append(f"assignee is {got_assigned or 'unassigned'}, expected {exp_assigned}")
             if (item.get("rev") or 0) < len(revs):
                 problems.append("fewer revisions than planned")
             if got_comments < exp_comments:

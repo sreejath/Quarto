@@ -79,8 +79,11 @@ def cmd_prepare(a):
     """Write a run config from --from, --to and --sprint. Its path is the only thing printed on stdout."""
     from .ado_client import AdoClient, AdoError
     from .jira_client import JiraClient
+    config.load_dotenv()
     say = lambda *x: print(*x, file=sys.stderr)
-    raw = config._read(a.base) if os.path.exists(a.base) else copy.deepcopy(config.DEFAULTS)
+    local_base = os.path.join("configs", "local", "base.yaml")
+    base_path = local_base if (a.base == os.path.join("configs", "enterprise-development.yaml") and os.path.exists(local_base)) else a.base
+    raw = config._read(base_path) if os.path.exists(base_path) else copy.deepcopy(config.DEFAULTS)
     if getattr(a, "jira_url", None) or os.environ.get("JIRA_BASE_URL"):
         raw.setdefault("jira", {})["base_url"] = (getattr(a, "jira_url", None) or os.environ["JIRA_BASE_URL"]).rstrip("/")
     if getattr(a, "ado_url", None) or os.environ.get("ADO_ORG_URL"):
@@ -89,6 +92,10 @@ def cmd_prepare(a):
     if os.path.exists(a.targets):
         with open(a.targets, encoding="utf-8") as fh:
             targets = yaml.safe_load(fh) or {}
+    local_targets = os.path.join("configs", "local", "targets.yaml")
+    if a.targets == os.path.join("configs", "targets.yaml") and os.path.exists(local_targets):
+        with open(local_targets, encoding="utf-8") as fh:
+            targets.update(yaml.safe_load(fh) or {})
     org = (raw.get("ado") or {}).get("org_url", "").rstrip("/")
     try:
         project = AdoClient(org, a.target.strip(), config.secret("ADO_PAT")).project_name()
@@ -96,7 +103,7 @@ def cmd_prepare(a):
         raise SystemExit(f"\nStopped: {e}")
     match = next((k for k in targets if name_key(k) == name_key(project)), None)
     if match is None:
-        say(f"Note: {a.targets} has no section for '{project}'. Using the mapping in {a.base} with the area and "
+        say(f"Note: {a.targets} has no section for '{project}'. Using the mapping in {base_path} with the area and "
             "iteration at the project root. The preview will show any Jira status that has no state there.")
         profile = {"ado": {"area_path": None, "create_area": False}, "mapping": {"iteration_parent": None}}
     else:
@@ -124,7 +131,7 @@ def cmd_prepare(a):
 
     jql = f'project = "{source}" AND sprint in ({", ".join(str(s["id"]) for s in chosen)})'
     if not a.include_done:
-        jql += " AND status != Done"
+        jql += " AND statusCategory != Done"
     jql += " ORDER BY key ASC"
     run_dir = os.path.join("runs", slug(source), "+".join(slug(s["name"]) for s in chosen))
     target_dir = os.path.join(run_dir, "to-" + slug(project))
@@ -149,14 +156,11 @@ def cmd_prepare(a):
                                "start": (s.get("startDate") or "")[:10], "end": (s.get("endDate") or "")[:10]}
                               for s in chosen]}
 
-    if not os.path.exists("users.csv") and os.path.exists(os.path.join("sprint28", "users.csv")):
-        shutil.copyfile(os.path.join("sprint28", "users.csv"), "users.csv")
-        say("Started users.csv from sprint28/users.csv. New people are added to it on every run.")
     os.makedirs(target_dir, exist_ok=True)
     path = os.path.join(target_dir, "config.yaml")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(f"# Written by jira2ado on {datetime.now():%Y-%m-%d %H:%M}. It is rewritten on every run,\n"
-                 f"# so change {a.targets} or {a.base} instead of this file.\n")
+                 f"# so change {a.targets} or {base_path} instead of this file.\n")
         yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True, width=120)
 
     for s in chosen:
@@ -293,12 +297,23 @@ def cmd_check(cfg, a):
 
     raw_issues = list(load_issues(out))
     used_wits = {type_for(issue, cfg, available_wits) for issue in raw_issues}
+    state_cats = {}
     if a.online and ado:
         for wit in used_wits:
             try:
-                valid[wit] = list(ado.states(wit))
+                if getattr(ado, "state_details", None):
+                    details = ado.state_details(wit)
+                    valid[wit] = [d["name"] for d in details]
+                    state_cats[wit] = {d["name"]: d.get("category", "") for d in details}
+                else:
+                    valid[wit] = list(ado.states(wit))
             except Exception:
                 valid[wit] = []
+        meta["available_wits"] = available_wits
+        meta["valid_states_by_type"] = valid
+        if state_cats:
+            meta["state_categories_by_type"] = state_cats
+        write_json(os.path.join(out, "meta.json"), meta)
 
     types, pairs, places, plans, issues = Counter(), Counter(), Counter(), [], []
     planner = Planner(cfg, meta, users, valid_states_by_type=valid, available_wits=available_wits)
@@ -342,9 +357,13 @@ def cmd_check(cfg, a):
             flag += f"   <-- '{state}' is not a state of {wit} in ADO"
             bad_types.add(wit)
         _, _, match_reason = closest_ado_state(st, wit, valid.get(wit), cfg, meta)
+        j_cat = (meta.get("statuses") or {}).get(st, "indeterminate")
+        rec_ado_cat = {"new": "Proposed", "indeterminate": "InProgress", "done": "Completed"}.get(j_cat, "InProgress")
         report["statuses"].append({
             "type": wit, "jira": st, "ado": state, "count": c,
             "mapped": ok, "exists": exists, "match_reason": match_reason,
+            "needs_attention": match_reason not in ("exact", "configured", "override"),
+            "recommended_ado_category": rec_ado_cat,
             "valid_states": valid.get(wit, []),
         })
         print(f"  {wit:<24} {st:<24} -> {state:<12} {c}{flag}")
@@ -532,14 +551,8 @@ def cmd_plan(cfg, a):
 def cmd_import(cfg, a):
     from .importer import import_items, import_links, state_dir
     ado = _ado(cfg)
-    jira = None
-    if cfg["mapping"].get("stamp_jira_migrated"):
-        try:
-            jira = _jira(cfg)
-        except Exception:
-            jira = None
     stats = import_items(ado, cfg, _users(cfg), only=set(a.keys) or None, limit=a.limit,
-                         possible_duplicates=a.possible_duplicates, jira=jira)
+                         possible_duplicates=a.possible_duplicates)
     tagged = len(stats["possible"]) - len(stats["held"])
     print(f"Created {stats['created']}, resumed {stats['resumed']}, already complete {stats['complete']} "
           f"(found in Azure DevOps by Jira key: {len(stats['existing'])}), "
@@ -580,6 +593,7 @@ def cmd_rollback(cfg, a):
 
 
 def main(argv=None):
+    config.load_dotenv()
     p = argparse.ArgumentParser(prog="jira2ado", description="Migrate Jira Cloud issues to Azure DevOps with full history.")
     p.add_argument("-c", "--config", default="config.yaml")
     sub = p.add_subparsers(dest="cmd", required=True)

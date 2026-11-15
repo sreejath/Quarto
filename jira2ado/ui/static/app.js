@@ -11,8 +11,8 @@ const S = {
   jira: null, ado: null, jiraUrl: "", adoUrl: "", settings: {}, problems: {}, connecting: false, editConnect: false,
   projects: [], projectsError: "", source: "",
   boards: [], boardsLoading: false, board: "",
-  sprints: [], sprintsLoading: false, sprintsError: "", picked: new Set(),
-  includeDone: false, includeHierarchy: true, historyMode: true, stampJira: false,
+  sprints: [], sprintsLoading: false, sprintsError: "", picked: new Set(), sprintFilter: "",
+  includeDone: false, includeHierarchy: false, historyMode: true,
   targets: [], target: "", other: "", isOther: false,
   iterations: [], areas: [], iterationsFor: "", iterationsError: "", iterMode: "sprint", iteration: "", newIteration: "", area: "",
   job: null, since: 0, log: [], phase: "setup", checkedSig: "", checkedAt: null, error: "",
@@ -50,6 +50,32 @@ async function api(path, body) {
   return data;
 }
 
+async function downloadServerFile(path, filename) {
+  let res;
+  try {
+    res = await fetch(`/api/download?path=${encodeURIComponent(path)}`, {
+      headers: { "X-Jira2ado-Key": KEY },
+    });
+  } catch (e) {
+    toast("Could not reach the local server to download the file.");
+    return;
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    toast(err.error || `Download failed (${res.status}).`);
+    return;
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "download.csv";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function toast(text) {
   const t = $("#toast");
   t.textContent = text;
@@ -65,6 +91,19 @@ const targetName = () => (S.isOther ? S.other.trim() : S.target);
 const targetInfo = () => S.targets.find((t) => t.name === targetName());
 const chosenIteration = () => (S.iterMode === "one" ? (S.iteration === "__new" ? S.newIteration.trim() : S.iteration) : "");
 const busy = () => S.phase === "checking" || S.phase === "importing" || S.phase === "rolling_back";
+
+function isDoublePaste(tok) {
+  const v = (tok || "").trim();
+  return v.length >= 20 && v.length % 2 === 0 && v.slice(0, v.length / 2) === v.slice(v.length / 2);
+}
+
+function displayedSprints() {
+  if (!S.sprintFilter.trim()) return S.sprints;
+  const q = S.sprintFilter.trim().toLowerCase();
+  return S.sprints.filter((sp) =>
+    `${sp.name} ${sp.state || ""} ${sp.goal || ""}`.toLowerCase().includes(q)
+  );
+}
 
 function signature() {
   return JSON.stringify({
@@ -99,10 +138,11 @@ function isDuplicateTicket(t) {
 }
 
 function effectiveAction(t) {
-  if (S.ticketActions[t.key]) return S.ticketActions[t.key];
-  if (t.action) return t.action;
+  const chosen = S.ticketActions[t.key] || t.action;
+  if (chosen === "sync" && t.outcome !== "already_there") return "skip";
+  if (chosen) return chosen;
   if (t.outcome === "already_there") return "skip";
-  if (t.outcome === "possible") return S.choice === "create" ? "duplicate" : (S.choice === "sync" ? "sync" : "skip");
+  if (t.outcome === "possible") return S.choice === "create" ? "duplicate" : "skip";
   return "create";
 }
 
@@ -149,7 +189,6 @@ function outcome(t, run) {
   }
   if (t.outcome === "possible") {
     if (act === "duplicate" || act === "create") return { cls: "maybe", text: "Will create duplicate" };
-    if (act === "sync") return { cls: "create", text: "Will sync delta", id: (t.matches && t.matches[0]) ? t.matches[0].id : null };
     return { cls: "maybe", text: "Possible duplicate" };
   }
   if (act === "skip") return { cls: "out", text: "Will be skipped" };
@@ -250,21 +289,30 @@ function renderTickets() {
     setStep("#step-tickets", "locked", `<h2>Source Tickets</h2><p class="lede">Connect first.</p>`);
     return;
   }
+  const prevScroll = document.querySelector("#step-tickets .sprints")?.scrollTop ?? 0;
   const options = S.projects.map((p) =>
     `<option value="${esc(p.key)}" ${p.key === S.source ? "selected" : ""}>${esc(p.key)}: ${esc(p.name)}</option>`).join("");
   const boardOpts = S.boards.map((b) =>
     `<option value="${esc(b.id)}" ${String(b.id) === String(S.board) ? "selected" : ""}>${esc(b.name)} (${esc(b.type)})</option>`).join("");
+  const shown = displayedSprints();
   let list;
   if (S.sprintsLoading) list = `<div class="empty-list">Loading sprints...</div>`;
   else if (S.sprintsError) list = `<div class="empty-list">${esc(S.sprintsError)}</div>`;
   else if (!S.source) list = `<div class="empty-list">Choose a Jira project to see its boards and sprints.</div>`;
   else if (!S.sprints.length) list = `<div class="empty-list">No sprints found on the selected board.</div>`;
-  else list = S.sprints.map((sp) => `
+  else if (!shown.length) list = `<div class="empty-list">No sprints match "${esc(S.sprintFilter)}".</div>`;
+  else list = shown.map((sp) => `
       <label class="sprint ${sp.state === "active" ? "active-sprint" : ""}">
         <input type="checkbox" data-action="pick-sprint" value="${esc(sp.id)}" ${S.picked.has(String(sp.id)) ? "checked" : ""} ${busy() ? "disabled" : ""}>
         <span class="sprint-name">${esc(sp.name)}</span>
         <span class="sprint-meta">${sprintMeta(sp)}</span>
       </label>`).join("");
+  const sprintToolbar = S.sprints.length ? `
+    <div class="sprint-toolbar">
+      <input type="search" class="sprint-filter" data-action="filter-sprints" placeholder="Filter sprints..." value="${esc(S.sprintFilter)}" aria-label="Filter sprints" ${busy() ? "disabled" : ""}>
+      <button type="button" class="btn secondary btn-sm" data-action="select-displayed-sprints" ${!shown.length || busy() ? "disabled" : ""}>Select all displayed (${shown.length})</button>
+      ${shown.some((sp) => S.picked.has(String(sp.id))) ? `<button type="button" class="quiet" data-action="clear-displayed-sprints" ${busy() ? "disabled" : ""}>Clear</button>` : ""}
+    </div>` : "";
   const state = S.source && S.picked.size ? "done" : "current";
   setStep("#step-tickets", state, `
     <h2>Source Tickets</h2>
@@ -283,15 +331,18 @@ function renderTickets() {
         </select>
       </label>
       <div class="field">Sprints (${S.picked.size} selected)
+        ${sprintToolbar}
         <div class="sprints" role="group" aria-label="Sprints">${list}</div>
       </div>
       <label class="check"><input type="checkbox" data-action="include-done" ${S.includeDone ? "checked" : ""} ${busy() ? "disabled" : ""}>
-        <span>Include tickets whose status is <b>Done</b></span></label>
+        <span>Include tickets whose status category is <b>Done</b></span></label>
       <label class="check"><input type="checkbox" data-action="include-hierarchy" ${S.includeHierarchy ? "checked" : ""} ${busy() ? "disabled" : ""}>
         <span>Auto-include parent Epics &amp; child Sub-tasks outside the sprint</span></label>
       <label class="check"><input type="checkbox" data-action="history-mode" ${S.historyMode ? "checked" : ""} ${busy() ? "disabled" : ""}>
         <span>Migrate full changelog revision history, worklogs &amp; links</span></label>
     </div>`);
+  const box = document.querySelector("#step-tickets .sprints");
+  if (box) box.scrollTop = prevScroll;
 }
 
 function renderDestination() {
@@ -303,9 +354,10 @@ function renderDestination() {
   const info = targetInfo();
   const opts = S.targets.map((t) =>
     `<option value="${esc(t.name)}" ${!S.isOther && t.name === S.target ? "selected" : ""}>${esc(t.name)}</option>`).join("");
+  const showOther = !S.targets.some((t) => !t.configured) || S.isOther;
   let note = "";
   if (name) {
-    if (info && info.confirm_with_project_name) note = "Requires typing the project name before migrating.";
+    if (!info || info.confirm_with_project_name) note = "Requires typing the project name before migrating.";
     else note = "Statuses will be automatically matched to the closest state in this project.";
   }
   let iterPick = "";
@@ -332,7 +384,7 @@ function renderDestination() {
         <select data-action="select-target" ${busy() ? "disabled" : ""}>
           <option value="">Choose a project</option>
           ${opts}
-          <option value="__other" ${S.isOther ? "selected" : ""}>Another project...</option>
+          ${showOther ? `<option value="__other" ${S.isOther ? "selected" : ""}>Another project...</option>` : ""}
         </select>
       </label>
       ${S.isOther ? `<input type="text" data-action="other-target" aria-label="Project name" placeholder="Project name, exactly as in Azure DevOps" value="${esc(S.other)}">` : ""}
@@ -368,7 +420,7 @@ function renderCheck() {
     body = `
       ${done ? `<p class="summary-line">Validated at ${esc(S.checkedAt)}. <b>${esc(plural(S.run.preview.issues, "ticket"))}</b> ready for review.</p>` : ""}
       ${stale ? `<p class="problem">Selection changed since last validation. Click Validate again before migrating.</p>` : ""}
-      ${S.error && S.phase !== "importing" ? `<p class="problem">${esc(S.error)}</p>` : ""}
+      ${S.error && S.phase === "setup" ? `<p class="problem">${esc(S.error)}</p>` : ""}
       <div class="row"><button class="btn ${done ? "secondary" : ""}" type="button" data-action="check" ${ready && !busy() ? "" : "disabled"}>${done ? "Validate again" : "Validate"}</button></div>`;
   }
   const state = S.phase === "checking" ? "current" : (S.run && !stale ? "done" : (ready ? "current" : ""));
@@ -398,32 +450,43 @@ function renderImport() {
         <p>${esc(summaryText(run))}</p>
       </div>
       <div class="row">
-        ${files["verify.csv"] ? `<a class="btn secondary btn-sm" href="/api/download?path=${encodeURIComponent(files["verify.csv"])}&key=${encodeURIComponent(KEY)}" download="verify.csv">Download Verify CSV</a>` : ""}
+        ${files["verify.csv"] ? `<button class="btn secondary btn-sm" type="button" data-action="download-file" data-path="${esc(files["verify.csv"])}" data-name="verify.csv">Download Verify CSV</button>` : ""}
         <button class="btn danger btn-sm" type="button" data-action="rollback">Undo / Rollback Run</button>
+      </div>`;
+  } else if (S.phase === "import_failed") {
+    const n = toCreate(run);
+    const c = tally(run);
+    body = `
+      <div class="banner bad">
+        <p><b>Migration did not finish:</b> ${esc(S.error || "See the Log tab for details.")}</p>
+        <p>${esc(plural(c.done, "ticket"))} completed; ${esc(plural(n, "ticket"))} remaining. Retrying is safe and idempotent — completed revisions are skipped and partial tickets are resumed from their live Azure DevOps revision.</p>
+      </div>
+      ${pv.confirm_with_project_name && S.confirm.trim() !== project ? `
+        <label class="field">Type <b>${esc(project)}</b> to confirm retry / resume
+          <input type="text" data-action="confirm" value="${esc(S.confirm)}" autocomplete="off" spellcheck="false">
+        </label>` : ""}
+      <div class="row">
+        <button class="btn" type="button" data-action="import" ${pv.confirm_with_project_name && S.confirm.trim() !== project ? "disabled" : ""}>Retry / Resume Remaining (${n})</button>
+        ${c.done > 0 ? `<button class="btn danger btn-sm" type="button" data-action="rollback">Undo / Rollback Run</button>` : ""}
       </div>`;
   } else {
     const n = toCreate(run);
     const hasDups = pv.tickets.some(isDuplicateTicket);
     let dup = "";
     if (hasDups) {
-      dup = `<p class="hint">Duplicates are highlighted in the table. Use the per-ticket dropdown or the bulk toolbar buttons to <b>Skip</b>, <b>Create Duplicate</b>, or <b>Sync Delta</b>.</p>`;
+      dup = `<p class="hint">Duplicates are highlighted in the table. Use the per-ticket dropdown or the bulk toolbar buttons to <b>Skip</b> or <b>Create Duplicate</b> (or <b>Sync Delta</b> on exact Jira key matches).</p>`;
     }
-    const stampToggle = `
-      <label class="check"><input type="checkbox" data-action="stamp-jira" ${S.stampJira ? "checked" : ""}>
-        <span>Add "Migrated to ADO" link &amp; label on source Jira tickets</span></label>`;
     let go;
     if (!n) {
-      go = `<p class="summary-line">No tickets selected for migration. Change a duplicate's action to <b>Create Duplicate</b> or <b>Sync Delta</b> if you want to migrate it.</p>`;
+      go = `<p class="summary-line">No tickets selected for migration. Change a duplicate's action to <b>Create Duplicate</b> (or <b>Sync Delta</b> for exact key matches) if you want to migrate it.</p>`;
     } else if (pv.confirm_with_project_name) {
       go = `
-        ${stampToggle}
         <label class="field">Type <b>${esc(project)}</b> to confirm migration
           <input type="text" data-action="confirm" value="${esc(S.confirm)}" autocomplete="off" spellcheck="false">
         </label>
         <div class="row"><button class="btn" type="button" data-action="import" ${S.confirm.trim() === project ? "" : "disabled"}>Migrate ${esc(plural(n, "ticket"))}</button></div>`;
     } else {
       go = `
-        ${stampToggle}
         <div class="row"><button class="btn" type="button" data-action="import">Migrate ${esc(plural(n, "ticket"))} to ${esc(project)}</button></div>`;
     }
     body = `${dup}${S.error ? `<p class="problem">${esc(S.error)}</p>` : ""}${go}`;
@@ -531,7 +594,6 @@ function renderManifest() {
         ${dupCount && !busy() && S.phase !== "imported" ? `
           <button type="button" class="btn secondary btn-sm" data-action="bulk-dup" data-mode="skip">Skip All Duplicates</button>
           <button type="button" class="btn secondary btn-sm" data-action="bulk-dup" data-mode="duplicate">Create All Duplicates</button>
-          <button type="button" class="btn secondary btn-sm" data-action="bulk-dup" data-mode="sync">Sync Delta All</button>
         ` : ""}
         <button type="button" class="btn secondary btn-sm" data-action="export-validation-csv">Export Table CSV</button>
       </div>
@@ -598,31 +660,36 @@ function ticketRow(t, run) {
   const curState = effectiveState(t);
   const statePool = Array.from(new Set([...(t.valid_states || []), curState].filter(Boolean)));
   const isEdited = Boolean(S.ticketStates[t.key] || S.statusOverrides[t.jira_status]);
+  const isRecommended = !isEdited && (t.state_match_reason === "fuzzy" || t.state_match_reason === "category");
   const reasonLabel = isEdited ? "✎ Edited by you" : ({
     exact: "✓ Identical state match",
     configured: "✓ Mapped state",
-    fuzzy: "≈ Closest fuzzy match",
-    category: "≈ Category fallback",
+    fuzzy: "★ Recommended closest match",
+    category: "★ Recommended category match",
   }[t.state_match_reason] || "Mapped state");
-  const reasonCls = isEdited ? "override" : (t.state_match_reason === "exact" ? "exact" : (t.state_match_reason === "fuzzy" ? "fuzzy" : ""));
+  const reasonCls = isEdited ? "override" : (t.state_match_reason === "exact" ? "exact" : (isRecommended ? "recommended" : ""));
 
   const statusDropdown = statePool.length ? `
-    <select class="status-select" data-action="ticket-state" data-key="${esc(t.key)}" data-jira-status="${esc(t.jira_status)}" aria-label="Target ADO state for ${esc(t.key)}" ${busy() || S.phase === "imported" ? "disabled" : ""}>
-      ${statePool.map((st) => `<option value="${esc(st)}" ${st === curState ? "selected" : ""}>${esc(st)}</option>`).join("")}
+    <select class="status-select ${isRecommended ? "recommended-select" : ""}" data-action="ticket-state" data-key="${esc(t.key)}" data-jira-status="${esc(t.jira_status)}" aria-label="Target ADO state for ${esc(t.key)}" ${busy() || S.phase === "imported" ? "disabled" : ""}>
+      ${statePool.map((st) => {
+        const recMark = st === t.ado_state && (t.state_match_reason === "fuzzy" || t.state_match_reason === "category");
+        const label = recMark ? `★ ${st} (Recommended)` : st;
+        return `<option value="${esc(st)}" ${st === curState ? "selected" : ""}>${esc(label)}</option>`;
+      }).join("")}
     </select>` : `<div><b>${esc(curState)}</b></div>`;
 
   const applyAllBtn = S.lastChangedKey === t.key ? `
     <div><button type="button" class="quiet" data-action="apply-status-all" data-jira-status="${esc(t.jira_status)}" data-ado-state="${esc(curState)}">Apply "${esc(curState)}" to all "${esc(t.jira_status)}" tickets</button></div>` : "";
 
-  // Per-ticket duplicate / migration action selector
+  // Per-ticket duplicate / migration action selector: Sync Delta is ONLY allowed for exact Jira key matches (S2)
   const act = effectiveAction(t);
-  const canSync = Boolean(t.ado_id || (t.matches && t.matches.length));
+  const canSync = t.outcome === "already_there" && Boolean(t.ado_id);
   const actionSelect = (S.phase !== "imported" && !busy() && (isDup || act === "skip")) ? `
     <div>
       <select class="dup-action-select" data-action="ticket-action" data-key="${esc(t.key)}" aria-label="Action for ${esc(t.key)}">
         <option value="skip" ${act === "skip" ? "selected" : ""}>Skip (Do not create)</option>
         <option value="duplicate" ${act === "duplicate" || act === "create" ? "selected" : ""}>${isDup ? "Create duplicate entry" : "Create in ADO"}</option>
-        ${canSync ? `<option value="sync" ${act === "sync" ? "selected" : ""}>Sync delta onto existing</option>` : ""}
+        ${canSync ? `<option value="sync" ${act === "sync" ? "selected" : ""}>Sync delta onto existing #${esc(t.ado_id)}</option>` : ""}
       </select>
     </div>` : "";
 
@@ -691,20 +758,28 @@ function panelHtml(tab, pv) {
         <td class="${p.iteration_exists === false ? "note" : "soft"}">${p.iteration_exists === false ? "Will be created & subscribed during migration" : p.iteration_exists ? "Exists in ADO" : ""}</td></tr>`).join("")}
       </tbody></table>
       <p class="soft">Migration mode: <b>${esc(pv.mode)}</b> · Links: <b>${esc(pv.links)}</b>.</p>
-      ${files["duplicates.csv"] ? `<div class="row"><a class="btn secondary btn-sm" href="/api/download?path=${encodeURIComponent(files["duplicates.csv"])}&key=${encodeURIComponent(KEY)}" download="duplicates.csv">Download Duplicate Report CSV</a></div>` : ""}`;
+      ${files["duplicates.csv"] ? `<div class="row"><button class="btn secondary btn-sm" type="button" data-action="download-file" data-path="${esc(files["duplicates.csv"])}" data-name="duplicates.csv">Download Duplicate Report CSV</button></div>` : ""}`;
   }
   if (tab === "statuses") {
-    return `<table><thead><tr><th>ADO Work Item Type</th><th>Jira Status</th><th>Target ADO State</th><th>Match Type</th><th>Tickets</th><th>Admin Action</th></tr></thead><tbody>
+    const hasRecommended = pv.statuses.some((s) => s.needs_attention || s.match_reason === "fuzzy" || s.match_reason === "category");
+    const banner = hasRecommended ? `
+      <div class="banner warn">
+        <p><b>★ Highlighted Statuses:</b> Rows marked with <b>★ Recommended</b> do not have an identically named state on the destination work item type in <b>${esc(pv.project)}</b>. Jira2ADO has highlighted the closest matching Azure DevOps state automatically. You can override any status using the dropdown in the ticket table above, or add custom states in Azure DevOps (<i>Organization Settings → Process</i>) and click <b>Validate again</b>.</p>
+      </div>` : "";
+    return `${banner}<table><thead><tr><th>ADO Work Item Type</th><th>Jira Status</th><th>Target ADO State</th><th>Match Type</th><th>Tickets</th><th>Status Guidance</th></tr></thead><tbody>
       ${pv.statuses.map((s) => {
         const cur = S.statusOverrides[s.jira] || s.ado;
-        const canCreateInAdo = s.valid_states && s.valid_states.length && !s.valid_states.some((v) => v.toLowerCase() === s.jira.toLowerCase());
-        return `<tr>
+        const needsAttention = Boolean(s.needs_attention || s.match_reason === "fuzzy" || s.match_reason === "category");
+        const recCat = s.recommended_ado_category || "InProgress";
+        return `<tr class="${needsAttention ? "status-attention" : ""}">
           <td>${esc(s.type)}</td>
           <td><b>${esc(s.jira)}</b></td>
-          <td>${esc(cur)}${s.exists === false ? ` <span class="flag">not a state in ${esc(pv.project)}</span>` : ""}</td>
+          <td><b>${needsAttention ? `★ ${esc(cur)}` : esc(cur)}</b>${s.exists === false ? ` <span class="flag">not a state in ${esc(pv.project)}</span>` : ""}</td>
           <td class="soft">${esc(s.match_reason || (s.mapped ? "configured" : "category"))}</td>
           <td class="num">${s.count}</td>
-          <td>${canCreateInAdo ? `<button type="button" class="quiet" data-action="create-ado-state" data-wit="${esc(s.type)}" data-state="${esc(s.jira)}">+ Create "${esc(s.jira)}" in ADO</button>` : `<span class="soft">✓ Ready</span>`}</td>
+          <td>${needsAttention
+            ? `<span class="match-tag recommended">★ Recommended fallback — no "${esc(s.jira)}" state in ADO (Category: ${esc(recCat)})</span>`
+            : `<span class="match-tag exact">✓ Exact / configured match</span>`}</td>
         </tr>`;
       }).join("")}
       </tbody></table>`;
@@ -745,6 +820,21 @@ function panelHtml(tab, pv) {
   return "";
 }
 
+function safeDescriptionSrcdoc(rawHtml) {
+  const clean = String(rawHtml || "<p><i>(No description)</i></p>")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/\sdata-action\s*=/gi, " data-ignored=")
+    .replace(/\son[a-z]+\s*=/gi, " data-ignored-event=");
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13.5px; line-height: 1.5; color: #1b2333; margin: 10px; overflow-wrap: anywhere; }
+    pre, code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; background: #f3f5fa; padding: 2px 4px; border-radius: 4px; }
+    pre { padding: 8px; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+    th, td { border: 1px solid #d6dce6; padding: 6px 8px; text-align: left; }
+    img { max-width: 100%; height: auto; }
+  </style></head><body>${clean}</body></html>`;
+}
+
 /* ------------------------------------------------------------ Drawer: Ticket Inspector & Help Guide */
 
 function renderDrawer() {
@@ -765,41 +855,40 @@ function renderDrawer() {
         <button type="button" class="btn secondary btn-sm" data-action="close-drawer">Close</button>
       </div>
       <div class="drawer-body">
-        <h3>1. Required Credentials &amp; Permissions</h3>
-        <p>To migrate tickets with 100% fidelity (including original timestamps, original authors, attachments, and sprint hierarchies), prepare:</p>
+        <h3>1. Required Credentials &amp; Minimum Permissions</h3>
+        <p>Jira2ADO is <b>100% read-only on Jira</b> and writes only to your chosen Azure DevOps destination project:</p>
         <ul>
-          <li><b>Atlassian Jira URL</b>: e.g., <code>https://your-org.atlassian.net</code></li>
-          <li><b>Jira API Token</b>: Create one at <code>https://id.atlassian.com/manage-profile/security/api-tokens</code></li>
-          <li><b>Azure DevOps Organization URL</b>: e.g., <code>https://dev.azure.com/your-org</code></li>
-          <li><b>Azure DevOps PAT (Personal Access Token)</b>: Create one in Azure DevOps under <i>User Settings → Personal access tokens</i> with:
+          <li><b>Atlassian Jira URL</b>: <code>https://your-org.atlassian.net</code> (HTTPS required)</li>
+          <li><b>Jira API Token</b>: Create one at <code>https://id.atlassian.com/manage-profile/security/api-tokens</code> (only read access to the source project and board is needed)</li>
+          <li><b>Azure DevOps Organization URL</b>: <code>https://dev.azure.com/your-org</code> (HTTPS required)</li>
+          <li><b>Azure DevOps PAT (Personal Access Token)</b>: Create one in Azure DevOps under <i>User Settings → Personal access tokens</i> with minimum scopes:
             <ul>
-              <li><b>Work Items</b>: <i>Read, write, &amp; manage</i> (required)</li>
-              <li><b>Project and team</b>: <i>Read, write, &amp; manage</i> (to auto-subscribe team sprint boards)</li>
+              <li><b>Work Items</b>: <i>Read &amp; write</i> (required)</li>
+              <li><b>Project and team</b>: <i>Read &amp; write</i> (optional — only needed when auto-creating sprint iterations and subscribing team boards)</li>
             </ul>
           </li>
         </ul>
 
-        <h3>2. Enabling "Bypass Rules" in Azure DevOps (Admin)</h3>
-        <p>Azure DevOps only allows setting historical <code>CreatedDate</code>, <code>ChangedDate</code>, and <code>CreatedBy</code> when the PAT owner has the <b>Bypass rules on work item updates</b> permission:</p>
+        <h3>2. Enabling "Bypass Rules" in Azure DevOps</h3>
+        <p>Jira2ADO uses the Azure DevOps <code>bypassRules=true</code> flag so that migrated work items preserve their original Jira <code>CreatedDate</code>, <code>ChangedDate</code>, <code>ClosedDate</code>, and workflow states across all revisions:</p>
         <ol>
           <li>Open your Azure DevOps Project → <b>Project Settings</b> → <b>Permissions</b> → <b>Users</b>.</li>
-          <li>Select your admin user account.</li>
+          <li>Select your user account.</li>
           <li>Set <b>Bypass rules on work item updates</b> to <b>Allow</b>.</li>
         </ol>
 
-        <h3>3. How Status Matching &amp; Dropdowns Work</h3>
-        <p>When you click <b>Validate</b>, Jira2ADO queries your destination Azure DevOps project for every valid state on each Work Item Type (supporting Scrum, Agile, Basic, CMMI, and custom Inherited processes) and selects the closest match automatically:</p>
+        <h3>3. Dynamic Status Discovery &amp; Highlighted Recommendations</h3>
+        <p>When you click <b>Validate</b>, Jira2ADO queries both Jira and your destination Azure DevOps project for all live statuses and state categories:</p>
         <ul>
-          <li><b>Identical Match</b>: If your ADO project has a state with the same name as Jira (e.g., <i>Ready for QA</i>), it selects it automatically.</li>
-          <li><b>Fuzzy / Semantic Match</b>: Matches similar names (e.g., <i>PO/BA Review</i> → <i>Ready for PO/BA Review</i>, <i>In Progress</i> → <i>Active</i> or <i>Committed</i>).</li>
-          <li><b>Interactive Override</b>: Use the Status dropdown on any row to change a single ticket's target state, or click <i>Apply to all</i> to update every ticket with that Jira status.</li>
-          <li><b>Admin Auto-Create State</b>: In the <i>Statuses</i> tab below the table, admins on Inherited processes can click <b>+ Create in ADO</b> to provision missing states directly.</li>
+          <li><b>Identical Match (✓)</b>: If your ADO project has a state with the exact same name as Jira, it is selected automatically.</li>
+          <li><b>Highlighted Recommendation (★)</b>: When no identically named state exists in ADO, Jira2ADO highlights the closest matching state with a <b>★ Recommended</b> badge in both the ticket dropdown and the <i>Statuses</i> tab.</li>
+          <li><b>Interactive Override</b>: Change any ticket's target state via its dropdown, or click <i>Apply to all</i> to update every ticket with that Jira status.</li>
         </ul>
 
-        <h3>4. Duplicate Detection &amp; Resolution Modes</h3>
+        <h3>4. Duplicate Detection &amp; Safe Resolution</h3>
         <p>Jira2ADO checks three levels of duplicates before creating anything:</p>
         <ul>
-          <li><b>Exact Jira Key Match</b>: An item in ADO already carries the Jira key in its tags or <code>Custom.JiraKey</code> field.</li>
+          <li><b>Exact Jira Key Match</b>: An item in ADO already carries the exact Jira key in its tags or <code>Custom.JiraKey</code> field.</li>
           <li><b>Possible Duplicate</b>: An ADO item's title contains the Jira key or matches the Jira summary.</li>
           <li><b>In-Run Duplicate</b>: Two tickets inside the chosen sprint share the exact same summary.</li>
         </ul>
@@ -807,7 +896,7 @@ function renderDrawer() {
         <ul>
           <li><b>Skip</b>: Leave the ticket out so no duplicate is created.</li>
           <li><b>Create Duplicate Entry</b>: Create a new work item in ADO tagged <code>Possible duplicate</code> and linked to the existing item.</li>
-          <li><b>Sync Delta</b>: Update the existing ADO work item in-place with the latest state, fields, and attachments.</li>
+          <li><b>Sync Delta (Exact Key Matches Only)</b>: Safely update an existing work item that shares the exact Jira key with the latest state, fields, comments, and attachments.</li>
         </ul>
 
         <h3>5. What Data is Migrated ("EVERYTHING")</h3>
@@ -817,7 +906,7 @@ function renderDrawer() {
           <li>Full <b>Change History</b> (each Jira change becomes an ADO revision with original author &amp; timestamp).</li>
           <li>All <b>Comments</b> with original author &amp; timestamp, plus resolved <code>@mentions</code>.</li>
           <li>All <b>Worklogs &amp; Time Tracking</b> (Original Estimate, Completed Work, Remaining Work, and worklog notes).</li>
-          <li>All <b>Links</b>: Parent Epics, Child Sub-tasks, Issue Links (Blocks, Relates, Duplicate), Remote Web/Confluence Links, and Git PR/Branch/Commit links.</li>
+          <li>All <b>Links</b>: Parent Epics, Child Sub-tasks, Issue Links (Blocks, Relates, Duplicate), cross-ticket link rewriting, Remote Web/Confluence Links, and Git PR/Branch/Commit links.</li>
         </ul>
       </div>`;
     return;
@@ -860,7 +949,7 @@ function renderDrawer() {
           </ul>` : ""}
 
         <h3>Rendered Description Preview</h3>
-        <div class="html-preview">${t.description_html || "<i class='soft'>(No description)</i>"}</div>
+        <iframe class="html-preview-frame" sandbox="" title="Rendered Description Preview" srcdoc="${esc(safeDescriptionSrcdoc(t.description_html))}"></iframe>
       </div>`;
   }
 }
@@ -977,6 +1066,14 @@ async function connect(form) {
     render();
     return;
   }
+  if (isDoublePaste(jt) || isDoublePaste(at)) {
+    S.problems = {
+      jira: isDoublePaste(jt) ? "That looks like the Jira API token pasted twice. Paste it once." : "",
+      ado: isDoublePaste(at) ? "That looks like the Azure DevOps token pasted twice. Paste it once." : "",
+    };
+    render();
+    return;
+  }
   S.connecting = true;
   S.problems = {};
   render();
@@ -1047,7 +1144,6 @@ async function persistOverrides() {
       ticket_states: S.ticketStates,
       status_overrides: S.statusOverrides,
       ticket_actions: S.ticketActions,
-      stamp_jira_migrated: S.stampJira,
     });
   } catch (e) {
     toast(e.message);
@@ -1064,7 +1160,6 @@ async function startImport() {
       ticket_states: S.ticketStates,
       status_overrides: S.statusOverrides,
       ticket_actions: S.ticketActions,
-      stamp_jira_migrated: S.stampJira,
       confirm: pv.confirm_with_project_name ? S.confirm.trim() : "yes",
     });
     S.log = [];
@@ -1079,13 +1174,24 @@ async function startImport() {
 }
 
 async function startRollback() {
-  if (!S.run || !S.run.config) return;
-  if (!confirm("Are you sure you want to roll back this migration? Work items created during this run will be moved to the Azure DevOps Recycle Bin (pre-existing items are never deleted).")) {
+  if (!S.run || !S.run.config || !S.run.preview) return;
+  const pv = S.run.preview;
+  let confirmToken = "yes";
+  if (pv.confirm_with_project_name) {
+    const typed = S.confirm.trim() === pv.project
+      ? pv.project
+      : (prompt(`Type "${pv.project}" to confirm rolling back this migration (work items created during this run will be moved to the Recycle Bin):`) || "").trim();
+    if (typed !== pv.project) {
+      toast(`Type "${pv.project}" to confirm rollback.`);
+      return;
+    }
+    confirmToken = typed;
+  } else if (!confirm("Are you sure you want to roll back this migration? Work items created during this run will be moved to the Azure DevOps Recycle Bin (pre-existing items are never deleted).")) {
     return;
   }
   S.error = "";
   try {
-    S.job = await api("/api/rollback", { config: S.run.config });
+    S.job = await api("/api/rollback", { config: S.run.config, confirm: confirmToken });
     S.log = [];
     S.since = 0;
     S.phase = "rolling_back";
@@ -1152,9 +1258,15 @@ async function poll() {
       toast(d.status === "done" ? "Rollback completed. Work items created in this run were removed." : (d.error || "Rollback failed."));
     } else {
       if (d.result && d.result.run) S.run = { ...d.result.run, preview: S.run.preview };
-      S.phase = d.status === "done" ? "imported" : "checked";
-      if (d.status !== "done") S.error = d.status === "stopped" ? "Migration was stopped. Run Migrate again to resume where it stopped."
-        : (d.error || "Migration failed. See the Log tab for details.");
+      if (d.status === "done") {
+        S.phase = "imported";
+        S.error = "";
+      } else {
+        S.phase = "import_failed";
+        S.error = d.status === "stopped"
+          ? "Migration was stopped. Click Retry / Resume Remaining to continue where it left off."
+          : (d.error || "Migration failed. See the Log tab for details, then click Retry / Resume Remaining.");
+      }
     }
     render();
   } catch (e) {
@@ -1181,6 +1293,7 @@ document.addEventListener("click", async (e) => {
   if (action === "import") startImport();
   if (action === "rollback") startRollback();
   if (action === "export-validation-csv") exportValidationCsv();
+  if (action === "download-file") downloadServerFile(el.dataset.path, el.dataset.name);
   if (action === "open-help") { S.drawerMode = "help"; renderDrawer(); }
   if (action === "close-drawer") { S.drawerMode = null; renderDrawer(); }
   if (action === "inspect-ticket") {
@@ -1188,24 +1301,35 @@ document.addEventListener("click", async (e) => {
     S.drawerTicketKey = el.dataset.key;
     renderDrawer();
   }
+  if (action === "select-displayed-sprints") {
+    const boxes = document.querySelectorAll('#step-tickets .sprints input[data-action="pick-sprint"]');
+    boxes.forEach((cb) => {
+      if (!cb.disabled) S.picked.add(String(cb.value));
+    });
+    render();
+  }
+  if (action === "clear-displayed-sprints") {
+    const boxes = document.querySelectorAll('#step-tickets .sprints input[data-action="pick-sprint"]');
+    boxes.forEach((cb) => {
+      S.picked.delete(String(cb.value));
+    });
+    render();
+  }
   if (action === "filter-outcome") {
     S.outcomeFilter = el.dataset.filter;
     renderManifest();
   }
   if (action === "bulk-dup" && S.run && S.run.preview) {
     const mode = el.dataset.mode;
+    if (mode !== "skip" && mode !== "duplicate") return;
     for (const t of S.run.preview.tickets) {
       if (isDuplicateTicket(t)) {
-        if (mode === "sync" && !(t.ado_id || (t.matches && t.matches.length))) {
-          S.ticketActions[t.key] = "duplicate";
-        } else {
-          S.ticketActions[t.key] = mode;
-        }
+        S.ticketActions[t.key] = mode;
       }
     }
     persistOverrides();
     render();
-    toast(`Set all duplicates to: ${mode === "skip" ? "Skip" : (mode === "sync" ? "Sync Delta" : "Create Duplicate")}`);
+    toast(`Set all duplicates to: ${mode === "skip" ? "Skip" : "Create Duplicate"}`);
   }
   if (action === "apply-status-all") {
     const jst = el.dataset.jiraStatus;
@@ -1220,16 +1344,6 @@ document.addEventListener("click", async (e) => {
     persistOverrides();
     render();
     toast(`Mapped all "${jst}" tickets to "${ast}".`);
-  }
-  if (action === "create-ado-state" && S.run && S.run.preview) {
-    const wit = el.dataset.wit;
-    const state = el.dataset.state;
-    try {
-      await api("/api/ado/create-state", { project: S.run.preview.project, wit, state });
-      toast(`Created state "${state}" on ${wit} in ${S.run.preview.project}! Click Validate again to refresh.`);
-    } catch (err) {
-      toast(err.message);
-    }
   }
   if (action === "save-people" && S.run) {
     S.savingPeople = true;
@@ -1262,18 +1376,19 @@ document.addEventListener("change", (e) => {
   if (action === "select-project") {
     S.source = el.value;
     S.board = "";
+    S.sprintFilter = "";
     if (S.source) loadBoardsAndSprints();
     else { S.boards = []; S.sprints = []; S.picked = new Set(); render(); }
   }
   if (action === "select-board") {
     S.board = el.value;
+    S.sprintFilter = "";
     loadSprints();
   }
   if (action === "pick-sprint") { if (el.checked) S.picked.add(el.value); else S.picked.delete(el.value); render(); }
   if (action === "include-done") { S.includeDone = el.checked; render(); }
   if (action === "include-hierarchy") { S.includeHierarchy = el.checked; render(); }
   if (action === "history-mode") { S.historyMode = el.checked; render(); }
-  if (action === "stamp-jira") { S.stampJira = el.checked; persistOverrides(); render(); }
   if (action === "select-target") {
     S.isOther = el.value === "__other";
     if (!S.isOther) S.target = el.value;
@@ -1314,6 +1429,17 @@ document.addEventListener("input", (e) => {
     if (check) check.disabled = !(S.source && S.picked.size && targetName() && chosenIteration()) || busy();
   }
   if (action === "other-target") S.other = el.value;
+  if (action === "filter-sprints") {
+    S.sprintFilter = el.value;
+    renderTickets();
+    renderCheck();
+    renderImport();
+    const input = document.querySelector("[data-action=filter-sprints]");
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+  }
   if (action === "search-tickets") {
     S.searchFilter = el.value;
     renderManifest();

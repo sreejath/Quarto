@@ -1,6 +1,7 @@
 # Default base configuration template for Jira2ADO.
 # Connection URLs (jira.base_url and ado.org_url) can be configured directly
-# in the browser UI or via environment variables (JIRA_BASE_URL, ADO_ORG_URL).
+# in the browser UI, via .env (JIRA_BASE_URL, ADO_ORG_URL), or in configs/local/base.yaml.
+# Statuses and work item types are discovered live from Jira and Azure DevOps during validation.
 
 jira:
   base_url: https://your-org.atlassian.net
@@ -8,8 +9,8 @@ jira:
 
 ado:
   org_url: https://dev.azure.com/your-org
-  project: Enterprise Development
-  area_path: Enterprise Development\Fin Corp SC Merch
+  project: Production
+  area_path: null
 
 paths:
   export_dir: ./export
@@ -24,45 +25,17 @@ mapping:
     Epic: Feature
     Story: Product Backlog Item
     User Story: Product Backlog Item
-    Task: Product Backlog Item
+    Task: Task
     Bug: Bug
-    Prod Bug: Bug
     Test: Test Case
-    UAT Request: Product Backlog Item
-    Work Request: Product Backlog Item
     Sub-task: Task
     Subtask: Task
-    Test Bug: Bug
-  type_tags:
-    Task: Jira Task
-    Prod Bug: Prod Bug
-    UAT Request: UAT Request
-    Work Request: Work Request
-    Test Bug: Test Bug
+  type_tags: {}
 
+  # Live validation queries Jira and Azure DevOps for all statuses/states and maps them
+  # automatically (1:1 exact match -> configured map -> semantic synonym match -> category fallback).
   states:
-    default:              # Product Backlog Item, Bug, Task, User Story
-      To Do: To Do
-      READY: Ready
-      Ready: Ready
-      Development: Development
-      Ready for PR Review: Ready for PR Review
-      PR Review: PR Review
-      Ready for QA: Ready for QA
-      QA: QA
-      PO/BA Review: Ready for PO/BA Review
-      Done: Done
-      In Progress: Development
-      Ready for Release to Production: Ready for PO/BA Review
-      Released to Production: Done
-      Blocked: Development
-      In QA: QA
-      UAT: Ready for PO/BA Review
-      Change Release Ready: Ready for PO/BA Review
-      Ready for Pre-Prod Promotion: Ready for PO/BA Review
-    Feature: {To Do: New, In Progress: In Progress, Done: Done}
-    Epic: {To Do: New, In Progress: In Progress, Done: Done}
-    Test Case: {To Do: Design, In Progress: Design, Done: Ready}
+    default: {}
   resolution_states:
     default: {"Won't Do": Removed, Duplicate: Removed, Cannot Reproduce: Removed}
 
@@ -71,21 +44,16 @@ mapping:
   description_field: {default: System.Description}
   points_jira_names: [Story Points, Story point estimate]      # first filled one wins
   points_field:
-    default: Microsoft.VSTS.Scheduling.StoryPoints
+    default: Microsoft.VSTS.Scheduling.Effort
+    Task: null
     Feature: null
     Epic: null
     Test Case: null
 
   jira_key_field: Custom.JiraKey      # where a type lacks it, the key is added as a tag
-  # Matches by field name across any Jira instance, with fallback to customfield IDs
   custom_fields:
-    - {ado: Custom.BusinessAnalysts, label: "Business Analysts", jira: ["Business Analyst", "Business Analysts", customfield_10330], kind: user}
-    - {ado: Custom.QATesters, label: "QA Testers", jira: ["QA Tester(s)", "QA Testers", "QA Tester", customfield_10455], kind: users}
-    - {ado: Custom.Developers, label: "Developers", jira: ["Developer(s)", "Developers", "Developer", customfield_10454, customfield_10331], kind: users}
-    - {ado: "Custom.CABTicket#", label: "CAB Ticket #", jira: ["CAB Ticket #", "CAB Ticket", customfield_10440], kind: text}
-    - {ado: Custom.ReleaseNotes, label: "Release Notes", jira: ["Release Notes", customfield_10438], kind: html}
-    - {ado: Custom.PromotionNotes, label: "Promotion Notes", jira: ["Promotion Notes", customfield_10437], kind: html}
-    - {ado: Microsoft.VSTS.Common.AcceptanceCriteria, label: "Acceptance Criteria", jira: ["Acceptance Criteria", customfield_10357], kind: html}
+    - {ado: Microsoft.VSTS.Common.AcceptanceCriteria, label: "Acceptance Criteria", jira: ["Acceptance Criteria"], kind: html}
+    - {ado: Custom.ReleaseNotes, label: "Release Notes", jira: ["Release Notes"], kind: html}
 
   tags:
     labels: true
@@ -94,7 +62,7 @@ mapping:
     jira_key: false
 
   sprints_to_iterations: true
-  iteration_parent: Fin Corp SC Merch
+  iteration_parent: null
   skip_future_sprints: true
 
   identity_domains: {}

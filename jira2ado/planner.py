@@ -25,9 +25,9 @@ _STATE_SYNONYMS = [
     {"in progress", "development", "in dev", "active", "committed", "doing", "working", "blocked", "on hold", "coding"},
     {"in review", "pr review", "ready for pr review", "code review", "peer review", "review"},
     {"qa", "in qa", "ready for qa", "testing", "in test", "test", "verification", "sit"},
-    {"uat", "po/ba review", "ready for po/ba review", "user acceptance", "business review", "sign off", "ready for release",
-     "ready for release to production", "change release ready", "ready for pre-prod promotion", "staging"},
-    {"done", "closed", "resolved", "completed", "complete", "released", "released to production", "shipped", "verified"},
+    {"uat", "acceptance", "user acceptance", "product review", "business review", "sign off", "ready for release",
+     "release", "staging", "pre prod", "promotion"},
+    {"done", "closed", "resolved", "completed", "complete", "released", "shipped", "verified"},
     {"removed", "cancelled", "canceled", "won't do", "wont do", "rejected", "duplicate", "cannot reproduce", "abandoned"},
 ]
 
@@ -65,7 +65,12 @@ def closest_ado_state(status, wit, valid_states=None, cfg=None, meta=None, resol
     if ov and (not valid or ov in valid):
         return apply_resolution(ov, True, "override")
 
-    # 2. Explicit config mapping (if it exists in valid_states or when offline)
+    # 2. Exact case/punctuation-insensitive match in valid_states (when ADO has an identically named state)
+    norm_st = _norm_state(status)
+    if valid and norm_st in valid_by_norm:
+        return apply_resolution(valid_by_norm[norm_st], True, "exact")
+
+    # 3. Explicit config mapping (if it exists in valid_states or when offline)
     cfg_hit = None
     for scope in (wit, "default"):
         hit = ((m.get("states") or {}).get(scope) or {}).get(status)
@@ -75,10 +80,9 @@ def closest_ado_state(status, wit, valid_states=None, cfg=None, meta=None, resol
     if cfg_hit and (not valid or cfg_hit in valid):
         return apply_resolution(cfg_hit, True, "configured")
 
-    # 3. Exact case/punctuation-insensitive match in valid_states
-    norm_st = _norm_state(status)
-    if valid and norm_st in valid_by_norm:
-        return apply_resolution(valid_by_norm[norm_st], True, "exact")
+    cat = (meta.get("statuses") or {}).get(status)
+    ado_cats = ((meta.get("state_categories_by_type") or {}).get(wit)) or {}
+    want_ado_cats = {"new": {"Proposed"}, "indeterminate": {"InProgress", "Resolved"}, "done": {"Completed"}}.get(cat, set())
 
     # 4. Fuzzy & synonym match against valid_states
     if valid and status:
@@ -88,7 +92,7 @@ def closest_ado_state(status, wit, valid_states=None, cfg=None, meta=None, resol
         for cand in valid:
             norm_c = _norm_state(cand)
             c_tokens = set(norm_c.split())
-            # Substring containment (e.g. "PO/BA Review" in "Ready for PO/BA Review" or "In QA" -> "QA")
+            # Substring containment (e.g. "Product Review" in "Ready for Product Review" or "In QA" -> "QA")
             sub_bonus = 0.25 if (norm_st and norm_c and (norm_st in norm_c or norm_c in norm_st)) else 0.0
             # Token overlap
             tok_overlap = (len(st_tokens & c_tokens) / max(len(st_tokens | c_tokens), 1)) * 0.45 if (st_tokens and c_tokens) else 0.0
@@ -96,29 +100,37 @@ def closest_ado_state(status, wit, valid_states=None, cfg=None, meta=None, resol
             c_buckets = [i for i, b in enumerate(_STATE_SYNONYMS) if norm_c in b or any(t in b for t in c_tokens)]
             exact_syn = any(norm_st in b and norm_c in b for b in _STATE_SYNONYMS)
             syn_bonus = 0.60 if exact_syn else (0.50 if (st_buckets and c_buckets and set(st_buckets) & set(c_buckets)) else 0.0)
+            # Category alignment bonus/penalty when ADO state categories and Jira statusCategory are known
+            cat_adj = 0.0
+            if want_ado_cats and cand in ado_cats:
+                cat_adj = 0.15 if ado_cats[cand] in want_ado_cats else -0.25
             # Character sequence similarity
             seq_score = SequenceMatcher(None, norm_st, norm_c).ratio() * 0.5
-            score = seq_score + sub_bonus + tok_overlap + syn_bonus
+            score = seq_score + sub_bonus + tok_overlap + syn_bonus + cat_adj
             if score > best_score:
                 best_score, best_state = score, cand
         if best_state and best_score >= 0.52:
             return apply_resolution(best_state, True, "fuzzy")
 
-    # 5. Category fallback
-    cat = (meta.get("statuses") or {}).get(status)
+    # 5. Category fallback (using live ADO state categories first, then synonym buckets)
     by_cat_map = m.get("state_by_category") or {}
     by_cat = by_cat_map.get(wit) or by_cat_map.get("default") or {"new": "New", "indeterminate": "Committed", "done": "Done"}
     cat_choice, ok = (by_cat[cat], True) if cat in by_cat else (by_cat.get("new", "New"), False)
     if valid and cat_choice not in valid:
-        # Pick the closest valid state in the same semantic category
-        cat_bucket_idx = {"new": 0, "indeterminate": 2, "done": 6}.get(cat, 0)
-        bucket = _STATE_SYNONYMS[cat_bucket_idx]
-        for cand in valid:
-            if _norm_state(cand) in bucket:
-                cat_choice = cand
-                break
+        # First check live ADO state_categories_by_type if available
+        matched_by_ado_cat = next((cand for cand in valid if want_ado_cats and ado_cats.get(cand) in want_ado_cats), None)
+        if matched_by_ado_cat:
+            cat_choice = matched_by_ado_cat
         else:
-            cat_choice = valid[0]
+            # Pick the closest valid state in the same semantic category bucket
+            cat_bucket_idx = {"new": 0, "indeterminate": 2, "done": 6}.get(cat, 0)
+            bucket = _STATE_SYNONYMS[cat_bucket_idx]
+            for cand in valid:
+                if _norm_state(cand) in bucket:
+                    cat_choice = cand
+                    break
+            else:
+                cat_choice = valid[0]
     if cfg_hit and not valid:
         return apply_resolution(cfg_hit, True, "configured")
     return apply_resolution(cat_choice, ok, "category" if ok else "fallback")
@@ -376,10 +388,10 @@ def extract_remote_relations(issue):
 
 class Planner:
     def __init__(self, cfg, meta, users=None, valid_states_by_type=None, available_wits=None):
-        self.cfg, self.meta = cfg, meta
+        self.cfg, self.meta = cfg, meta or {}
         self.users = users or {"ids": {}, "names": {}}
-        self.valid_states_by_type = valid_states_by_type or {}
-        self.available_wits = available_wits
+        self.valid_states_by_type = valid_states_by_type if valid_states_by_type is not None else (self.meta.get("valid_states_by_type") or {})
+        self.available_wits = available_wits if available_wits is not None else self.meta.get("available_wits")
         self.warnings = []
 
     def warn(self, key, msg):
@@ -631,13 +643,23 @@ class Planner:
         # Apply per-ticket status override from the interactive validation UI if present
         ticket_state_ov = (m.get("ticket_states") or {}).get(key)
         if ticket_state_ov:
-            # Find the last revision that sets System.State, or set it on the final revision
+            ado_cats = ((self.meta.get("state_categories_by_type") or {}).get(wit)) or {}
+            is_done = ticket_state_ov in m["done_states"] or ado_cats.get(ticket_state_ov) == "Completed"
+            target_rev = revs[-1]
             for r in reversed(revs):
                 if "System.State" in r["fields"]:
-                    r["fields"]["System.State"] = ticket_state_ov
+                    target_rev = r
                     break
+            target_rev["fields"]["System.State"] = ticket_state_ov
+            if is_done:
+                if not any(r["fields"].get("Microsoft.VSTS.Common.ClosedDate") for r in revs):
+                    target_rev["fields"]["Microsoft.VSTS.Common.ClosedDate"] = ctx.get("closed_date") or target_rev["date"]
             else:
-                revs[-1]["fields"]["System.State"] = ticket_state_ov
+                had_earlier_close = any(r is not target_rev and r["fields"].get("Microsoft.VSTS.Common.ClosedDate") for r in revs)
+                if had_earlier_close:
+                    target_rev["fields"]["Microsoft.VSTS.Common.ClosedDate"] = ""
+                else:
+                    target_rev["fields"].pop("Microsoft.VSTS.Common.ClosedDate", None)
 
         return {"key": key, "type": wit, "revisions": revs}
 

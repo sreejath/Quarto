@@ -39,7 +39,7 @@ def node_name(name):
 
 
 def name_key(name):
-    """Compare sprint and iteration names the way ADO stores them: 'Fin&Corp Sprint 28' = 'fin-corp sprint 28'."""
+    """Compare sprint and iteration names the way ADO stores them: 'Platform&Core Sprint 28' = 'platform-core sprint 28'."""
     return re.sub(r"\s+", " ", node_name(name)).lower()
 
 
@@ -49,7 +49,7 @@ def iteration_node(path):
 
 
 def slug(text):
-    """Folder-friendly name: 'Fin&Corp Sprint 28' -> 'fin-corp-sprint-28'."""
+    """Folder-friendly name: 'Platform&Core Sprint 28' -> 'platform-core-sprint-28'."""
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:80] or "unnamed"
 
 
@@ -84,7 +84,10 @@ class Journal:
                 for line in fh:
                     line = line.strip()
                     if line:
-                        self._apply(json.loads(line))
+                        try:
+                            self._apply(json.loads(line))
+                        except (ValueError, KeyError, TypeError):
+                            continue
         self._fh = None
         if not readonly:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -92,7 +95,7 @@ class Journal:
 
     def _apply(self, e):
         if e["t"] == "rev":
-            self.items[e["k"]] = {**self.items.get(e["k"], {}), "id": e["id"], "revs": e["n"], "last": e["d"]}
+            self.items[e["k"]] = {**self.items.get(e["k"], {}), "id": e["id"], "revs": e["n"], "last": e.get("d")}
             if e.get("found"):  # was already in the target before this log; not created by it
                 self.items[e["k"]]["found"] = True
             self.held.pop(e["k"], None)
@@ -119,4 +122,15 @@ class Journal:
 
 
 def backoff_sleep(attempt, retry_after=None):
-    time.sleep(float(retry_after) if retry_after else min(60, 2 ** attempt))
+    delay = min(60, 2 ** attempt)
+    if retry_after:
+        try:
+            delay = max(0.0, min(60.0, float(retry_after)))
+        except (ValueError, TypeError):
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(str(retry_after))
+                delay = max(0.0, min(60.0, (dt - datetime.now(timezone.utc)).total_seconds()))
+            except Exception:
+                pass
+    time.sleep(delay)

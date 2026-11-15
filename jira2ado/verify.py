@@ -3,14 +3,14 @@ import csv
 import os
 
 from .exporter import load_issues
-from .importer import journal_path, link_target
+from .importer import journal_path, link_target, load_meta
 from .planner import Planner
-from .util import Journal, read_json
+from .util import Journal
 
 
 def verify(ado, cfg, users, report_path, log=print):
     out = cfg["paths"]["export_dir"]
-    meta = read_json(os.path.join(out, "meta.json"), {})
+    meta = load_meta(cfg)
     journal = Journal(journal_path(cfg), readonly=True)
     planner = Planner(cfg, meta, users)
     rows, bad, held, before = [], 0, 0, 0

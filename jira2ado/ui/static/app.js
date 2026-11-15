@@ -290,11 +290,17 @@ function renderTickets() {
     return;
   }
   const prevScroll = document.querySelector("#step-tickets .sprints")?.scrollTop ?? 0;
+  const activeEl = document.activeElement;
+  const stepRoot = document.querySelector("#step-tickets");
+  const activeAction = activeEl && stepRoot && stepRoot.contains(activeEl) ? (activeEl.dataset?.action || "") : "";
+  const activeVal = activeEl ? String(activeEl.value ?? "") : "";
   const options = S.projects.map((p) =>
     `<option value="${esc(p.key)}" ${p.key === S.source ? "selected" : ""}>${esc(p.key)}: ${esc(p.name)}</option>`).join("");
   const boardOpts = S.boards.map((b) =>
     `<option value="${esc(b.id)}" ${String(b.id) === String(S.board) ? "selected" : ""}>${esc(b.name)} (${esc(b.type)})</option>`).join("");
   const shown = displayedSprints();
+  const shownPicked = shown.filter((sp) => S.picked.has(String(sp.id))).length;
+  const hiddenPicked = Math.max(0, S.picked.size - shownPicked);
   let list;
   if (S.sprintsLoading) list = `<div class="empty-list">Loading sprints...</div>`;
   else if (S.sprintsError) list = `<div class="empty-list">${esc(S.sprintsError)}</div>`;
@@ -311,7 +317,8 @@ function renderTickets() {
     <div class="sprint-toolbar">
       <input type="search" class="sprint-filter" data-action="filter-sprints" placeholder="Filter sprints..." value="${esc(S.sprintFilter)}" aria-label="Filter sprints" ${busy() ? "disabled" : ""}>
       <button type="button" class="btn secondary btn-sm" data-action="select-displayed-sprints" ${!shown.length || busy() ? "disabled" : ""}>Select all displayed (${shown.length})</button>
-      ${shown.some((sp) => S.picked.has(String(sp.id))) ? `<button type="button" class="quiet" data-action="clear-displayed-sprints" ${busy() ? "disabled" : ""}>Clear</button>` : ""}
+      ${shownPicked ? `<button type="button" class="quiet" data-action="clear-displayed-sprints" ${busy() ? "disabled" : ""}>Clear</button>` : ""}
+      ${hiddenPicked ? `<button type="button" class="quiet" data-action="clear-all-sprints" ${busy() ? "disabled" : ""}>Clear all (${S.picked.size})</button>` : ""}
     </div>` : "";
   const state = S.source && S.picked.size ? "done" : "current";
   setStep("#step-tickets", state, `
@@ -330,7 +337,7 @@ function renderTickets() {
           ${boardOpts}
         </select>
       </label>
-      <div class="field">Sprints (${S.picked.size} selected)
+      <div class="field">Sprints (${S.picked.size} selected${hiddenPicked ? ` · ${hiddenPicked} hidden by filter` : ""})
         ${sprintToolbar}
         <div class="sprints" role="group" aria-label="Sprints">${list}</div>
       </div>
@@ -343,6 +350,12 @@ function renderTickets() {
     </div>`);
   const box = document.querySelector("#step-tickets .sprints");
   if (box) box.scrollTop = prevScroll;
+  if (activeAction) {
+    const target = activeAction === "pick-sprint"
+      ? Array.from(document.querySelectorAll('#step-tickets input[data-action="pick-sprint"]')).find((el) => String(el.value) === activeVal)
+      : document.querySelector(`#step-tickets [data-action="${activeAction}"]`);
+    if (target && typeof target.focus === "function") target.focus({ preventScroll: true });
+  }
 }
 
 function renderDestination() {
@@ -1313,6 +1326,10 @@ document.addEventListener("click", async (e) => {
     boxes.forEach((cb) => {
       S.picked.delete(String(cb.value));
     });
+    render();
+  }
+  if (action === "clear-all-sprints") {
+    S.picked.clear();
     render();
   }
   if (action === "filter-outcome") {

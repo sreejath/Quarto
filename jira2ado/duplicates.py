@@ -2,7 +2,7 @@
 
 Three kinds of match, strongest first:
   same Jira key           the item has the key as a tag, or in the Jira Key field. Certain.
-  Jira key in the title   the item's title contains the key, for example "DEA-3637: Fix banner".
+  Jira key in the title   the item's title contains the key, for example "PROJ-101: Fix banner".
   same title              the item's title equals the Jira summary, ignoring case and extra spaces.
 The first kind means the ticket is already there. The other two are possible duplicates.
 """
@@ -30,7 +30,7 @@ def keys_on_item(item, key_field=None):
 
 
 def key_in_text(key, text):
-    """DEA-3637 counts in "DEA-3637: Fix" or "[DEA-3637] Fix", not in "DEA-36370"."""
+    """PROJ-101 counts in "PROJ-101: Fix" or "[PROJ-101] Fix", not in "PROJ-1010"."""
     return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(key)}(?![0-9])", text or "", re.I))
 
 
@@ -62,7 +62,7 @@ def classify(entries, items, key_field=None, titles=True):
 
 
 def describe(match):
-    """One line for the preview and logs: 'same title as #17990 (Committed, from DEA-1100)'."""
+    """One line for the preview and logs: 'same title as #100 (Committed, from PROJ-102)'."""
     what = {SAME_KEY: "already there as", KEY_IN_TITLE: "Jira key in the title of", SAME_TITLE: "same title as"}
     extra = [match.get("state") or ""] + [f"from {k}" for k in match.get("jira_keys") or []]
     extra = ", ".join(x for x in extra if x)

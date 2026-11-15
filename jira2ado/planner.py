@@ -65,12 +65,7 @@ def closest_ado_state(status, wit, valid_states=None, cfg=None, meta=None, resol
     if ov and (not valid or ov in valid):
         return apply_resolution(ov, True, "override")
 
-    # 2. Exact case/punctuation-insensitive match in valid_states (when ADO has an identically named state)
-    norm_st = _norm_state(status)
-    if valid and norm_st in valid_by_norm:
-        return apply_resolution(valid_by_norm[norm_st], True, "exact")
-
-    # 3. Explicit config mapping (if it exists in valid_states or when offline)
+    # 2. Explicit config mapping (if it exists in valid_states or when offline)
     cfg_hit = None
     for scope in (wit, "default"):
         hit = ((m.get("states") or {}).get(scope) or {}).get(status)
@@ -79,6 +74,11 @@ def closest_ado_state(status, wit, valid_states=None, cfg=None, meta=None, resol
             break
     if cfg_hit and (not valid or cfg_hit in valid):
         return apply_resolution(cfg_hit, True, "configured")
+
+    # 3. Exact case/punctuation-insensitive match in valid_states (when ADO has an identically named state)
+    norm_st = _norm_state(status)
+    if valid and norm_st in valid_by_norm:
+        return apply_resolution(valid_by_norm[norm_st], True, "exact")
 
     cat = (meta.get("statuses") or {}).get(status)
     ado_cats = ((meta.get("state_categories_by_type") or {}).get(wit)) or {}

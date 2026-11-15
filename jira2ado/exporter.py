@@ -169,7 +169,7 @@ def write_users_file(export_dir, path, domains=None, ado_discovered=None):
     users = collect_users(export_dir)
     disc_email = (ado_discovered or {}).get("by_email") or {}
     disc_name = (ado_discovered or {}).get("by_name") or {}
-    has_ado_directory = bool(disc_email or disc_name)
+    has_ado_directory = ado_discovered is not None
 
     def guess(email, name=""):
         if email and "@" in email:

@@ -11,7 +11,7 @@ import yaml
 from . import config
 from .exporter import export, load_issues, load_users_file, write_users_file
 from .planner import Planner, closest_ado_state, map_state, type_for
-from .util import Journal, name_key, read_json, slug, write_json
+from .util import Journal, name_key, read_json, slug, sprint_folder_slug, write_json
 
 
 def _jira(cfg):
@@ -82,15 +82,16 @@ def cmd_prepare(a):
     config.load_dotenv()
     say = lambda *x: print(*x, file=sys.stderr)
     local_base = os.path.join("configs", "local", "base.yaml")
-    base_path = local_base if (a.base == os.path.join("configs", "enterprise-development.yaml") and os.path.exists(local_base)) else a.base
+    base_path = local_base if (a.base == os.path.join("configs", "enterprise-development.yaml") and os.path.exists(local_base)) else config.resolve_config_path(a.base)
     raw = config._read(base_path) if os.path.exists(base_path) else copy.deepcopy(config.DEFAULTS)
     if getattr(a, "jira_url", None) or os.environ.get("JIRA_BASE_URL"):
         raw.setdefault("jira", {})["base_url"] = (getattr(a, "jira_url", None) or os.environ["JIRA_BASE_URL"]).rstrip("/")
     if getattr(a, "ado_url", None) or os.environ.get("ADO_ORG_URL"):
         raw.setdefault("ado", {})["org_url"] = (getattr(a, "ado_url", None) or os.environ["ADO_ORG_URL"]).rstrip("/")
     targets = {}
-    if os.path.exists(a.targets):
-        with open(a.targets, encoding="utf-8") as fh:
+    targets_path = config.resolve_config_path(a.targets)
+    if targets_path and os.path.exists(targets_path):
+        with open(targets_path, encoding="utf-8") as fh:
             targets = yaml.safe_load(fh) or {}
     local_targets = os.path.join("configs", "local", "targets.yaml")
     if a.targets == os.path.join("configs", "targets.yaml") and os.path.exists(local_targets):
@@ -133,7 +134,7 @@ def cmd_prepare(a):
     if not a.include_done:
         jql += " AND statusCategory != Done"
     jql += " ORDER BY key ASC"
-    run_dir = os.path.join("runs", slug(source), "+".join(slug(s["name"]) for s in chosen))
+    run_dir = os.path.join("runs", slug(source), sprint_folder_slug(chosen))
     target_dir = os.path.join(run_dir, "to-" + slug(project))
     raw["jira"]["jql"] = jql
     if board_id:
@@ -256,11 +257,12 @@ def cmd_export(cfg, a):
 
 def cmd_users(cfg, a):
     ado_disc = None
-    try:
-        if os.environ.get("ADO_PAT") and cfg["ado"].get("org_url") and cfg["ado"].get("project"):
-            ado_disc = _ado(cfg).discover_users()
-    except Exception:
-        ado_disc = None
+    if os.environ.get("ADO_PAT") and cfg["ado"].get("org_url") and cfg["ado"].get("project"):
+        ado_disc = {"by_email": {}, "by_name": {}}
+        try:
+            ado_disc = _ado(cfg).discover_users() or ado_disc
+        except Exception:
+            pass
     total, unmapped = write_users_file(
         cfg["paths"]["export_dir"], cfg["paths"]["users_file"], cfg["mapping"]["identity_domains"], ado_discovered=ado_disc
     )
@@ -273,10 +275,10 @@ def cmd_check(cfg, a):
     data as preview.json in the target folder, one row per ticket, for the browser view."""
     from .duplicates import describe
     from .exporter import collect_users, load_users_file
-    from .importer import journal_path, plan_title, state_dir
+    from .importer import journal_path, load_meta, plan_title, state_dir
     from .planner import field_ids
     out = cfg["paths"]["export_dir"]
-    meta = read_json(os.path.join(out, "meta.json"), {})
+    meta = load_meta(cfg)
     users = _users(cfg)
     project = cfg["ado"]["project"]
 
@@ -309,11 +311,11 @@ def cmd_check(cfg, a):
                     valid[wit] = list(ado.states(wit))
             except Exception:
                 valid[wit] = []
-        meta["available_wits"] = available_wits
-        meta["valid_states_by_type"] = valid
+        ado_meta = {"available_wits": available_wits, "valid_states_by_type": valid}
         if state_cats:
-            meta["state_categories_by_type"] = state_cats
-        write_json(os.path.join(out, "meta.json"), meta)
+            ado_meta["state_categories_by_type"] = state_cats
+        meta.update(ado_meta)
+        write_json(os.path.join(state_dir(cfg), "ado-meta.json"), ado_meta)
 
     types, pairs, places, plans, issues = Counter(), Counter(), Counter(), [], []
     planner = Planner(cfg, meta, users, valid_states_by_type=valid, available_wits=available_wits)
@@ -533,9 +535,9 @@ def cmd_check(cfg, a):
 
 
 def cmd_plan(cfg, a):
-    from .importer import state_dir
+    from .importer import load_meta, state_dir
     out = cfg["paths"]["export_dir"]
-    meta = read_json(os.path.join(out, "meta.json"), {})
+    meta = load_meta(cfg)
     planner = Planner(cfg, meta, _users(cfg))
     n = revs = 0
     for issue in load_issues(out):
@@ -569,7 +571,7 @@ def cmd_import(cfg, a):
         "synced": stats.get("synced", []),
         "tagged": sorted(set(stats["possible"]) - set(stats["held"]) - set(stats.get("synced", [])))})
     if not a.no_links:
-        links = import_links(ado, cfg)
+        links = import_links(ado, cfg, skip_keys=set(stats["failed"]))
         write_json(os.path.join(state_dir(cfg), "link-report.json"), links)
     if stats["failed"]:
         sys.exit(1)

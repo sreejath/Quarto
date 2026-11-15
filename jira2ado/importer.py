@@ -18,6 +18,17 @@ def state_dir(cfg):
     return cfg["paths"].get("state_dir") or cfg["paths"]["export_dir"]
 
 
+def load_meta(cfg):
+    """Load Jira export metadata and overlay destination-specific ADO metadata from state_dir."""
+    out = cfg["paths"]["export_dir"]
+    meta = dict(read_json(os.path.join(out, "meta.json"), {}) or {})
+    sdir = state_dir(cfg)
+    if sdir:
+        ado_meta = read_json(os.path.join(sdir, "ado-meta.json"), {}) or {}
+        meta.update(ado_meta)
+    return meta
+
+
 def journal_path(cfg):
     return os.path.join(state_dir(cfg), "import-state.jsonl")
 
@@ -243,20 +254,50 @@ def _create_item_idempotent(ado, wit, ops, key, title, key_ref):
         raise
 
 
+def _norm_comment(s):
+    return " ".join((s or "").split())
+
+
 def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal, base, planner,
                        key_to_ado=None, ado_edit_base="", log=print):
     """Delta Sync (for exact Jira key matches only): update an existing ADO work item with the latest
     Jira state, non-blank fields, new attachments, and any missing comments without clearing existing
     ADO assignees or overwriting title-only matches."""
+    from urllib.parse import parse_qs, urlparse
     key = plan["key"]
     out = cfg["paths"]["export_dir"]
     revs = plan["revisions"]
     live = ado.get_item(item_id) if getattr(ado, "get_item", None) else {"fields": {}, "relations": []}
-    live_fields = live.get("fields") or {}
-    live_rel_urls = {r.get("url") for r in (live.get("relations") or []) if r.get("url")}
+    live_fields = dict(live.get("fields") or {})
+    live_rels = list(live.get("relations") or [])
+    live_rel_urls = {r.get("url") for r in live_rels if r.get("url")}
+    before_rel_urls = set(live_rel_urls)
+
+    # Map existing attached filenames on the ADO item so syncing from another run folder reuses them
+    existing_att_by_name = {}
+    for r in live_rels:
+        url = r.get("url") or ""
+        if not url:
+            continue
+        if r.get("rel") == "AttachedFile" or "/attachments/" in url:
+            attrs = r.get("attributes") or {}
+            rname = attrs.get("name") or (parse_qs(urlparse(url).query).get("fileName") or [""])[0]
+            if rname:
+                existing_att_by_name[rname] = url
+
+    existing_comments = []
+    if getattr(ado, "comments", None):
+        try:
+            existing_comments = list(ado.comments(item_id) or [])
+        except Exception:
+            existing_comments = []
+    existing_norm = {_norm_comment(c) for c in existing_comments if c}
+
     new_atts = []
     for rev in revs:
         for a in rev["attachments"]:
+            if a["id"] not in journal.atts and a["filename"] in existing_att_by_name:
+                journal.log(t="att", a=a["id"], u=existing_att_by_name[a["filename"]])
             if a["id"] not in journal.atts:
                 path = os.path.join(out, a["local_path"])
                 if os.path.exists(path) and os.path.getsize(path) <= MAX_ATTACHMENT:
@@ -264,6 +305,7 @@ def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal
             if a["id"] in journal.atts and journal.atts[a["id"]] not in live_rel_urls:
                 new_atts.append(a)
                 live_rel_urls.add(journal.atts[a["id"]])
+
     final_fields = {}
     for rev in revs:
         adapted = adapt_to_type(rev, supported, key, plan["type"], cfg, planner)
@@ -272,6 +314,24 @@ def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal
     # Never wipe an existing ADO assignee simply because the Jira assignee has no ADO mapping
     if final_fields.get("System.AssignedTo") == "" and live_fields.get("System.AssignedTo") and (issue.get("fields") or {}).get("assignee"):
         final_fields.pop("System.AssignedTo", None)
+    # Merge tags added in Azure DevOps with the planned Jira tags
+    if "System.Tags" in final_fields and live_fields.get("System.Tags"):
+        existing_tags = [t.strip() for t in str(live_fields["System.Tags"]).split(";") if t.strip()]
+        planned_tags = [t.strip() for t in str(final_fields["System.Tags"]).split(";") if t.strip()]
+        merged_tags = list(existing_tags)
+        seen_tags = {t.casefold() for t in existing_tags}
+        for t in planned_tags:
+            if t.casefold() not in seen_tags:
+                merged_tags.append(t)
+                seen_tags.add(t.casefold())
+        final_fields["System.Tags"] = "; ".join(merged_tags)
+
+    # Save a pre-sync snapshot in the journal so rollback can restore the item
+    if key not in journal.synced:
+        tracked_keys = (set(final_fields) | set(live_fields)) - {"System.CreatedDate", "System.CreatedBy", "System.ChangedDate", "System.ChangedBy"}
+        before_fields = {k: live_fields.get(k) for k in sorted(tracked_keys)}
+        journal.log(t="sync", k=key, id=item_id, before_fields=before_fields, before_rel_urls=sorted(before_rel_urls))
+
     live_last = parse_dt(live_fields.get("System.ChangedDate")) if live_fields.get("System.ChangedDate") else None
     when = bump(datetime.now(timezone.utc), live_last)
     sync_rev = {
@@ -285,17 +345,24 @@ def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal
     ops = build_ops(sync_rev, users, journal.atts, base, when, key_to_ado=key_to_ado, ado_edit_base=ado_edit_base)
     ado.update_item(item_id, ops)
     last = when
-    # Append any Jira comments beyond what the item already has
-    existing_comments = ado.comment_count(item_id) if getattr(ado, "comment_count", None) else 0
+
+    # Append any Jira comments that are not already present on the ADO item
     comment_revs = [r for r in revs[1:] if r.get("comment")]
-    for crev in comment_revs[max(0, existing_comments - 1):]:
+    for crev in comment_revs:
         when = bump(datetime.now(timezone.utc), last)
         c_ops = build_ops(
             {"date": iso(when), "author": crev.get("author"), "author_name": crev.get("author_name"),
              "fields": {}, "comment": crev["comment"], "attachments": []},
             users, journal.atts, base, when, key_to_ado=key_to_ado, ado_edit_base=ado_edit_base,
         )
+        c_html = next((o["value"] for o in c_ops if o["path"] == "/fields/System.History"), "")
+        raw_html = rewrite_html(crev["comment"], journal.atts, base, key_to_ado=key_to_ado, ado_edit_base=ado_edit_base)
+        norm_full = _norm_comment(c_html)
+        norm_raw = _norm_comment(raw_html)
+        if norm_full in existing_norm or (norm_raw and any(norm_raw in ec for ec in existing_norm)):
+            continue
         ado.update_item(item_id, c_ops)
+        existing_norm.add(norm_full)
         last = when
     journal.log(t="rev", k=key, id=item_id, n=len(revs), d=iso(last), found=True)
     log(f"  {key} delta-synced onto existing #{item_id}")
@@ -308,7 +375,7 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
     Note: 'sync' is only permitted on exact Jira key matches (existing), never on title-only matches."""
     from urllib.parse import quote
     out = cfg["paths"]["export_dir"]
-    meta = read_json(os.path.join(out, "meta.json"), {})
+    meta = load_meta(cfg)
     journal = Journal(journal_path(cfg))
     available_wits = meta.get("available_wits") or (ado.work_item_types() if getattr(ado, "work_item_types", None) else None)
     planner = Planner(cfg, meta, users, available_wits=available_wits)
@@ -410,7 +477,8 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                 # Inline images can point at any attachment, so all uploads happen before the first write.
                 last = parse_dt(st["last"]) if st.get("last") else None
                 item_id = st.get("id")
-                # Self-healing resume: reconcile against live ADO item if resuming a partial import
+                # Self-healing resume: reconcile ChangedDate against live ADO item if resuming a partial import
+                # (Never infer `done` from live["rev"], because link additions or edits increment `rev` in ADO)
                 if item_id is not None and done > 0 and getattr(ado, "get_item", None):
                     try:
                         live = ado.get_item(item_id)
@@ -419,10 +487,6 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                             live_dt = parse_dt(live_changed)
                             if live_dt and (not last or live_dt > last):
                                 last = live_dt
-                        live_rev = live.get("rev") or 0
-                        if live_rev > done and done < len(plan["revisions"]):
-                            done = min(live_rev, len(plan["revisions"]))
-                            journal.log(t="rev", k=key, id=item_id, n=done, d=iso(last or datetime.now(timezone.utc)))
                     except Exception:
                         pass
                 for i in range(done, len(plan["revisions"])):
@@ -473,9 +537,10 @@ def link_target(issue, cfg):
             yield m.get((l.get("type") or {}).get("name"), m["default"]), l["outwardIssue"]["key"]
 
 
-def import_links(ado, cfg, log=print):
+def import_links(ado, cfg, log=print, skip_keys=None):
     out = cfg["paths"]["export_dir"]
     journal = Journal(journal_path(cfg))
+    skip_keys = set(skip_keys or ())
     stats = {"added": 0, "skipped_outside_scope": [], "failed": []}
     # Also resolve external links if the target key already exists in ADO!
     finder = getattr(ado, "find_duplicates", None)
@@ -485,6 +550,8 @@ def import_links(ado, cfg, log=print):
         missing_targets = set()
         for issue in load_issues(out):
             key = issue["key"]
+            if key in skip_keys:
+                continue
             st = journal.items.get(key)
             if not st or not st.get("id") or st.get("links"):
                 continue
@@ -503,6 +570,8 @@ def import_links(ado, cfg, log=print):
 
         for issue in load_issues(out):
             key = issue["key"]
+            if key in skip_keys:
+                continue
             st = journal.items.get(key)
             if not st or not st.get("id") or st.get("links"):
                 continue
@@ -531,16 +600,44 @@ def import_links(ado, cfg, log=print):
 
 def rollback_run(ado, cfg, log=print):
     """Golden Quadrant #3: Delete all work items created by this run (never items that existed before
-    this run) and reset the run's journal so the migration can be re-run cleanly."""
+    this run), restore any pre-existing items updated via Delta Sync, and reset the run's journal."""
     jpath = journal_path(cfg)
     if not os.path.exists(jpath):
         log("Nothing to roll back: no import journal found for this run.")
-        return {"deleted": [], "failed": [], "kept_preexisting": []}
+        return {"deleted": [], "failed": [], "kept_preexisting": [], "restored": []}
     journal = Journal(jpath, readonly=True)
-    deleted, failed, kept = [], [], []
+    deleted, failed, kept, restored = [], [], [], []
     for key, st in sorted(journal.items.items()):
         item_id = st.get("id")
         if not item_id:
+            continue
+        if key in journal.synced:
+            sync_info = journal.synced[key]
+            b_fields = sync_info.get("before_fields") or {}
+            try:
+                live = ado.get_item(item_id) if getattr(ado, "get_item", None) else {"fields": {}, "relations": []}
+                cur_fields = live.get("fields") or {}
+                live_last = parse_dt(cur_fields.get("System.ChangedDate")) if cur_fields.get("System.ChangedDate") else None
+                when = bump(datetime.now(timezone.utc), live_last)
+                ops = [{"op": "add", "path": "/fields/System.ChangedDate", "value": iso(when)}]
+                for ref, val in b_fields.items():
+                    if val is None:
+                        if ref in cur_fields:
+                            ops.append({"op": "remove", "path": f"/fields/{ref}"})
+                    else:
+                        ops.append({"op": "add", "path": f"/fields/{ref}", "value": val})
+                before_urls = set(sync_info.get("before_rel_urls") or [])
+                rels = live.get("relations") or []
+                for idx in range(len(rels) - 1, -1, -1):
+                    if rels[idx].get("url") and rels[idx]["url"] not in before_urls:
+                        ops.append({"op": "remove", "path": f"/relations/{idx}"})
+                ado.update_item(item_id, ops)
+                restored.append({"key": key, "id": item_id})
+                kept.append({"key": key, "id": item_id})
+                log(f"  Restored {key} (#{item_id}) to its pre-sync state")
+            except AdoError as e:
+                failed.append({"key": key, "id": item_id, "error": str(e)})
+                log(f"  Failed to restore synced item {key} (#{item_id}): {e}")
             continue
         if st.get("found"):
             kept.append({"key": key, "id": item_id})
@@ -568,5 +665,6 @@ def rollback_run(ado, cfg, log=print):
                     os.remove(fpath)
                 except OSError:
                     pass
-        log(f"Rollback complete. {len(deleted)} work item(s) moved to ADO Recycle Bin.")
-    return {"deleted": deleted, "failed": failed, "kept_preexisting": kept}
+        log(f"Rollback complete. {len(deleted)} work item(s) moved to ADO Recycle Bin"
+            + (f", {len(restored)} synced item(s) restored." if restored else "."))
+    return {"deleted": deleted, "failed": failed, "kept_preexisting": kept, "restored": restored}

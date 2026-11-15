@@ -1299,22 +1299,26 @@ class CodeReviewRegressionTests(unittest.TestCase):
         sample.write_export(folder)
         cfg = cfg_for(folder)
         q = lambda *a, **k: None
-        ado = sample.FakeAdo()
-        # Simulate that DEMO-1 was created on the server and advanced to rev 3,
-        # but the local journal only recorded rev 1 before a crash.
+        # Fail after 3 writes on DEMO-1 (which has 7 revisions and 3 comments)
+        ado = sample.FakeAdo(fail_after=3)
         stats1 = import_items(ado, cfg, USERS, log=q)
-        self.assertEqual(stats1["created"], 2)
-        # Rewind the journal for DEMO-1 to n=1 with an outdated date
-        from jira2ado.importer import journal_path
-        jpath = journal_path(cfg)
-        with open(jpath, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"t": "rev", "k": "DEMO-1", "id": 101, "n": 1, "last": "2024-01-02T14:00:00.000Z"}) + "\n")
-            fh.write("{corrupt truncated json line\n")
-        # Running import_items again must reconcile from live ADO rev (7) and not duplicate or fail
+        self.assertEqual(stats1["failed"], ["DEMO-1", "DEMO-2"])
+        self.assertEqual(ado.items[101]["rev"], 3)
+        # Simulate another update or relation added to #101 in ADO while failed (raising rev to 4 and advancing ChangedDate)
+        ado.fail_after = None
+        ado.update_item(101, [
+            {"op": "add", "path": "/fields/System.ChangedDate", "value": "2024-06-01T00:00:00.000Z"},
+            {"op": "add", "path": "/relations/-", "value": {"rel": "Hyperlink", "url": "https://example.com"}},
+        ])
+        self.assertEqual(ado.items[101]["rev"], 4)
+        # Retrying import_items must NOT skip revision #3 due to live rev=4; all 3 comments must be written
         stats2 = import_items(ado, cfg, USERS, log=q)
         self.assertEqual(stats2["failed"], [])
         self.assertEqual(len(ado.items), 2)
-        self.assertEqual(ado.items[101]["rev"], 7)
+        self.assertEqual(len(ado.items[101]["comments"]), 3)
+        import_links(ado, cfg, log=q)
+        _, bad = verify(ado, cfg, USERS, os.path.join(folder, "r.csv"), log=q)
+        self.assertEqual(bad, 0)
 
     def test_m1_retried_attachment_upload_rewinds_file_stream(self):
         import io
@@ -1423,6 +1427,155 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertEqual(bad, 1)
         with open(report) as fh:
             self.assertIn("iteration is Shop\\WrongIteration, expected Shop\\Sprint 2-A", fh.read())
+
+    def test_round2_sync_delta_comments_attachments_tags_and_rollback(self):
+        from jira2ado.importer import rollback_run
+        from jira2ado.util import read_json, write_json
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        cfg = cfg_for(folder)
+        cfg["mapping"]["history"] = False
+        cfg["mapping"]["note_jira_status"] = True
+        q = lambda *a, **k: None
+        ado = sample.FakeAdo()
+
+        # Initial import of DEMO-1 (2 comments, 1 attachment)
+        stats0 = import_items(ado, cfg, USERS, only={"DEMO-1"}, log=q)
+        self.assertEqual(stats0["created"], 1)
+        self.assertEqual(len(ado.uploads), 1)
+        # User adds a custom tag in Azure DevOps and changes State to New
+        ado.items[101]["fields"]["System.Tags"] = str(ado.items[101]["fields"].get("System.Tags") or "") + "; ADO-Custom-Tag"
+        ado.items[101]["fields"]["System.State"] = "New"
+
+        # Add a 3rd comment to DEMO-1 in the Jira export and run 1st Sync from a brand-new state_dir
+        issue_file = os.path.join(folder, "issues", "DEMO-1.json")
+        iss = read_json(issue_file)
+        iss["comments"].append({
+            "id": "c3", "author": sample.U1,
+            "created": "2024-01-05T10:00:00.000-0500",
+            "body": "Third comment added before first sync",
+        })
+        write_json(issue_file, iss)
+
+        sync_cfg1 = copy.deepcopy(cfg)
+        sync_cfg1["paths"]["state_dir"] = tempfile.mkdtemp()
+        sync_cfg1["mapping"]["ticket_actions"] = {"DEMO-1": "sync"}
+        s1 = import_items(ado, sync_cfg1, USERS, only={"DEMO-1"}, log=q)
+        self.assertEqual(s1["synced"], ["DEMO-1"])
+        # Attachment must NOT be re-uploaded or duplicated even in a new state_dir!
+        self.assertEqual(len(ado.uploads), 1)
+        att_rels = [r for r in ado.items[101]["relations"] if r.get("rel") == "AttachedFile"]
+        self.assertEqual(len(att_rels), 1)
+        # ADO-Custom-Tag must be preserved alongside Jira tags
+        self.assertIn("ADO-Custom-Tag", ado.items[101]["fields"]["System.Tags"])
+        self.assertIn("checkout", ado.items[101]["fields"]["System.Tags"])
+        # The 3rd comment must be added even with note_jira_status=True
+        all_comments_1 = "\n".join(ado.comments(101))
+        self.assertIn("Third comment added before first sync", all_comments_1)
+
+        # Add a 4th comment in Jira and run a 2nd Sync from another new state_dir
+        iss["comments"].append({
+            "id": "c4", "author": sample.U2,
+            "created": "2024-01-06T11:00:00.000-0500",
+            "body": "Fourth comment added before second sync",
+        })
+        write_json(issue_file, iss)
+        sync_cfg2 = copy.deepcopy(cfg)
+        sync_cfg2["paths"]["state_dir"] = tempfile.mkdtemp()
+        sync_cfg2["mapping"]["ticket_actions"] = {"DEMO-1": "sync"}
+        s2 = import_items(ado, sync_cfg2, USERS, only={"DEMO-1"}, log=q)
+        self.assertEqual(s2["synced"], ["DEMO-1"])
+        self.assertEqual(len(ado.uploads), 1)
+        all_comments_2 = "\n".join(ado.comments(101))
+        self.assertIn("Fourth comment added before second sync", all_comments_2)
+        # Ensure 3rd comment was not duplicated by the 2nd sync
+        self.assertEqual(all_comments_2.count("Third comment added before first sync"), 1)
+
+        # Rollback of sync_cfg1 must restore DEMO-1's State to "New" (its state before sync_cfg1) without deleting #101
+        rb = rollback_run(ado, sync_cfg1, log=q)
+        self.assertEqual(len(rb["deleted"]), 0)
+        self.assertEqual(len(rb["restored"]), 1)
+        self.assertIn(101, ado.items)
+        self.assertEqual(ado.items[101]["fields"]["System.State"], "New")
+
+    def test_round2_config_state_map_beats_same_name_state(self):
+        from jira2ado.planner import closest_ado_state
+        cfg = cfg_for("x")
+        cfg["mapping"]["states"]["default"]["In Progress"] = "Development"
+        valid = ["To Do", "In Progress", "Development", "Done"]
+        state, ok, reason = closest_ado_state("In Progress", "Product Backlog Item", valid, cfg, sample.META)
+        self.assertEqual((state, ok, reason), ("Development", True, "configured"))
+
+    def test_round2_empty_ado_user_discovery_does_not_guess_emails(self):
+        import csv
+        from jira2ado.exporter import write_users_file
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        path = os.path.join(folder, "users.csv")
+        write_users_file(folder, path, {"example.com": "contoso.com"}, ado_discovered={"by_email": {}, "by_name": {}})
+        with open(path, newline="") as fh:
+            rows = {r["display_name"]: r["ado_identity"] for r in csv.DictReader(fh)}
+        self.assertEqual(rows["Ana Lee"], "")
+
+    def test_round2_per_destination_ado_meta_isolation_and_multi_sprint_slug(self):
+        from jira2ado.importer import load_meta
+        from jira2ado.util import sprint_folder_slug, write_json
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        dest_a = tempfile.mkdtemp()
+        dest_b = tempfile.mkdtemp()
+        write_json(os.path.join(dest_a, "ado-meta.json"), {"available_wits": ["Product Backlog Item", "Bug", "Task"]})
+        write_json(os.path.join(dest_b, "ado-meta.json"), {"available_wits": ["User Story", "Bug", "Task"]})
+        cfg_a = cfg_for(folder)
+        cfg_a["paths"]["state_dir"] = dest_a
+        cfg_b = cfg_for(folder)
+        cfg_b["paths"]["state_dir"] = dest_b
+        self.assertEqual(load_meta(cfg_a)["available_wits"][0], "Product Backlog Item")
+        self.assertEqual(load_meta(cfg_b)["available_wits"][0], "User Story")
+
+        # 25 sprints must produce a short, deterministic folder name (< 80 chars)
+        many_sprints = [{"id": i, "name": f"Platform and Core Engineering Sprint {i}"} for i in range(1, 26)]
+        folder_name = sprint_folder_slug(many_sprints)
+        self.assertLessEqual(len(folder_name), 80)
+        self.assertIn("25-sprints", folder_name)
+
+    def test_round2_bundled_config_fallback_when_frozen(self):
+        from jira2ado import config
+        empty_cwd = tempfile.mkdtemp()
+        saved_cwd = os.getcwd()
+        try:
+            os.chdir(empty_cwd)
+            resolved_base = config.resolve_config_path(os.path.join("configs", "enterprise-development.yaml"))
+            resolved_targets = config.resolve_config_path(os.path.join("configs", "targets.yaml"))
+            self.assertTrue(os.path.exists(resolved_base))
+            self.assertTrue(os.path.exists(resolved_targets))
+            loaded = config.load(os.path.join("configs", "enterprise-development.yaml"))
+            self.assertEqual(loaded["ado"]["project"], "Production")
+        finally:
+            os.chdir(saved_cwd)
+
+    def test_round2_no_company_strings_in_tracked_files(self):
+        import subprocess
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tracked = subprocess.check_output(["git", "-C", repo_root, "ls-files"], text=True).splitlines()
+        forbidden = (
+            "petvalu", "petretailbrands", "Fin Corp", "Fin&Corp", "Fin-Corp",
+            "DEA-", "PVE-", "17990", "3637", "customfield_10330", "customfield_10455",
+            "PO/BA Review", "Pre-Prod Promotion",
+        )
+        for rel in tracked:
+            if rel == "tests/test_all.py":
+                continue
+            full = os.path.join(repo_root, rel)
+            if not os.path.isfile(full):
+                continue
+            try:
+                with open(full, encoding="utf-8") as fh:
+                    text = fh.read()
+            except UnicodeDecodeError:
+                continue
+            for term in forbidden:
+                self.assertNotIn(term.lower(), text.lower(), f"Forbidden term '{term}' found in {rel}")
 
 
 if __name__ == "__main__":

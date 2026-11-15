@@ -108,14 +108,22 @@ class FakeAdo:
             assert it["last"] is None or changed[0] > it["last"], "ChangedDate must increase"
             it["last"] = changed[0]
         for o in ops:
+            op_type = o.get("op", "add")
             if o["path"].startswith("/fields/"):
                 ref = o["path"][8:]
-                if ref == "System.History":
+                if op_type == "remove":
+                    it["fields"].pop(ref, None)
+                elif ref == "System.History":
                     it["comments"].append((it["last"], o["value"]))
                 else:
                     it["fields"][ref] = o["value"]
-            else:
-                it["relations"].append(o["value"])
+            elif o["path"].startswith("/relations/"):
+                if op_type == "remove":
+                    idx = int(o["path"].rsplit("/", 1)[-1])
+                    if 0 <= idx < len(it["relations"]):
+                        it["relations"].pop(idx)
+                else:
+                    it["relations"].append(o["value"])
         it["rev"] += 1
         it["log"].append(ops)
 
@@ -133,10 +141,16 @@ class FakeAdo:
 
     def get_item(self, item_id):
         it = self.items[item_id]
-        return {"id": item_id, "rev": it["rev"], "fields": it["fields"], "relations": it["relations"]}
+        fields = dict(it["fields"])
+        if it.get("last") and "System.ChangedDate" not in fields:
+            fields["System.ChangedDate"] = it["last"]
+        return {"id": item_id, "rev": it["rev"], "fields": fields, "relations": it["relations"]}
 
     def comment_count(self, item_id):
         return len(self.items[item_id]["comments"])
+
+    def comments(self, item_id):
+        return [text for _, text in self.items[item_id]["comments"]]
 
     def upload_attachment(self, path, filename):
         self.uploads.append(filename)

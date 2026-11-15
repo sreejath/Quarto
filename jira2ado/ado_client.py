@@ -87,6 +87,20 @@ class AdoClient:
         url = f"{self.proj}/_apis/wit/workItems/{item_id}/comments"
         return self._request("GET", url, params={"api-version": self.v + "-preview.4", "$top": 1}).json().get("totalCount", 0)
 
+    def comments(self, item_id):
+        """Return the list of existing comment texts (HTML strings) on a work item."""
+        url = f"{self.proj}/_apis/wit/workItems/{item_id}/comments"
+        out, token = [], None
+        while True:
+            params = {"api-version": self.v + "-preview.4", "$top": 200}
+            if token:
+                params["continuationToken"] = token
+            data = self._request("GET", url, params=params).json()
+            out.extend(c.get("text") or "" for c in (data.get("comments") or []))
+            token = data.get("continuationToken")
+            if not token:
+                return out
+
     def upload_attachment(self, path, filename):
         url = f"{self.proj}/_apis/wit/attachments"
         with open(path, "rb") as fh:

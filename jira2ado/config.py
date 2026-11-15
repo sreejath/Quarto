@@ -1,7 +1,20 @@
 import copy
 import os
+import sys
 
 import yaml
+
+BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def resolve_config_path(path):
+    """Return path if it exists in the working directory, else fall back to the bundled copy."""
+    if not path:
+        return path
+    if os.path.exists(path):
+        return path
+    bundled = os.path.join(BUNDLE_DIR, path)
+    return bundled if os.path.exists(bundled) else path
 
 DEFAULTS = {
     "jira": {"base_url": "", "jql": "", "board_id": None, "board_name": None},
@@ -159,18 +172,20 @@ def _merge(base, over):
 
 def _read(path):
     """Read a config file. A file can start from another one with  extends: other.yaml"""
-    with open(path, encoding="utf-8") as fh:
+    real_path = resolve_config_path(path)
+    with open(real_path, encoding="utf-8") as fh:
         user = yaml.safe_load(fh) or {}
     base = user.pop("extends", None)
     if base:
-        parent = _read(os.path.join(os.path.dirname(os.path.abspath(path)), base))
+        parent = _read(os.path.join(os.path.dirname(os.path.abspath(real_path)), base))
         user = _merge(parent, user)
     return user
 
 
 def load(path):
     load_dotenv()
-    user = _read(path) if path and os.path.exists(path) else {}
+    real_path = resolve_config_path(path)
+    user = _read(real_path) if real_path and os.path.exists(real_path) else {}
     cfg = _merge(copy.deepcopy(DEFAULTS), user)
     if os.environ.get("JIRA_BASE_URL") and not user.get("jira", {}).get("base_url"):
         cfg["jira"]["base_url"] = os.environ["JIRA_BASE_URL"]

@@ -26,8 +26,8 @@ def iso(dt):
 
 
 def bump(dt, last):
-    """ADO needs every revision date to be later than the one before it."""
-    if last and dt <= last:
+    """ADO needs every revision date (at millisecond precision) to be later than the one before it."""
+    if last and (dt <= last or iso(dt) <= iso(last)):
         dt = last + timedelta(milliseconds=1)
     return dt
 
@@ -51,6 +51,20 @@ def iteration_node(path):
 def slug(text):
     """Folder-friendly name: 'Platform&Core Sprint 28' -> 'platform-core-sprint-28'."""
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:80] or "unnamed"
+
+
+def sprint_folder_slug(chosen):
+    """Deterministic, filesystem-safe folder name for 1..N selected sprints (always <= 80 chars)."""
+    if not chosen:
+        return "unnamed"
+    joined = "+".join(slug(s["name"]) for s in chosen)
+    if len(chosen) <= 3 and len(joined) <= 80:
+        return joined or "unnamed"
+    import hashlib
+    sig = hashlib.sha1(",".join(str(s.get("id", s.get("name", ""))) for s in sorted(chosen, key=lambda x: str(x.get("id", x.get("name", ""))))).encode()).hexdigest()[:8]
+    first = slug(chosen[0]["name"])[:28].rstrip("-")
+    last = slug(chosen[-1]["name"])[:28].rstrip("-")
+    return f"{first}..{last}-{len(chosen)}-sprints-{sig}"
 
 
 def read_json(path, default=None):
@@ -77,6 +91,7 @@ class Journal:
         self.items = {}       # key -> {"id": int, "revs": int, "last": iso, "links": bool}
         self.held = {}        # key -> why it was left out (a possible duplicate)
         self.atts = {}        # jira attachment id -> ado url
+        self.synced = {}      # key -> {"id": int, "before_fields": dict, "before_rel_urls": list}
         self.iterations = set()
         self.areas = set()
         if os.path.exists(path):
@@ -109,6 +124,13 @@ class Journal:
             self.iterations.add(e["n"])
         elif e["t"] == "area":
             self.areas.add(e["n"])
+        elif e["t"] == "sync":
+            if e["k"] not in self.synced:
+                self.synced[e["k"]] = {
+                    "id": e["id"],
+                    "before_fields": e.get("before_fields") or {},
+                    "before_rel_urls": list(e.get("before_rel_urls") or []),
+                }
 
     def log(self, **e):
         self._apply(e)

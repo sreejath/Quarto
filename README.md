@@ -54,7 +54,7 @@ jira2ado-ui
 ```bash
 cd jira2ado
 docker build -t jira2ado .
-docker run --rm -p 8765:8765 jira2ado
+docker run --rm -p 127.0.0.1:8765:8765 -v "$(pwd)/runs:/app/runs" jira2ado
 ```
 
 ### Option 4: Standalone Executables (GitHub Releases)

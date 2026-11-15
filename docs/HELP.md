@@ -18,7 +18,7 @@ Jira2ADO runs as a **100% local web application** bound exclusively to `127.0.0.
 - **Docker**:
   ```bash
   docker build -t jira2ado .
-  docker run --rm -p 8765:8765 jira2ado
+  docker run --rm -p 127.0.0.1:8765:8765 -v "$(pwd)/runs:/app/runs" jira2ado
   ```
 
 Your default browser will automatically open the Jira2ADO web interface. You can also click the **`? Help & Setup Guide`** button in the top-right corner of the app at any time.

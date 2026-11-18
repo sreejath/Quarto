@@ -8,8 +8,9 @@ This guide covers everything required to connect, validate, review, and migrate 
 
 Jira2ADO runs as a **100% local web application** bound exclusively to `127.0.0.1` on your machine. Your API tokens are held in memory only for your active session and are **never saved to disk**.
 
-- **macOS**: Double-click **`Start jira2ado.command`** in Finder (or run `bash ui.sh`).
-- **Windows**: Double-click **`Start-Jira2ADO.bat`** in File Explorer.
+- **Standalone Click-to-Run App**: Download **`Jira2ADO-macOS.dmg`** (drag `Jira2ADO.app` to Applications) or **`Jira2ADO-Windows.exe`**. Runs without Python installed and saves run folders in `~/Documents/Jira2ADO`. *(First launch on macOS: if Gatekeeper warns about an unidentified developer, Right-click `Jira2ADO.app` → **Open**.)*
+- **macOS (from source)**: Double-click **`Start jira2ado.command`** in Finder (or run `bash ui.sh`).
+- **Windows (from source)**: Double-click **`Start-Jira2ADO.bat`** in File Explorer.
 - **Python Package (Any OS)**:
   ```bash
   pip install -e .

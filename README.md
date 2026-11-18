@@ -57,8 +57,15 @@ docker build -t jira2ado .
 docker run --rm -p 127.0.0.1:8765:8765 -v "$(pwd)/runs:/app/runs" jira2ado
 ```
 
-### Option 4: Standalone Executables (GitHub Releases)
-Every tagged release (`v*`) automatically builds standalone **`Jira2ADO-Windows.exe`** and **`Jira2ADO-macOS`** executables via [`.github/workflows/release.yml`](.github/workflows/release.yml) that run without Python installed.
+### Option 4: Standalone Click-to-Run Desktop Apps (macOS `.dmg` & Windows `.exe`)
+No Python installation or terminal required:
+- **Download from GitHub Releases**: Every tagged release (`v*`) automatically publishes **`Jira2ADO-macOS.dmg`** and **`Jira2ADO-Windows.exe`** via [`.github/workflows/release.yml`](.github/workflows/release.yml).
+- **Build locally**:
+  ```bash
+  pip install -r requirements.txt pyinstaller
+  python packaging/build.py   # produces dist/Jira2ADO-macOS.dmg on macOS or dist/Jira2ADO-Windows.exe on Windows
+  ```
+- Migration runs, logs, and user CSVs are saved cleanly in `~/Documents/Jira2ADO`.
 
 ---
 

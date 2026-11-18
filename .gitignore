@@ -35,5 +35,6 @@ link-report.json
 
 # Archives & OS metadata
 *.zip
+*.dmg
 .DS_Store
 Thumbs.db

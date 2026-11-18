@@ -1554,6 +1554,23 @@ class CodeReviewRegressionTests(unittest.TestCase):
         finally:
             os.chdir(saved_cwd)
 
+    def test_packaging_workspace_and_clean_config_staging(self):
+        from unittest.mock import patch
+        from jira2ado import config
+        from packaging import build as pkg_build
+
+        # 1. frozen_workspace_dir must resolve to JIRA2ADO_HOME (or ~/Documents/Jira2ADO), never read-only bundle dirs
+        custom_home = os.path.join(tempfile.mkdtemp(), "MyWorkspace")
+        with patch.dict(os.environ, {"JIRA2ADO_HOME": custom_home}):
+            ws = config.frozen_workspace_dir()
+        self.assertEqual(ws, custom_home)
+        self.assertTrue(os.path.isdir(ws))
+
+        # 2. stage_clean_configs must include only public templates and never leak configs/local/
+        staged = pkg_build.stage_clean_configs()
+        self.assertEqual(sorted(os.listdir(staged)), ["enterprise-development.yaml", "targets.yaml"])
+        self.assertFalse(os.path.exists(os.path.join(staged, "local")))
+
     def test_round2_no_company_strings_in_tracked_files(self):
         import subprocess
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

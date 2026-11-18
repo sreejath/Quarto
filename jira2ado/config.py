@@ -7,6 +7,22 @@ import yaml
 BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def frozen_workspace_dir():
+    """Return a writable workspace directory for standalone packaged builds so
+    read-only macOS .app / App Translocation or Program Files never fail."""
+    custom = (os.environ.get("JIRA2ADO_HOME") or "").strip()
+    if custom:
+        path = os.path.abspath(os.path.expanduser(custom))
+        os.makedirs(path, exist_ok=True)
+        return path
+    home = os.path.expanduser("~")
+    docs = os.path.join(home, "Documents")
+    base = docs if os.path.isdir(docs) and os.access(docs, os.W_OK) else home
+    path = os.path.join(base, "Jira2ADO")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def resolve_config_path(path):
     """Return path if it exists in the working directory, else fall back to the bundled copy."""
     if not path:

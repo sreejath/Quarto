@@ -12,6 +12,7 @@ import io
 import json
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import threading
@@ -27,7 +28,7 @@ from ..jira_client import JiraClient
 
 if getattr(sys, "frozen", False):
     BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    KIT = os.path.dirname(os.path.abspath(sys.executable))
+    KIT = config.frozen_workspace_dir()
     STATIC = os.path.join(BUNDLE_DIR, "jira2ado", "ui", "static")
     if not os.path.isdir(STATIC):
         STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -77,7 +78,10 @@ def _is_double_paste(tok):
 
 
 def _cfg_path(rel):
-    for root in (os.getcwd(), KIT, BUNDLE_DIR):
+    roots = (KIT,) if rel.startswith(os.path.join("configs", "local")) and getattr(sys, "frozen", False) else (
+        (KIT, BUNDLE_DIR) if getattr(sys, "frozen", False) else (os.getcwd(), KIT, BUNDLE_DIR)
+    )
+    for root in roots:
         cand = os.path.join(root, rel) if root else rel
         if os.path.exists(cand):
             return cand
@@ -183,8 +187,17 @@ def run_step(job, index, args, ok=(0,)):
     step["status"] = "running"
     job.log.append(f"$ jira2ado {' '.join(args)}")
     capture = args and args[0] == "prepare"  # prepare prints only the config path on stdout
-    proc = subprocess.Popen(CMD + list(args), cwd=KIT, env=env_with_tokens(), text=True, bufsize=1,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE if capture else subprocess.STDOUT)
+    popen_kw = {
+        "cwd": KIT,
+        "env": env_with_tokens(),
+        "text": True,
+        "bufsize": 1,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE if capture else subprocess.STDOUT,
+    }
+    if sys.platform == "win32":
+        popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.Popen(CMD + list(args), **popen_kw)
     job.proc = proc
     if capture:
         out, err = proc.communicate()
@@ -750,6 +763,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(port=0, open_browser=True, host=None):
+    os.makedirs(KIT, exist_ok=True)
     os.chdir(KIT)
     bind_host = host or os.environ.get("JIRA2ADO_UI_HOST") or "127.0.0.1"
     S.server = ThreadingHTTPServer((bind_host, port), Handler)
@@ -757,6 +771,12 @@ def serve(port=0, open_browser=True, host=None):
     url = f"http://127.0.0.1:{S.port}/#key={S.key}"
     print(f"jira2ado is open in your browser at {url}")
     print("Keep this window open while you use it. Close it, or press Ctrl+C, to stop.")
+    prev_term = None
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, "SIGTERM"):
+        def _on_term(_signum, _frame):
+            if S.server:
+                threading.Thread(target=S.server.shutdown, daemon=True).start()
+        prev_term = signal.signal(signal.SIGTERM, _on_term)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -764,6 +784,8 @@ def serve(port=0, open_browser=True, host=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if prev_term is not None and threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, prev_term)
         S.tokens.clear()
         S.server.server_close()
         print("jira2ado has stopped.")

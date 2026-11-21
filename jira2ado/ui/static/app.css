@@ -297,6 +297,61 @@ table.tickets { width: 100%; border-collapse: collapse; margin-top: 4px; }
 .stopped-page { max-width: 520px; margin: 18vh auto; padding: 0 16px; }
 .stopped-page h1 { font-size: var(--s5); margin: 0 0 8px; }
 
+/* Mode Hub, Mode Pills, Batch Controls, Recoverable Runs & Mode 4 Page */
+.mode-pill {
+  display: inline-block; margin-left: 10px; padding: 2px 10px; border-radius: 999px;
+  font-size: var(--s1); font-weight: 600; background: var(--carbon-wash); color: var(--carbon);
+  vertical-align: middle;
+}
+.hub-wrap { max-width: 1040px; }
+.hub-head h1 { margin: 0 0 6px; font-size: var(--s6); letter-spacing: -0.02em; }
+.hub-head p { margin: 0 0 22px; color: var(--ink-soft); font-size: var(--s3); }
+.mode-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr));
+  gap: 16px; margin-bottom: 32px;
+}
+.mode-card {
+  display: flex; flex-direction: column; justify-content: space-between;
+  padding: 20px; border: 1px solid var(--rule); border-radius: 10px; background: var(--rail);
+  transition: border-color 140ms, box-shadow 140ms;
+}
+.mode-card:hover { border-color: var(--carbon); box-shadow: 0 4px 16px rgba(44, 71, 181, 0.1); }
+.mode-card-tag {
+  display: inline-block; font-size: 11.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--carbon); margin-bottom: 6px;
+}
+.mode-card.placeholder .mode-card-tag { color: var(--amber); }
+.mode-card h3 { margin: 0 0 8px; font-size: var(--s4); }
+.mode-card p { margin: 0 0 18px; color: var(--ink-soft); font-size: var(--s2); line-height: 1.45; }
+.mode-card .btn { width: 100%; justify-content: center; text-align: center; text-decoration: none; }
+
+.runs-section { margin-top: 28px; border-top: 1px solid var(--rule); padding-top: 22px; }
+.runs-section h2 { margin: 0 0 6px; font-size: var(--s4); }
+.runs-table { width: 100%; border-collapse: collapse; font-size: var(--s2); margin-top: 12px; }
+.runs-table th, .runs-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+.runs-table th { font-size: var(--s1); color: var(--ink-soft); font-weight: 600; background: var(--rail); }
+.state-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+}
+.state-badge.failed, .state-badge.export_incomplete { background: var(--red-wash); color: var(--red); }
+.state-badge.paused, .state-badge.batch_done, .state-badge.partial { background: var(--amber-wash); color: var(--amber); }
+.state-badge.completed { background: var(--green-wash); color: var(--green); }
+.state-badge.validated { background: var(--carbon-wash); color: var(--carbon); }
+
+.batch-box {
+  margin: 10px 0 12px; padding: 10px 12px; border: 1px solid var(--rule);
+  border-radius: 6px; background: var(--paper); font-size: var(--s2);
+}
+.batch-box label { display: block; font-weight: 600; font-size: var(--s1); margin-bottom: 4px; }
+.batch-box select { width: 100%; padding: 6px 8px; border: 1px solid var(--rule); border-radius: 4px; background: var(--paper); }
+
+.single-page { max-width: 680px; margin: 10vh auto; padding: 0 20px; }
+.not-implemented-card {
+  padding: 32px; border: 1px solid var(--rule); border-radius: 12px; background: var(--rail);
+}
+.not-implemented-card h1 { margin: 8px 0 12px; font-size: var(--s5); }
+.not-implemented-card p { margin: 0 0 16px; color: var(--ink-soft); }
+
 @media (max-width: 960px) {
   .layout { grid-template-columns: 1fr; }
   .rail { border-right: 0; border-bottom: 1px solid var(--rule); }

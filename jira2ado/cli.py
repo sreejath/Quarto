@@ -9,7 +9,7 @@ from datetime import datetime
 import yaml
 
 from . import config
-from .exporter import export, load_issues, load_users_file, write_users_file
+from .exporter import export, load_issues, load_users_file, search_run_keys, write_users_file
 from .planner import Planner, closest_ado_state, map_state, type_for
 from .util import Journal, name_key, read_json, slug, sprint_folder_slug, write_json
 
@@ -39,7 +39,7 @@ def cmd_access(cfg, a):
         jira = None
     if jira:
         try:
-            keys = list(jira.search_keys(cfg["jira"]["jql"]))
+            keys = search_run_keys(jira, cfg)
             shown = ", ".join(keys[:8]) + (f" and {len(keys) - 8} more" if len(keys) > 8 else "")
             print(f"Jira: {len(keys)} ticket(s) match the query" + (f": {shown}" if keys else ""))
             if not keys:
@@ -113,8 +113,16 @@ def cmd_prepare(a):
 
     source = a.source.strip().upper()
     jira = JiraClient(raw["jira"]["base_url"].rstrip("/"), config.secret("JIRA_EMAIL"), config.secret("JIRA_API_TOKEN"))
+    mode = (getattr(a, "mode", None) or "sprints").strip().lower()
     board_id = getattr(a, "board", None)
+    board_name = ""
     try:
+        if mode == "board" and getattr(jira, "boards", None):
+            b_list = jira.boards(source)
+            hit = next((b for b in b_list if str(b.get("id")) == str(board_id) or name_key(b.get("name")) == name_key(str(board_id))), None)
+            if hit:
+                board_id = str(hit["id"])
+                board_name = hit.get("name") or str(board_id)
         try:
             sprints = jira.project_sprints(source, board_id=board_id) if board_id else jira.project_sprints(source)
         except TypeError:
@@ -122,36 +130,62 @@ def cmd_prepare(a):
     except RuntimeError as e:
         if " 401 " in str(e) or " 403 " in str(e):
             raise SystemExit(f"\nStopped: Jira did not accept the email and API token. {e}")
-        raise SystemExit(f"\nStopped: could not read the boards of Jira project '{source}'. Check the name given to --from. {e}")
-    wanted = [p.strip() for v in a.sprints for p in v.split(",") if p.strip()]
-    chosen = []
-    for w in wanted:
-        sp = resolve_sprint(w, sprints, source)
-        if sp["id"] not in [c["id"] for c in chosen]:
-            chosen.append(sp)
+        if mode == "sprints":
+            raise SystemExit(f"\nStopped: could not read the boards of Jira project '{source}'. Check the name given to --from. {e}")
+        sprints = []
 
-    jql = f'project = "{source}" AND sprint in ({", ".join(str(s["id"]) for s in chosen)})'
-    if not a.include_done:
-        jql += " AND statusCategory != Done"
-    jql += " ORDER BY key ASC"
-    run_dir = os.path.join("runs", slug(source), sprint_folder_slug(chosen))
+    chosen = []
+    only_sprints = None
+    board_filter_jql = None
+    if mode == "sprints":
+        raw_sprints = getattr(a, "sprints", None) or []
+        wanted = [p.strip() for v in raw_sprints for p in v.split(",") if p.strip()]
+        if not wanted:
+            raise SystemExit("\nStopped: choose at least one Jira sprint (--sprint).")
+        for w in wanted:
+            sp = resolve_sprint(w, sprints, source)
+            if sp["id"] not in [c["id"] for c in chosen]:
+                chosen.append(sp)
+        jql = f'project = "{source}" AND sprint in ({", ".join(str(s["id"]) for s in chosen)})'
+        if not a.include_done:
+            jql += " AND statusCategory != Done"
+        jql += " ORDER BY key ASC"
+        run_dir = os.path.join("runs", slug(source), sprint_folder_slug(chosen))
+        only_sprints = [s["name"] for s in chosen]
+    elif mode == "board":
+        if not board_id:
+            raise SystemExit("\nStopped: choose a Jira board (--board) for board migration mode.")
+        chosen = list(sprints)
+        board_filter_jql = None if a.include_done else "statusCategory != Done"
+        jql = f'project = "{source}"' + ("" if a.include_done else " AND statusCategory != Done") + " ORDER BY key ASC"
+        b_slug = f"board-{slug(str(board_id))}" + (f"-{slug(board_name)}" if board_name else "")
+        run_dir = os.path.join("runs", slug(source), b_slug[:80])
+    elif mode == "project":
+        chosen = list(sprints)
+        jql = f'project = "{source}"' + ("" if a.include_done else " AND statusCategory != Done") + " ORDER BY key ASC"
+        run_dir = os.path.join("runs", slug(source), "entire-project" if a.include_done else "entire-project-open")
+    else:
+        raise SystemExit(f"\nStopped: unknown migration mode '{mode}'.")
+
     target_dir = os.path.join(run_dir, "to-" + slug(project))
     raw["jira"]["jql"] = jql
     if board_id:
         raw["jira"]["board_id"] = board_id
+    if board_filter_jql:
+        raw["jira"]["board_filter_jql"] = board_filter_jql
     raw.setdefault("ado", {})["project"] = project
     if getattr(a, "area", None):
         raw["ado"]["area_path"] = a.area
     raw.setdefault("paths", {}).update(export_dir=os.path.join(run_dir, "export"), state_dir=target_dir,
                                        users_file="users.csv")
     m = raw.setdefault("mapping", {})
-    m.update(only_sprints=[s["name"] for s in chosen], skip_future_sprints=False, iteration_override=a.iteration or None)
+    m.update(only_sprints=only_sprints, skip_future_sprints=False, iteration_override=a.iteration or None)
     if getattr(a, "include_hierarchy", False):
         m["include_hierarchy"] = True
     if getattr(a, "history", None) in ("true", "false"):
         m["history"] = a.history == "true"
-    raw["run"] = {"from": source, "to": project, "board_id": board_id, "include_done": bool(a.include_done),
-                  "iteration": a.iteration or None,
+    raw["run"] = {"mode": mode, "from": source, "to": project, "board_id": board_id, "board_name": board_name,
+                  "include_done": bool(a.include_done), "iteration": a.iteration or None,
                   "sprints": [{"number": s["id"], "name": s["name"], "state": s.get("state"),
                                "goal": s.get("goal", ""),
                                "start": (s.get("startDate") or "")[:10], "end": (s.get("endDate") or "")[:10]}
@@ -164,9 +198,14 @@ def cmd_prepare(a):
                  f"# so change {a.targets} or {base_path} instead of this file.\n")
         yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True, width=120)
 
-    for s in chosen:
-        dates = f", {s['startDate'][:10]} to {s['endDate'][:10]}" if s.get("startDate") and s.get("endDate") else ""
-        say(f"Jira sprint:  {s['name']} (number {s['id']}, {s.get('state')}{dates})")
+    if mode == "sprints":
+        for s in chosen:
+            dates = f", {s['startDate'][:10]} to {s['endDate'][:10]}" if s.get("startDate") and s.get("endDate") else ""
+            say(f"Jira sprint:  {s['name']} (number {s['id']}, {s.get('state')}{dates})")
+    elif mode == "board":
+        say(f"Jira board:   {board_name or board_id} (all tickets on board, {len(chosen)} sprint(s) discovered)")
+    else:
+        say(f"Jira scope:   Entire project {source} ({len(chosen)} sprint(s) discovered)")
     say(f"From:         Jira project {source}, " + ("all statuses" if a.include_done else "status not Done"))
     say(f"To:           Azure DevOps project {project}" + (f" (settings from {a.targets})" if match else ""))
     if a.iteration:
@@ -199,7 +238,8 @@ def _duplicate_report(cfg, plans, journal, ado):
             found, possible = check_duplicates(ado, cfg, plans, journal)
         except AdoError as e:
             failed = str(e)
-    groups = same_summary_groups(list(titles.items()))
+    # Exclude sub-tasks from same_summary_groups because sub-tasks across parent tickets often share identical names
+    groups = same_summary_groups([(p["key"], plan_title(p)) for p in plans if not p.get("subtask")])
     project = cfg["ado"]["project"]
     print(f"\nDuplicate check" + (f" in {project}:" if ado is not None else " (this run only):"))
     if failed:
@@ -569,10 +609,14 @@ def cmd_import(cfg, a):
         "revisions": stats["revisions"], "failed": stats["failed"], "warnings": len(stats["warnings"]),
         "already_there": stats["existing"], "held": stats["held"],
         "synced": stats.get("synced", []),
+        "remaining": stats.get("remaining", 0),
+        "paused": bool(stats.get("paused")),
         "tagged": sorted(set(stats["possible"]) - set(stats["held"]) - set(stats.get("synced", [])))})
     if not a.no_links:
         links = import_links(ado, cfg, skip_keys=set(stats["failed"]))
         write_json(os.path.join(state_dir(cfg), "link-report.json"), links)
+    if stats.get("paused"):
+        sys.exit(2)
     if stats["failed"]:
         sys.exit(1)
 
@@ -601,12 +645,14 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("export", help="copy issues, history, comments and attachments out of Jira")
     s.add_argument("--force", action="store_true", help="re-export issues already on disk")
-    s = sub.add_parser("prepare", help="write a run config from --from, --to and --sprint (used by run.sh and UI)")
+    s = sub.add_parser("prepare", help="write a run config from --from, --to and --mode/--sprint (used by run.sh and UI)")
+    s.add_argument("--mode", choices=["sprints", "board", "project"], default="sprints",
+                   help="sprints (default): chosen sprints; board: all tickets on a board; project: whole Jira project")
     s.add_argument("--from", dest="source", required=True, help="Jira project key, for example PROJ")
     s.add_argument("--to", dest="target", required=True, help="Azure DevOps project name")
-    s.add_argument("--board", dest="board", help="Optional Jira board ID")
-    s.add_argument("--sprint", dest="sprints", action="append", required=True,
-                   help="Jira sprint name or number; repeat for more than one")
+    s.add_argument("--board", dest="board", help="Jira board ID or name (required for --mode board)")
+    s.add_argument("--sprint", dest="sprints", action="append", default=[],
+                   help="Jira sprint name or number; repeat for more than one (required for --mode sprints)")
     s.add_argument("--iteration", help="put every item in this Azure DevOps iteration")
     s.add_argument("--area", help="put every item in this Azure DevOps area path")
     s.add_argument("--include-done", action="store_true", help="also take tickets whose status is Done")

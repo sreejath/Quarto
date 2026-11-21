@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>jira2ado — Mode 4: Custom JQL Migration (Not Implemented)</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body data-page-mode="jql">
+  <header class="bar">
+    <div class="brand"><img src="/logo.svg" alt="" width="28" height="28" class="brand-logo">jira2ado<span class="mode-pill">Mode 4: Custom JQL Migration</span></div>
+    <div class="who" id="who"></div>
+    <div class="bar-actions">
+      <button class="btn secondary btn-sm" type="button" data-action="go-mode" data-href="/">← Mode Selection</button>
+      <button class="btn secondary btn-sm" id="help-btn" type="button" data-action="open-help">? Help &amp; Setup Guide</button>
+      <button class="quiet" id="quit" type="button">Quit</button>
+    </div>
+  </header>
+  <main class="single-page" id="app">
+    <section class="not-implemented-card" id="manifest" aria-label="Not Implemented"></section>
+  </main>
+  <div class="drawer-backdrop hidden" id="drawer-backdrop" data-action="close-drawer"></div>
+  <aside class="drawer hidden" id="drawer" aria-label="Details drawer"></aside>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

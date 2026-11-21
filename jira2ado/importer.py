@@ -33,6 +33,10 @@ def journal_path(cfg):
     return os.path.join(state_dir(cfg), "import-state.jsonl")
 
 
+def pause_path(cfg):
+    return os.path.join(state_dir(cfg), ".pause")
+
+
 def build_ops(rev, users, att_urls, jira_base, when, issue_url=None, key_to_ado=None, ado_edit_base=""):
     ops = []
     add = lambda path, value: ops.append({"op": "add", "path": path, "value": value})
@@ -72,8 +76,14 @@ def create_iterations(ado, cfg, meta, journal, log=print):
     sub_fn = getattr(ado, "subscribe_team_iteration", None) if cfg["ado"].get("subscribe_team_iterations", True) else None
     team = cfg["ado"].get("team")
     sprints, every = {}, {}
+    for sp in (cfg.get("run") or {}).get("sprints") or []:
+        if isinstance(sp, dict) and sp.get("name"):
+            every.setdefault(sp["name"], (sp.get("start") or sp.get("startDate"), sp.get("end") or sp.get("endDate"), sp.get("state")))
     for issue in load_issues(cfg["paths"]["export_dir"]):
         found = sprints_in(issue, meta, cfg)
+        for k, v in found.items():
+            if k in every and not v[0] and every[k][0]:
+                found[k] = every[k]
         every.update({k: v for k, v in found.items() if k not in every or v[0]})
         if not m["history"]:  # only the sprint each item ends up in is needed
             current = sprint_info(issue, meta, m.get("only_sprints"))[0]
@@ -210,7 +220,9 @@ def check_duplicates(ado, cfg, plans, journal):
     key_ref = cfg["mapping"].get("jira_key_field")
     getter = getattr(ado, "type_fields", None)
     has_field = bool(key_ref and getter and any(key_ref in (getter(t) or set()) for t in {p["type"] for p in todo}))
-    found = finder([(p["key"], plan_title(p)) for p in todo], key_ref if has_field else None,
+    # For sub-tasks, use only the Jira ID/Key (never summary title) because sub-tasks across stories share identical names
+    entries = [(p["key"], "" if p.get("subtask") else plan_title(p)) for p in todo]
+    found = finder(entries, key_ref if has_field else None,
                    cfg["mapping"].get("duplicate_check_titles", True))
     there, possible = {}, {}
     for key, matches in found.items():
@@ -389,8 +401,9 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
     existing_policy = cfg["mapping"].get("existing_duplicates") or "skip"
     ticket_actions = cfg["mapping"].get("ticket_actions") or {}
     stats = {"created": 0, "resumed": 0, "complete": 0, "revisions": 0, "failed": [], "existing": {},
-             "possible": {}, "held": [], "synced": []}
+             "possible": {}, "held": [], "synced": [], "remaining": 0, "paused": False}
     type_fields = {}
+    pfile = pause_path(cfg)
     try:
         issues_list = [i for i in load_issues(out) if not only or i["key"] in only]
         plans = [planner.plan(i) for i in issues_list]
@@ -437,12 +450,25 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
         key_ref = cfg["mapping"].get("jira_key_field")
         for issue in issues_list:
             key = issue["key"]
-            if limit and n >= limit:
-                break
             if key in held:
                 continue
-            n += 1
             plan = planner.plan(issue)
+            st = journal.items.get(key, {})
+            done = st.get("revs", 0)
+            if key not in sync_targets and done >= len(plan["revisions"]):
+                stats["complete"] += 1
+                continue
+            if os.path.exists(pfile):
+                try:
+                    os.remove(pfile)
+                except OSError:
+                    pass
+                stats["paused"] = True
+                log("  Migration paused cleanly by user request. Click Resume to continue.")
+            if stats["paused"] or (limit and n >= limit):
+                stats["remaining"] += 1
+                continue
+            n += 1
             if plan["type"] not in type_fields:
                 getter = getattr(ado, "type_fields", None)
                 type_fields[plan["type"]] = getter(plan["type"]) if getter else None
@@ -458,11 +484,6 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                 except (AdoError, OSError) as e:
                     stats["failed"].append(key)
                     log(f"  {key} SYNC FAILED: {e}")
-                continue
-            st = journal.items.get(key, {})
-            done = st.get("revs", 0)
-            if done >= len(plan["revisions"]):
-                stats["complete"] += 1
                 continue
             try:
                 for rev in plan["revisions"][done:]:

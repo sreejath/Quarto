@@ -892,7 +892,8 @@ class PossibleDuplicateImportTests(unittest.TestCase):
         planner = Planner(self.cfg, sample.META, USERS)
         from jira2ado.exporter import load_issues
         plans = [planner.plan(i) for i in load_issues(self.dir)]
-        plans.append({**plans[1], "key": "DEMO-3"})               # a second ticket with DEMO-2's summary
+        plans[1]["subtask"] = False
+        plans.append({**plans[1], "key": "DEMO-3", "subtask": False})  # a second non-subtask ticket with the same summary
         buf = io.StringIO()
         with redirect_stdout(buf):
             found, possible = cli._duplicate_report(self.cfg, plans, Journal(journal_path(self.cfg), readonly=True), self.ado)
@@ -1122,6 +1123,50 @@ class BrowserViewTests(unittest.TestCase):
         self.assertIn("Type Shop exactly to confirm rollback", d["error"])
         # M6: Session key in query string is rejected when X-Jira2ado-Key header is missing
         self.assertEqual(self.call(f"/api/download?path={rel}&key={self.server.S.key}", key=False)[0], 403)
+
+    def test_multi_mode_pages_and_saved_runs_recovery_api(self):
+        # Verify Mode Hub (/), Mode 1 (/sprints), Mode 2 (/board), Mode 3 (/project), and Mode 4 (/jql Not Implemented)
+        for route, expected in (
+            ("/", b'data-page-mode="hub"'),
+            ("/sprints", b'data-page-mode="sprints"'),
+            ("/board", b'data-page-mode="board"'),
+            ("/project", b'data-page-mode="project"'),
+            ("/jql", b'data-page-mode="jql"'),
+        ):
+            status, html_bytes = self.call(route, key=False)
+            self.assertEqual(status, 200, f"Route {route} failed")
+            self.assertIn(expected, html_bytes)
+
+        # Create a failed run in self.run_dir and verify GET /api/runs and POST /api/runs/recover
+        os.makedirs(self.run_dir, exist_ok=True)
+        cfg_file = os.path.join(self.run_dir, "config.yaml")
+        pv_file = os.path.join(self.run_dir, "preview.json")
+        res_file = os.path.join(self.run_dir, "import-result.json")
+        with open(cfg_file, "w") as fh:
+            fh.write("ado: {org_url: 'https://dev.azure.com/o', project: Shop}\n"
+                     "jira: {base_url: 'https://x.atlassian.net', jql: 'project = DEMO'}\n"
+                     "run: {mode: board, from: DEMO, to: Shop, board_id: '12', board_name: 'Core Board'}\n")
+        with open(pv_file, "w") as fh:
+            json.dump({"project": "Shop", "issues": 2, "tickets": [
+                {"key": "DEMO-1", "revisions": 2, "ado_state": "New"},
+                {"key": "DEMO-2", "revisions": 2, "ado_state": "New"},
+            ]}, fh)
+        with open(res_file, "w") as fh:
+            json.dump({"created": 1, "failed": ["DEMO-2"], "remaining": 1}, fh)
+        rel = os.path.relpath(cfg_file, self.server.KIT)
+
+        status, runs_data = self.call("/api/runs")
+        self.assertEqual(status, 200)
+        found_run = next((r for r in runs_data["runs"] if r["config"] == rel), None)
+        self.assertIsNotNone(found_run)
+        self.assertEqual(found_run["mode"], "board")
+        self.assertEqual(found_run["state"], "failed")
+        self.assertEqual(found_run["failed"], 1)
+
+        status, rec_data = self.call("/api/runs/recover", {"config": rel})
+        self.assertEqual(status, 200)
+        self.assertEqual(rec_data["recovered"], "loaded")
+        self.assertEqual(rec_data["run"]["preview"]["project"], "Shop")
 
 
 class ClosestAdoStateTests(unittest.TestCase):
@@ -1555,9 +1600,13 @@ class CodeReviewRegressionTests(unittest.TestCase):
             os.chdir(saved_cwd)
 
     def test_packaging_workspace_and_clean_config_staging(self):
+        import importlib.util
         from unittest.mock import patch
         from jira2ado import config
-        from packaging import build as pkg_build
+        build_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packaging", "build.py")
+        spec = importlib.util.spec_from_file_location("jira2ado_pkg_build", build_py)
+        pkg_build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pkg_build)
 
         # 1. frozen_workspace_dir must resolve to JIRA2ADO_HOME (or ~/Documents/Jira2ADO), never read-only bundle dirs
         custom_home = os.path.join(tempfile.mkdtemp(), "MyWorkspace")
@@ -1593,6 +1642,122 @@ class CodeReviewRegressionTests(unittest.TestCase):
                 continue
             for term in forbidden:
                 self.assertNotIn(term.lower(), text.lower(), f"Forbidden term '{term}' found in {rel}")
+
+    def test_subtask_duplicates_checked_by_jira_key_only_never_by_title(self):
+        from jira2ado.cli import _duplicate_report
+        from jira2ado.importer import check_duplicates
+        from jira2ado.util import Journal, read_json
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        cfg = cfg_for(folder)
+        cfg["paths"]["state_dir"] = tempfile.mkdtemp()
+        planner = Planner(cfg, sample.META, USERS)
+
+        # Create two subtasks across different stories that have the exact same summary "Add retry token"
+        sub1 = sample.subtask()  # key DEMO-2, summary "Add retry token", issuetype "Sub-task"
+        sub2 = copy.deepcopy(sub1)
+        sub2["key"] = "DEMO-3"
+        plans = [planner.plan(sub1), planner.plan(sub2)]
+        self.assertTrue(plans[0]["subtask"])
+        self.assertTrue(plans[1]["subtask"])
+
+        ado = sample.FakeAdo()
+        # Existing ADO Task from a different Jira sub-task (DEMO-99) that has the exact same title "Add retry token"
+        ado.create_item("Task", [
+            {"op": "add", "path": "/fields/System.Title", "value": "Add retry token"},
+            {"op": "add", "path": "/fields/System.State", "value": "To Do"},
+            {"op": "add", "path": "/fields/System.Tags", "value": "DEMO-99"},
+        ])
+        journal = Journal(os.path.join(cfg["paths"]["state_dir"], "import-state.jsonl"), readonly=True)
+        there, possible = check_duplicates(ado, cfg, plans, journal)
+        # Must NOT match DEMO-2 or DEMO-3 against DEMO-99 by title!
+        self.assertEqual(there, {})
+        self.assertEqual(possible, {})
+
+        # Also check _duplicate_report: DEMO-2 and DEMO-3 must NOT be grouped in same_summary_in_run
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            _duplicate_report(cfg, plans, journal, ado)
+        dup_json = read_json(os.path.join(cfg["paths"]["state_dir"], "duplicates.json"))
+        self.assertEqual(dup_json["same_summary_in_run"], [])
+
+        # Now add an ADO item that actually carries DEMO-2's Jira key -> must be matched as SAME_KEY
+        ado.create_item("Task", [
+            {"op": "add", "path": "/fields/System.Title", "value": "Add retry token"},
+            {"op": "add", "path": "/fields/System.State", "value": "Done"},
+            {"op": "add", "path": "/fields/System.Tags", "value": "DEMO-2"},
+        ])
+        there2, possible2 = check_duplicates(ado, cfg, plans, journal)
+        self.assertIn("DEMO-2", there2)
+        self.assertNotIn("DEMO-3", there2)
+        self.assertEqual(possible2, {})
+
+    def test_mode2_board_and_mode3_project_prepare_and_unsprinted_tickets(self):
+        from jira2ado.exporter import search_run_keys
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        cfg = cfg_for(folder)
+        cfg["run"] = {"mode": "board", "from": "DEMO", "to": "Shop", "board_id": "42", "board_name": "Team Board",
+                      "sprints": [{"number": 7, "name": "Sprint 2&A", "state": "active",
+                                   "start": "2024-01-01", "end": "2024-01-15"}]}
+        cfg["jira"]["board_id"] = "42"
+        cfg["jira"]["board_filter_jql"] = "statusCategory != Done"
+        cfg["mapping"]["only_sprints"] = None
+
+        class BoardJira:
+            def board_keys(self, board_id, jql=None):
+                self.called = (board_id, jql)
+                return ["DEMO-1", "DEMO-2", "DEMO-UNSPRINTED"]
+
+        bj = BoardJira()
+        self.assertEqual(search_run_keys(bj, cfg), ["DEMO-1", "DEMO-2", "DEMO-UNSPRINTED"])
+        self.assertEqual(bj.called, ("42", "statusCategory != Done"))
+
+        # Unsprinted backlog ticket on the board must be placed at the base/root iteration while sprinted ticket gets its sprint iteration
+        unsprinted = sample.story()
+        unsprinted["key"] = "DEMO-UNSPRINTED"
+        unsprinted["fields"]["customfield_10020"] = None
+        unsprinted["changelog"] = []
+        planner = Planner(cfg, sample.META, USERS)
+        p_un = planner.plan(unsprinted)
+        p_sp = planner.plan(sample.story())
+        self.assertEqual(p_un["revisions"][0]["fields"]["System.IterationPath"], "Shop")
+        sp_iters = [r["fields"]["System.IterationPath"] for r in p_sp["revisions"] if "System.IterationPath" in r["fields"]]
+        self.assertEqual(sp_iters[-1], "Shop\\Sprint 2-A")
+
+    def test_batched_import_pause_and_resume(self):
+        from jira2ado.importer import pause_path
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        cfg = cfg_for(folder)
+        cfg["paths"]["state_dir"] = tempfile.mkdtemp()
+        q = lambda *a, **k: None
+        ado = sample.FakeAdo()
+
+        # Batch 1 with limit=1 must migrate DEMO-1 only and report remaining=1
+        b1 = import_items(ado, cfg, USERS, limit=1, log=q)
+        self.assertEqual(b1["created"], 1)
+        self.assertEqual(b1["remaining"], 1)
+        self.assertEqual(len(ado.items), 1)
+
+        # Write a .pause sentinel before Batch 2 -> must pause cleanly with paused=True and remaining=1
+        with open(pause_path(cfg), "w", encoding="utf-8") as fh:
+            fh.write("pause\n")
+        b_paused = import_items(ado, cfg, USERS, limit=1, log=q)
+        self.assertTrue(b_paused["paused"])
+        self.assertEqual(b_paused["created"], 0)
+        self.assertEqual(b_paused["complete"], 1)
+        self.assertEqual(b_paused["remaining"], 1)
+        self.assertFalse(os.path.exists(pause_path(cfg)))
+
+        # Resume Batch 2 with limit=1 -> must skip already-completed DEMO-1 and migrate DEMO-2!
+        b2 = import_items(ado, cfg, USERS, limit=1, log=q)
+        self.assertFalse(b2["paused"])
+        self.assertEqual(b2["created"], 1)
+        self.assertEqual(b2["complete"], 1)
+        self.assertEqual(b2["remaining"], 0)
+        self.assertEqual(len(ado.items), 2)
 
 
 if __name__ == "__main__":

@@ -102,6 +102,15 @@ class JiraClient:
                 continue  # a Kanban board has no sprints
         return list(found.values())
 
+    def board_keys(self, board_id, jql=None):
+        """Yield all issue keys on a Jira board (Scrum or Kanban, including backlog and unsprinted tickets)."""
+        params = {"fields": "key"}
+        if jql:
+            params["jql"] = jql
+        for issue in self._agile_pages(f"/rest/agile/1.0/board/{board_id}/issue", params=params):
+            if issue.get("key"):
+                yield issue["key"]
+
     def search_keys(self, jql):
         """Yield issue keys. Uses /search/jql, which replaced the removed /search endpoint."""
         token = None

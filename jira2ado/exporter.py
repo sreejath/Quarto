@@ -56,8 +56,20 @@ def _export_single_issue(jira, key, out, m, force=False, log=print):
     return issue, True
 
 
+def search_run_keys(jira, cfg):
+    """Fetch the target issue keys for this run (via Agile board endpoint in board mode, else JQL)."""
+    run_info = cfg.get("run") or {}
+    j_cfg = cfg.get("jira") or {}
+    board_id = j_cfg.get("board_id") or run_info.get("board_id")
+    if run_info.get("mode") == "board" and board_id and getattr(jira, "board_keys", None):
+        return list(jira.board_keys(board_id, jql=j_cfg.get("board_filter_jql")))
+    return list(jira.search_keys(j_cfg["jql"]))
+
+
 def export(jira, cfg, force=False, log=print):
     out = cfg["paths"]["export_dir"]
+    state_folder = cfg["paths"].get("state_dir") or out
+    pause_file = os.path.join(state_folder, ".pause")
     m = cfg["mapping"]
     fields = jira.fields()
     by_name = {}
@@ -74,13 +86,22 @@ def export(jira, cfg, force=False, log=print):
     }
 
     done = skipped = 0
-    keys = list(jira.search_keys(cfg["jira"]["jql"]))
+    keys = search_run_keys(jira, cfg)
     meta["rank_order"] = {k: idx + 1 for idx, k in enumerate(keys)}
     write_json(os.path.join(out, "meta.json"), meta)
+    write_json(os.path.join(out, "keys.json"), keys)
 
     seen_keys = set(keys)
     extra_keys = []
     for key in keys:
+        if os.path.exists(pause_file):
+            try:
+                os.remove(pause_file)
+            except OSError:
+                pass
+            write_json(os.path.join(out, "keys.json"), keys)
+            log(f"Export paused cleanly after {done} new, {skipped} cached issue(s). Click Resume to continue.")
+            raise SystemExit(2)
         issue, is_new = _export_single_issue(jira, key, out, m, force=force, log=log)
         if is_new:
             done += 1

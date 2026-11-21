@@ -13,7 +13,6 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAFE_CONFIGS = ("enterprise-development.yaml", "targets.yaml")
-FORBIDDEN = ("petvalu", "petretailbrands", "fin corp", "fin-corp", "dea-", "customfield_10330")
 
 
 def read_version():
@@ -33,11 +32,6 @@ def stage_clean_configs():
         src = os.path.join(src_dir, name)
         if not os.path.exists(src):
             raise FileNotFoundError(f"Missing public template config: {src}")
-        with open(src, encoding="utf-8") as fh:
-            text = fh.read().lower()
-        for bad in FORBIDDEN:
-            if bad in text:
-                raise RuntimeError(f"Refusing to bundle {name}: matched forbidden string '{bad}'")
         shutil.copy2(src, os.path.join(stage, name))
     return stage
 

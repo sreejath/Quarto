@@ -1,30 +1,36 @@
 /* jira2ado browser view. Talks only to the local helper that served this page. */
 "use strict";
 
-const KEY = new URLSearchParams(location.hash.slice(1)).get("key") || "";
+const HASH_PARAMS = new URLSearchParams(location.hash.slice(1));
+const KEY = HASH_PARAMS.get("key") || "";
+const INITIAL_RECOVER_CFG = HASH_PARAMS.get("run") || "";
+const PAGE_MODE = (document.body && document.body.dataset.pageMode) || "hub";
 const $ = (sel) => document.querySelector(sel);
 const esc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + "s")}`;
 
 const S = {
+  pageMode: PAGE_MODE,
   jira: null, ado: null, jiraUrl: "", adoUrl: "", settings: {}, problems: {}, connecting: false, editConnect: false,
   projects: [], projectsError: "", source: "",
   boards: [], boardsLoading: false, board: "",
   sprints: [], sprintsLoading: false, sprintsError: "", picked: new Set(), sprintFilter: "",
-  includeDone: false, includeHierarchy: false, historyMode: true,
+  includeDone: PAGE_MODE === "project", includeHierarchy: false, historyMode: true, forceExport: false,
   targets: [], target: "", other: "", isOther: false,
   iterations: [], areas: [], iterationsFor: "", iterationsError: "", iterMode: "sprint", iteration: "", newIteration: "", area: "",
   job: null, since: 0, log: [], phase: "setup", checkedSig: "", checkedAt: null, error: "",
   run: null, choice: "skip", confirm: "", tab: "where", stamps: {}, quitting: false,
+  batchSize: "all",     // "all" | "10" | "25" | "50" | "100" | "250"
+  savedRuns: [],
   // Interactive validation table state
   ticketStates: {},     // {jiraKey: adoState}
   statusOverrides: {},  // {jiraStatus: adoState}
   ticketActions: {},    // {jiraKey: "create" | "skip" | "duplicate" | "sync"}
   lastChangedKey: "",   // key whose status dropdown was just changed (shows "Apply to all" pill)
   searchFilter: "",
-  outcomeFilter: "all", // "all" | "create" | "duplicates" | "there"
-  drawerMode: null,     // null | "help" | "ticket"
+  outcomeFilter: "all", // "all" | "create" | "duplicates" | "there" | "failed"
+  drawerMode: null,     // null | "help" | "ticket" | "runs"
   drawerTicketKey: null,
   peopleEdits: {},      // {account_id: ado_identity}
   savingPeople: false,
@@ -107,9 +113,24 @@ function displayedSprints() {
 
 function signature() {
   return JSON.stringify({
-    s: S.source, b: S.board, p: [...S.picked].sort(), t: targetName(),
+    m: S.pageMode, s: S.source, b: S.board, p: [...S.picked].sort(), t: targetName(),
     i: chosenIteration(), a: S.area, d: S.includeDone, h: S.includeHierarchy, hm: S.historyMode,
   });
+}
+
+function sourceReady() {
+  if (S.pageMode === "board") return Boolean(S.source && S.board);
+  if (S.pageMode === "project") return Boolean(S.source);
+  return Boolean(S.source && S.picked.size);
+}
+
+function modeHref(path, extraParams = {}) {
+  const hp = new URLSearchParams();
+  if (KEY) hp.set("key", KEY);
+  for (const [k, v] of Object.entries(extraParams)) {
+    if (v) hp.set(k, v);
+  }
+  return `${path}#${hp.toString()}`;
 }
 
 function fmtDate(iso) {
@@ -237,11 +258,13 @@ function renderWho() {
 
 function setStep(id, state, html) {
   const el = $(id);
+  if (!el) return;
   el.className = `step ${state}`;
   el.innerHTML = html;
 }
 
 function renderConnect() {
+  if (!$("#step-connect")) return;
   if (connected() && !S.editConnect) {
     setStep("#step-connect", "done", `
       <h2>Connect</h2>
@@ -285,19 +308,78 @@ function renderConnect() {
 }
 
 function renderTickets() {
+  if (!$("#step-tickets")) return;
   if (!connected()) {
     setStep("#step-tickets", "locked", `<h2>Source Tickets</h2><p class="lede">Connect first.</p>`);
     return;
   }
+  const options = S.projects.map((p) =>
+    `<option value="${esc(p.key)}" ${p.key === S.source ? "selected" : ""}>${esc(p.key)}: ${esc(p.name)}</option>`).join("");
+  const boardOpts = S.boards.map((b) =>
+    `<option value="${esc(b.id)}" ${String(b.id) === String(S.board) ? "selected" : ""}>${esc(b.name)} (${esc(b.type)})</option>`).join("");
+
+  if (S.pageMode === "project") {
+    const state = S.source ? "done" : "current";
+    setStep("#step-tickets", state, `
+      <h2>Source Project</h2>
+      <p class="lede">Mode 3: Migrate every ticket and all associated data in a Jira project.</p>
+      <div class="step-body">
+        <label class="field">Jira project
+          <select data-action="select-project" ${busy() ? "disabled" : ""}>
+            <option value="">${S.projects.length ? "Choose a project" : esc(S.projectsError || "Loading projects...")}</option>
+            ${options}
+          </select>
+        </label>
+        <p class="hint">Fetches all issues in <b>${esc(S.source || "the project")}</b> (across all boards, sprints, and backlog). Sprints attached to tickets are automatically created in Azure DevOps.</p>
+        <label class="check"><input type="checkbox" data-action="include-done" ${S.includeDone ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Include tickets whose status category is <b>Done</b></span></label>
+        <label class="check"><input type="checkbox" data-action="include-hierarchy" ${S.includeHierarchy ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Auto-include parent Epics &amp; child Sub-tasks outside the project</span></label>
+        <label class="check"><input type="checkbox" data-action="history-mode" ${S.historyMode ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Migrate full changelog revision history, worklogs &amp; links</span></label>
+        <label class="check"><input type="checkbox" data-action="force-export" ${S.forceExport ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Force fresh re-export from Jira (uncheck to resume cached export)</span></label>
+      </div>`);
+    return;
+  }
+
+  if (S.pageMode === "board") {
+    const selectedBoard = S.boards.find((b) => String(b.id) === String(S.board));
+    const state = S.source && S.board ? "done" : "current";
+    setStep("#step-tickets", state, `
+      <h2>Source Board</h2>
+      <p class="lede">Mode 2: Migrate all tickets on a Jira board regardless of sprint (including backlog &amp; unsprinted items).</p>
+      <div class="step-body">
+        <label class="field">Jira project
+          <select data-action="select-project" ${busy() ? "disabled" : ""}>
+            <option value="">${S.projects.length ? "Choose a project" : esc(S.projectsError || "Loading projects...")}</option>
+            ${options}
+          </select>
+        </label>
+        <label class="field">Jira board (required)
+          <select data-action="select-board" ${!S.source || busy() ? "disabled" : ""}>
+            <option value="">${S.boardsLoading ? "Loading boards..." : (S.boards.length ? "Choose a board" : "No boards found")}</option>
+            ${boardOpts}
+          </select>
+        </label>
+        ${selectedBoard ? `<p class="hint">Board type: <b>${esc(selectedBoard.type)}</b> (${esc(plural(S.sprints.length, "sprint"))} discovered). Tickets in sprints will have matching iterations created in ADO; unsprinted/backlog tickets go to the project/team iteration.</p>` : `<p class="hint">Select a Scrum or Kanban board to fetch all of its tickets.</p>`}
+        <label class="check"><input type="checkbox" data-action="include-done" ${S.includeDone ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Include tickets whose status category is <b>Done</b></span></label>
+        <label class="check"><input type="checkbox" data-action="include-hierarchy" ${S.includeHierarchy ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Auto-include parent Epics &amp; child Sub-tasks outside the board</span></label>
+        <label class="check"><input type="checkbox" data-action="history-mode" ${S.historyMode ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Migrate full changelog revision history, worklogs &amp; links</span></label>
+        <label class="check"><input type="checkbox" data-action="force-export" ${S.forceExport ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Force fresh re-export from Jira (uncheck to resume cached export)</span></label>
+      </div>`);
+    return;
+  }
+
   const prevScroll = document.querySelector("#step-tickets .sprints")?.scrollTop ?? 0;
   const activeEl = document.activeElement;
   const stepRoot = document.querySelector("#step-tickets");
   const activeAction = activeEl && stepRoot && stepRoot.contains(activeEl) ? (activeEl.dataset?.action || "") : "";
   const activeVal = activeEl ? String(activeEl.value ?? "") : "";
-  const options = S.projects.map((p) =>
-    `<option value="${esc(p.key)}" ${p.key === S.source ? "selected" : ""}>${esc(p.key)}: ${esc(p.name)}</option>`).join("");
-  const boardOpts = S.boards.map((b) =>
-    `<option value="${esc(b.id)}" ${String(b.id) === String(S.board) ? "selected" : ""}>${esc(b.name)} (${esc(b.type)})</option>`).join("");
   const shown = displayedSprints();
   const shownPicked = shown.filter((sp) => S.picked.has(String(sp.id))).length;
   const hiddenPicked = Math.max(0, S.picked.size - shownPicked);
@@ -347,6 +429,8 @@ function renderTickets() {
         <span>Auto-include parent Epics &amp; child Sub-tasks outside the sprint</span></label>
       <label class="check"><input type="checkbox" data-action="history-mode" ${S.historyMode ? "checked" : ""} ${busy() ? "disabled" : ""}>
         <span>Migrate full changelog revision history, worklogs &amp; links</span></label>
+      <label class="check"><input type="checkbox" data-action="force-export" ${S.forceExport ? "checked" : ""} ${busy() ? "disabled" : ""}>
+        <span>Force fresh re-export from Jira (uncheck to resume cached export)</span></label>
     </div>`);
   const box = document.querySelector("#step-tickets .sprints");
   if (box) box.scrollTop = prevScroll;
@@ -359,6 +443,7 @@ function renderTickets() {
 }
 
 function renderDestination() {
+  if (!$("#step-destination")) return;
   if (!connected()) {
     setStep("#step-destination", "locked", `<h2>Destination Project</h2><p class="lede">Connect first.</p>`);
     return;
@@ -388,6 +473,9 @@ function renderDestination() {
         <p class="hint">Created automatically during migration.</p>` : ""}`;
     }
   }
+  const sprintLabel = S.pageMode === "sprints"
+    ? "Named after each ticket's Jira sprint (auto-creates &amp; subscribes team)"
+    : "Match each ticket's Jira sprint (unsprinted/backlog tickets go to root/team iteration)";
   const state = name && (S.iterMode === "sprint" || chosenIteration()) ? "done" : "current";
   setStep("#step-destination", state, `
     <h2>Destination Project</h2>
@@ -404,7 +492,7 @@ function renderDestination() {
       ${note ? `<p class="hint">${esc(note)}</p>` : ""}
       <div class="field">Iteration placement
         <label class="check"><input type="radio" name="iter" value="sprint" data-action="iter-mode" ${S.iterMode === "sprint" ? "checked" : ""} ${busy() ? "disabled" : ""}>
-          <span>Named after each ticket's Jira sprint (auto-creates &amp; subscribes team)</span></label>
+          <span>${sprintLabel}</span></label>
         <label class="check"><input type="radio" name="iter" value="one" data-action="iter-mode" ${S.iterMode === "one" ? "checked" : ""} ${busy() ? "disabled" : ""}>
           <span>Put every ticket in one specific iteration</span></label>
         ${iterPick}
@@ -413,21 +501,34 @@ function renderDestination() {
 }
 
 function progressList(job) {
-  const mark = { waiting: "", running: "•", done: "✓", failed: "✗", stopped: "–" };
+  const mark = { waiting: "", running: "•", done: "✓", failed: "✗", stopped: "–", paused: "⏸" };
   return `<ol class="progress">${job.steps.map((s) =>
     `<li class="${esc(s.status)}"><span class="mark" aria-hidden="true">${mark[s.status] || ""}</span><span>${esc(s.label)}</span></li>`).join("")}</ol>`;
 }
 
 function renderCheck() {
+  if (!$("#step-check")) return;
   if (!connected()) {
     setStep("#step-check", "locked", `<h2>Validate</h2><p class="lede">Connect first.</p>`);
     return;
   }
-  const ready = S.source && S.picked.size && targetName() && (S.iterMode === "sprint" || chosenIteration());
+  const ready = sourceReady() && targetName() && (S.iterMode === "sprint" || chosenIteration());
   const stale = S.checkedSig && S.checkedSig !== signature();
   let body;
   if (S.phase === "checking" && S.job) {
-    body = `${progressList(S.job)}<div class="row"><button class="quiet" type="button" data-action="stop">Stop</button></div>`;
+    body = `${progressList(S.job)}
+      <div class="row">
+        <button class="btn secondary btn-sm" type="button" data-action="pause">⏸ Pause</button>
+        <button class="quiet" type="button" data-action="stop">Stop</button>
+      </div>`;
+  } else if (S.phase === "check_paused") {
+    body = `
+      <div class="banner warn">
+        <p><b>Validation / Export Paused:</b> Tickets exported so far are saved on disk.</p>
+      </div>
+      <div class="row">
+        <button class="btn" type="button" data-action="resume-check" ${ready && !busy() ? "" : "disabled"}>▶ Resume Validation</button>
+      </div>`;
   } else {
     const done = S.run && !stale && S.checkedAt;
     body = `
@@ -439,13 +540,32 @@ function renderCheck() {
   const state = S.phase === "checking" ? "current" : (S.run && !stale ? "done" : (ready ? "current" : ""));
   setStep("#step-check", state, `
     <h2>Validate</h2>
-    <p class="lede">Fetches sprint tickets, maps statuses to the closest ADO state, and highlights duplicates.</p>
+    <p class="lede">Fetches tickets, maps statuses to the closest ADO state, and highlights duplicates.</p>
     <div class="step-body">${body}</div>`);
 }
 
+function batchSelectorHtml() {
+  const opts = [
+    ["all", "All remaining tickets (single run)"],
+    ["10", "10 tickets per batch (Pilot batch)"],
+    ["25", "25 tickets per batch"],
+    ["50", "50 tickets per batch"],
+    ["100", "100 tickets per batch"],
+    ["250", "250 tickets per batch"],
+  ];
+  return `
+    <div class="batch-box">
+      <label for="batch-size-select">Batch Size (Pause &amp; checkpoint after batch)</label>
+      <select id="batch-size-select" data-action="select-batch-size" ${busy() ? "disabled" : ""}>
+        ${opts.map(([v, label]) => `<option value="${v}" ${String(S.batchSize) === v ? "selected" : ""}>${esc(label)}</option>`).join("")}
+      </select>
+    </div>`;
+}
+
 function renderImport() {
+  if (!$("#step-import")) return;
   const stale = S.checkedSig && S.checkedSig !== signature();
-  if (!S.run || !S.run.preview || stale || S.phase === "checking") {
+  if (!S.run || !S.run.preview || stale || S.phase === "checking" || S.phase === "check_paused") {
     setStep("#step-import", "locked", `<h2>Migrate</h2><p class="lede">Validate the tickets first.</p>`);
     return;
   }
@@ -454,7 +574,11 @@ function renderImport() {
   const project = pv.project;
   let body = "";
   if ((S.phase === "importing" || S.phase === "rolling_back") && S.job) {
-    body = `${progressList(S.job)}<div class="row"><button class="quiet" type="button" data-action="stop">Stop</button></div>`;
+    body = `${progressList(S.job)}
+      <div class="row">
+        ${S.phase === "importing" ? `<button class="btn secondary btn-sm" type="button" data-action="pause">⏸ Pause after current ticket</button>` : ""}
+        <button class="quiet" type="button" data-action="stop">Stop</button>
+      </div>`;
   } else if (S.phase === "imported") {
     const c = tally(run);
     const files = run.files || {};
@@ -466,20 +590,39 @@ function renderImport() {
         ${files["verify.csv"] ? `<button class="btn secondary btn-sm" type="button" data-action="download-file" data-path="${esc(files["verify.csv"])}" data-name="verify.csv">Download Verify CSV</button>` : ""}
         <button class="btn danger btn-sm" type="button" data-action="rollback">Undo / Rollback Run</button>
       </div>`;
+  } else if (S.phase === "import_paused" || S.phase === "batch_done") {
+    const n = toCreate(run);
+    const c = tally(run);
+    const bLabel = S.batchSize !== "all" ? `Next Batch (up to ${S.batchSize} of ${n} remaining)` : `Remaining (${n})`;
+    body = `
+      <div class="banner warn">
+        <p><b>${S.phase === "batch_done" ? "Batch Completed:" : "Migration Paused:"}</b> ${esc(plural(c.done, "ticket"))} migrated so far; <b>${esc(plural(n, "ticket"))}</b> remaining.</p>
+        <p>Every migrated item is journaled on disk. Click Resume below when you are ready for the next batch.</p>
+      </div>
+      ${batchSelectorHtml()}
+      ${pv.confirm_with_project_name && S.confirm.trim() !== project ? `
+        <label class="field">Type <b>${esc(project)}</b> to confirm resume
+          <input type="text" data-action="confirm" value="${esc(S.confirm)}" autocomplete="off" spellcheck="false">
+        </label>` : ""}
+      <div class="row">
+        <button class="btn" type="button" data-action="import" ${pv.confirm_with_project_name && S.confirm.trim() !== project ? "disabled" : ""}>▶ Resume / Migrate ${esc(bLabel)}</button>
+        ${c.done > 0 ? `<button class="btn danger btn-sm" type="button" data-action="rollback">Undo / Rollback Run</button>` : ""}
+      </div>`;
   } else if (S.phase === "import_failed") {
     const n = toCreate(run);
     const c = tally(run);
     body = `
       <div class="banner bad">
         <p><b>Migration did not finish:</b> ${esc(S.error || "See the Log tab for details.")}</p>
-        <p>${esc(plural(c.done, "ticket"))} completed; ${esc(plural(n, "ticket"))} remaining. Retrying is safe and idempotent — completed revisions are skipped and partial tickets are resumed from their live Azure DevOps revision.</p>
+        <p>${esc(plural(c.done, "ticket"))} completed; ${esc(plural(n, "ticket"))} remaining. Retrying is safe and idempotent — completed revisions are skipped and partial tickets are resumed.</p>
       </div>
+      ${batchSelectorHtml()}
       ${pv.confirm_with_project_name && S.confirm.trim() !== project ? `
         <label class="field">Type <b>${esc(project)}</b> to confirm retry / resume
           <input type="text" data-action="confirm" value="${esc(S.confirm)}" autocomplete="off" spellcheck="false">
         </label>` : ""}
       <div class="row">
-        <button class="btn" type="button" data-action="import" ${pv.confirm_with_project_name && S.confirm.trim() !== project ? "disabled" : ""}>Retry / Resume Remaining (${n})</button>
+        <button class="btn" type="button" data-action="import" ${pv.confirm_with_project_name && S.confirm.trim() !== project ? "disabled" : ""}>▶ Retry / Resume Remaining (${n})</button>
         ${c.done > 0 ? `<button class="btn danger btn-sm" type="button" data-action="rollback">Undo / Rollback Run</button>` : ""}
       </div>`;
   } else {
@@ -489,18 +632,24 @@ function renderImport() {
     if (hasDups) {
       dup = `<p class="hint">Duplicates are highlighted in the table. Use the per-ticket dropdown or the bulk toolbar buttons to <b>Skip</b> or <b>Create Duplicate</b> (or <b>Sync Delta</b> on exact Jira key matches).</p>`;
     }
+    const batchCount = S.batchSize !== "all" ? Math.min(n, parseInt(S.batchSize, 10) || n) : n;
+    const btnText = S.batchSize !== "all" && n > batchCount
+      ? `Migrate Batch (${batchCount} of ${n} tickets)`
+      : `Migrate ${plural(n, "ticket")}`;
     let go;
     if (!n) {
       go = `<p class="summary-line">No tickets selected for migration. Change a duplicate's action to <b>Create Duplicate</b> (or <b>Sync Delta</b> for exact key matches) if you want to migrate it.</p>`;
     } else if (pv.confirm_with_project_name) {
       go = `
+        ${batchSelectorHtml()}
         <label class="field">Type <b>${esc(project)}</b> to confirm migration
           <input type="text" data-action="confirm" value="${esc(S.confirm)}" autocomplete="off" spellcheck="false">
         </label>
-        <div class="row"><button class="btn" type="button" data-action="import" ${S.confirm.trim() === project ? "" : "disabled"}>Migrate ${esc(plural(n, "ticket"))}</button></div>`;
+        <div class="row"><button class="btn" type="button" data-action="import" ${S.confirm.trim() === project ? "" : "disabled"}>${esc(btnText)}</button></div>`;
     } else {
       go = `
-        <div class="row"><button class="btn" type="button" data-action="import">Migrate ${esc(plural(n, "ticket"))} to ${esc(project)}</button></div>`;
+        ${batchSelectorHtml()}
+        <div class="row"><button class="btn" type="button" data-action="import">${esc(btnText)} to ${esc(project)}</button></div>`;
     }
     body = `${dup}${S.error ? `<p class="problem">${esc(S.error)}</p>` : ""}${go}`;
   }
@@ -523,11 +672,18 @@ function summaryText(run) {
 
 /* ------------------------------------------------------------ rendering: the validation ticket list */
 
+function isFailedOrPartialTicket(t, run) {
+  if (!run) return false;
+  const o = outcome(t, run);
+  return o.cls === "failed" || o.cls === "working" || t.outcome === "partial";
+}
+
 function filterTickets(tickets, run) {
   return tickets.filter((t) => {
     if (S.outcomeFilter === "create" && !["create", "duplicate", "sync"].includes(effectiveAction(t))) return false;
     if (S.outcomeFilter === "duplicates" && !isDuplicateTicket(t)) return false;
     if (S.outcomeFilter === "there" && t.outcome !== "already_there") return false;
+    if (S.outcomeFilter === "failed" && !isFailedOrPartialTicket(t, run)) return false;
     if (S.searchFilter) {
       const q = S.searchFilter.toLowerCase();
       const hay = `${t.key} ${t.title} ${t.jira_type} ${t.ado_type} ${t.assignee || ""} ${t.jira_status} ${effectiveState(t)}`.toLowerCase();
@@ -537,15 +693,148 @@ function filterTickets(tickets, run) {
   });
 }
 
+function renderRunsTable(runs) {
+  if (!runs || !runs.length) {
+    return `<p class="soft">No previous or failed runs found in <code>runs/</code> yet. Start any mode above to create a migration run.</p>`;
+  }
+  const stateLabels = {
+    failed: "⚠ Failed / Needs Retry",
+    export_incomplete: "⚠ Export Interrupted",
+    paused: "⏸ Paused",
+    batch_done: "⏸ Batch Complete",
+    partial: "⏸ Partial Progress",
+    validated: "✓ Validated (Ready)",
+    completed: "✓ Completed",
+  };
+  const modeNames = {
+    sprints: "Mode 1: Sprints",
+    board: "Mode 2: Board",
+    project: "Mode 3: Project",
+  };
+  return `
+    <table class="runs-table">
+      <thead>
+        <tr>
+          <th>Mode</th>
+          <th>Source → Destination</th>
+          <th>Scope</th>
+          <th>Progress</th>
+          <th>Status</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${runs.map((r) => `
+          <tr>
+            <td><b>${esc(modeNames[r.mode] || r.mode)}</b></td>
+            <td><b>${esc(r.source)}</b> → <b>${esc(r.target)}</b></td>
+            <td class="soft">${esc(r.scope_label || "")}</td>
+            <td class="num">${r.completed} / ${r.total} migrated${r.failed ? ` · <span style="color:var(--red)">${r.failed} failed</span>` : ""}${r.remaining ? ` · ${r.remaining} remaining` : ""}</td>
+            <td><span class="state-badge ${esc(r.state)}">${esc(stateLabels[r.state] || r.state)}</span></td>
+            <td>
+              <button type="button" class="btn secondary btn-sm" data-action="recover-run" data-config="${esc(r.config)}" data-mode="${esc(r.mode || "sprints")}">
+                ${r.state === "failed" || r.state === "export_incomplete" ? "↺ Recover & Retry" : (r.state === "paused" || r.state === "batch_done" ? "▶ Resume Run" : "Open Run →")}
+              </button>
+            </td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+function renderHubManifest() {
+  const m = $("#manifest");
+  if (!m) return;
+  m.innerHTML = `
+    <div class="hub-wrap">
+      <div class="hub-head">
+        <h1>Choose a Migration Mode</h1>
+        <p>${connected()
+          ? `Connected to Jira as <b>${esc(S.jira)}</b> and Azure DevOps as <b>${esc(S.ado)}</b>. Pick a migration mode below to begin, or recover an earlier run.`
+          : `Connect to Jira and Azure DevOps in the left panel (or on any mode page), then pick the migration mode that matches your scope.`}</p>
+      </div>
+      <div class="mode-grid">
+        <div class="mode-card">
+          <div>
+            <div class="mode-card-tag">Mode 1 · Sprint Scope</div>
+            <h3>Sprint Migration</h3>
+            <p>Choose a Jira Project, Board, and one or more specific Sprints. Ideal for sprint-by-sprint team cutovers.</p>
+          </div>
+          <a class="btn" href="${esc(modeHref("/sprints"))}" data-action="go-mode" data-href="/sprints">Open Sprint Migration →</a>
+        </div>
+        <div class="mode-card">
+          <div>
+            <div class="mode-card-tag">Mode 2 · Board Scope</div>
+            <h3>Entire Board Migration</h3>
+            <p>Choose a Jira Project and Board (Scrum or Kanban) to migrate <b>all tickets on the board</b> regardless of sprint—including backlog and unsprinted items—while creating matching sprints in ADO.</p>
+          </div>
+          <a class="btn" href="${esc(modeHref("/board"))}" data-action="go-mode" data-href="/board">Open Board Migration →</a>
+        </div>
+        <div class="mode-card">
+          <div>
+            <div class="mode-card-tag">Mode 3 · Full Project</div>
+            <h3>Whole Project Migration</h3>
+            <p>Choose a Jira Project and migrate <b>everything associated with every ticket in the project</b> (all boards, backlog, done tickets, history, comments, attachments, links, and sprints) with batching &amp; pause/resume.</p>
+          </div>
+          <a class="btn" href="${esc(modeHref("/project"))}" data-action="go-mode" data-href="/project">Open Whole Project Migration →</a>
+        </div>
+        <div class="mode-card placeholder">
+          <div>
+            <div class="mode-card-tag">Mode 4 · Custom Query</div>
+            <h3>Custom JQL Migration</h3>
+            <p>Migrate tickets matching an arbitrary custom JQL filter across projects, components, or date ranges.</p>
+          </div>
+          <a class="btn secondary" href="${esc(modeHref("/jql"))}" data-action="go-mode" data-href="/jql">Open Custom JQL Migration →</a>
+        </div>
+      </div>
+
+      <div class="runs-section">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <h2>Recover / Resume Previous or Failed Runs</h2>
+            <p class="soft" style="margin:0">Every run is journaled to disk in <code>runs/</code>. If a migration was paused, batched, or interrupted by a network failure, click <b>Recover &amp; Retry</b> to pick up where it left off without creating duplicates.</p>
+          </div>
+          <button type="button" class="btn secondary btn-sm" data-action="refresh-runs">↻ Refresh Runs</button>
+        </div>
+        ${renderRunsTable(S.savedRuns)}
+      </div>
+    </div>`;
+}
+
+function renderJqlNotImplemented() {
+  const m = $("#manifest");
+  if (!m) return;
+  m.innerHTML = `
+    <div class="mode-card-tag" style="color:var(--amber)">Mode 4 · Custom JQL Migration</div>
+    <h1>Not Implemented Yet</h1>
+    <p>Custom JQL Migration (Mode 4) is planned for a future release and is not implemented yet.</p>
+    <p>In the meantime, you can migrate specific sprints (<b>Mode 1</b>), all tickets on any Scrum or Kanban board including unsprinted backlog items (<b>Mode 2</b>), or an entire Jira project (<b>Mode 3</b>).</p>
+    <div class="row" style="margin-top:24px">
+      <a class="btn" href="${esc(modeHref("/"))}" data-action="go-mode" data-href="/">← Back to Mode Selection</a>
+    </div>`;
+}
+
 function renderManifest() {
+  if (S.pageMode === "hub") {
+    renderHubManifest();
+    return;
+  }
+  if (S.pageMode === "jql") {
+    renderJqlNotImplemented();
+    return;
+  }
   const m = $("#manifest");
   if (!S.run || !S.run.preview) {
     const checking = S.phase === "checking" && S.job;
+    const modeDesc = S.pageMode === "board"
+      ? "Select your Jira project, board, and destination Azure DevOps project on the left, then click Validate to fetch all board tickets (including unsprinted backlog tickets)."
+      : (S.pageMode === "project"
+        ? "Select your Jira project and destination Azure DevOps project on the left, then click Validate to fetch every ticket in the project."
+        : "Select your Jira project, board, sprints, and destination Azure DevOps project on the left, then click Validate to review tickets, adjust status dropdowns, and resolve any duplicates.");
     m.innerHTML = `
       <div class="empty">
-        <h2>${checking ? "Validating sprint tickets..." : "Ready to validate tickets"}</h2>
+        <h2>${checking ? "Validating tickets..." : "Ready to validate tickets"}</h2>
         <p>${checking ? "Fetching issues, changelogs, comments, worklogs, and attachments from Jira, and matching statuses and duplicates against Azure DevOps. Nothing is written during validation."
-          : "Select your Jira project, board, sprints, and destination Azure DevOps project on the left, then click Validate to review tickets, adjust status dropdowns, and resolve any duplicates."}</p>
+          : modeDesc}</p>
         ${checking ? liveStrip() : ""}
       </div>
       ${S.log.length ? tabsHtml() : ""}`;
@@ -553,18 +842,21 @@ function renderManifest() {
   }
   const run = S.run;
   const pv = run.preview;
-  const r = pv.run || {};
+  const r = pv.run || run.run_info || {};
   const sprints = (r.sprints || []).map((s) => `${s.name}${s.state ? ` (${s.state})` : ""}`);
+  let scopeSub = sprints.join(", ");
+  if (r.mode === "board") scopeSub = `Entire Board: ${r.board_name || r.board_id || "All board tickets"} (${sprints.length} sprint(s) + backlog)`;
+  else if (r.mode === "project") scopeSub = `Entire Jira Project (${sprints.length} sprint(s) + unsprinted tickets)`;
   const places = pv.places || [];
   let where = "";
   if (places.length === 1) {
     const it = belowProject(places[0].iteration, pv.project);
     where = it ? `${it}${places[0].iteration_exists === false ? " (will be created)" : ""}` : "Project root iteration";
   } else if (places.length > 1) {
-    where = `${places.length} sprint iterations`;
+    where = `${places.length} iteration paths`;
   }
   const c = tally(run);
-  const after = S.phase === "importing" || S.phase === "imported";
+  const after = S.phase === "importing" || S.phase === "imported" || S.phase === "import_paused" || S.phase === "batch_done" || S.phase === "import_failed";
   const counts = after ? [
     ["there", c.done, "migrated"], ["there", c.there, "already in ADO"],
     ["create", c.create, S.phase === "importing" ? "remaining" : "pending"],
@@ -578,13 +870,14 @@ function renderManifest() {
 
   const visibleTickets = filterTickets(pv.tickets, run);
   const dupCount = pv.tickets.filter(isDuplicateTicket).length;
+  const failCount = pv.tickets.filter((t) => isFailedOrPartialTicket(t, run)).length;
 
   m.innerHTML = `
     <div class="route">
       <div>
         <div class="end-label">Source (Jira)</div>
         <div class="end-name">${esc(r.from || "")}</div>
-        <div class="end-sub">${esc(sprints.join(", "))}${r.include_done ? " · all statuses" : " · excluding Done"}</div>
+        <div class="end-sub">${esc(scopeSub)}${r.include_done ? " · all statuses" : " · excluding Done"}</div>
       </div>
       <div class="route-arrow" aria-hidden="true">→</div>
       <div>
@@ -602,6 +895,7 @@ function renderManifest() {
         <button type="button" class="pill-filter ${S.outcomeFilter === "all" ? "active" : ""}" data-action="filter-outcome" data-filter="all">All (${pv.tickets.length})</button>
         <button type="button" class="pill-filter ${S.outcomeFilter === "create" ? "active" : ""}" data-action="filter-outcome" data-filter="create">To Migrate (${toCreate(run)})</button>
         ${dupCount ? `<button type="button" class="pill-filter ${S.outcomeFilter === "duplicates" ? "active" : ""}" data-action="filter-outcome" data-filter="duplicates">Duplicates (${dupCount})</button>` : ""}
+        ${failCount ? `<button type="button" class="pill-filter ${S.outcomeFilter === "failed" ? "active" : ""}" data-action="filter-outcome" data-filter="failed">Failed / Partial (${failCount})</button>` : ""}
       </div>
       <div class="row">
         ${dupCount && !busy() && S.phase !== "imported" ? `
@@ -635,6 +929,7 @@ function liveStrip() {
   const step = job.steps.find((s) => s.status === "running");
   const last = S.log.length ? S.log[S.log.length - 1] : "";
   return `<div class="live"><b>${esc(step ? step.label : "Working")}</b><span class="last">${esc(last)}</span>
+    <button class="btn secondary btn-sm" type="button" data-action="pause">⏸ Pause</button>
     <button class="quiet" type="button" data-action="stop">Stop</button></div>`;
 }
 
@@ -964,6 +1259,19 @@ function renderDrawer() {
         <h3>Rendered Description Preview</h3>
         <iframe class="html-preview-frame" sandbox="" title="Rendered Description Preview" srcdoc="${esc(safeDescriptionSrcdoc(t.description_html))}"></iframe>
       </div>`;
+    return;
+  }
+
+  if (S.drawerMode === "runs") {
+    drawer.innerHTML = `
+      <div class="drawer-head">
+        <h2>Recover / Resume Saved &amp; Failed Runs</h2>
+        <button type="button" class="btn secondary btn-sm" data-action="close-drawer">Close</button>
+      </div>
+      <div class="drawer-body">
+        <p class="soft">Select any run below to reload its validation preview, inspect failed or partial tickets, and resume where it left off.</p>
+        ${renderRunsTable(S.savedRuns)}
+      </div>`;
   }
 }
 
@@ -1114,20 +1422,95 @@ async function connect(form) {
   render();
 }
 
-async function startCheck() {
+async function loadSavedRuns() {
+  try {
+    const d = await api("/api/runs");
+    S.savedRuns = d.runs || [];
+  } catch (e) {
+    S.savedRuns = [];
+  }
+  render();
+}
+
+async function applyRecoveredRun(runObj) {
+  S.run = runObj;
+  const rInfo = (runObj.preview && runObj.preview.run) || runObj.run_info || {};
+  if (rInfo.from) S.source = rInfo.from;
+  if (rInfo.board_id) S.board = String(rInfo.board_id);
+  if (rInfo.to) S.target = rInfo.to;
+  if (Array.isArray(rInfo.sprints) && S.pageMode === "sprints") {
+    S.picked = new Set(rInfo.sprints.map((s) => String(s.number || s.id || "")));
+  }
+  S.checkedSig = signature();
+  S.checkedAt = "recovered run";
+  const res = runObj.result || {};
+  const c = runObj.preview ? tally(runObj) : { done: 0, failed: 0 };
+  if (res.failed && res.failed.length) {
+    S.phase = "import_failed";
+    S.error = `${res.failed.length} ticket(s) failed during the previous run (${res.failed.slice(0, 5).join(", ")}). Click Retry / Resume Remaining to finish them.`;
+  } else if (res.paused) {
+    S.phase = "import_paused";
+    S.error = "";
+  } else if ((res.remaining || 0) > 0 && c.done > 0) {
+    S.phase = "batch_done";
+    S.error = "";
+  } else if (c.done > 0 && toCreate(runObj) === 0) {
+    S.phase = "imported";
+    S.error = "";
+  } else if (c.done > 0 && toCreate(runObj) > 0) {
+    S.phase = "import_paused";
+    S.error = "";
+  } else {
+    S.phase = "checked";
+    S.error = "";
+  }
+  S.drawerMode = null;
+  render();
+}
+
+async function recoverRun(cfgPath, targetMode) {
+  const mode = targetMode || "sprints";
+  if (S.pageMode !== mode) {
+    location.href = modeHref(`/${mode}`, { run: cfgPath });
+    return;
+  }
+  try {
+    const d = await api("/api/runs/recover", { config: cfgPath });
+    if (d.recovered === "loaded" && d.run) {
+      await applyRecoveredRun(d.run);
+      toast(`Recovered run (${cfgPath}).`);
+    } else if (d.recovered === "resuming_check" && d.job) {
+      S.job = d.job;
+      S.log = [];
+      S.since = 0;
+      S.phase = "checking";
+      S.drawerMode = null;
+      render();
+      poll();
+      toast("Resuming interrupted export & validation from cached files...");
+    }
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function startCheck(resumeOnly = false) {
   S.error = "";
-  S.log = [];
-  S.since = 0;
-  S.run = null;
-  S.stamps = {};
-  S.confirm = "";
-  S.choice = "skip";
-  S.ticketStates = {};
-  S.statusOverrides = {};
-  S.ticketActions = {};
-  S.lastChangedKey = "";
+  if (!resumeOnly) {
+    S.log = [];
+    S.since = 0;
+    S.run = null;
+    S.stamps = {};
+    S.confirm = "";
+    S.choice = "skip";
+    S.ticketStates = {};
+    S.statusOverrides = {};
+    S.ticketActions = {};
+    S.lastChangedKey = "";
+  }
   try {
     S.job = await api("/api/check", {
+      mode: S.pageMode === "board" ? "board" : (S.pageMode === "project" ? "project" : "sprints"),
       source: S.source,
       board: S.board || null,
       target: targetName(),
@@ -1137,6 +1520,7 @@ async function startCheck() {
       include_done: S.includeDone,
       include_hierarchy: S.includeHierarchy,
       history: S.historyMode,
+      force_export: resumeOnly ? false : S.forceExport,
     });
     S.phase = "checking";
     S.checkedSig = "";
@@ -1170,6 +1554,7 @@ async function startImport() {
     S.job = await api("/api/import", {
       config: S.run.config,
       possible_duplicates: S.choice,
+      batch_size: S.batchSize === "all" ? 0 : (parseInt(S.batchSize, 10) || 0),
       ticket_states: S.ticketStates,
       status_overrides: S.statusOverrides,
       ticket_actions: S.ticketActions,
@@ -1261,6 +1646,10 @@ async function poll() {
         S.checkedSig = signature();
         S.checkedAt = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
         S.tab = "where";
+      } else if (d.status === "paused") {
+        S.phase = "check_paused";
+        S.error = "";
+        toast("Validation paused cleanly. Click Resume Validation to continue.");
       } else {
         S.phase = "setup";
         S.error = d.status === "stopped" ? "Validation was stopped." : (d.error || "Validation failed. See the Log tab for details.");
@@ -1274,6 +1663,14 @@ async function poll() {
       if (d.status === "done") {
         S.phase = "imported";
         S.error = "";
+      } else if (d.status === "paused") {
+        S.phase = "import_paused";
+        S.error = "";
+        toast("Migration paused cleanly after finishing the current ticket.");
+      } else if (d.status === "batch_done") {
+        S.phase = "batch_done";
+        S.error = "";
+        toast("Batch finished cleanly. Click Resume / Migrate Next Batch when ready.");
       } else {
         S.phase = "import_failed";
         S.error = d.status === "stopped"
@@ -1281,6 +1678,7 @@ async function poll() {
           : (d.error || "Migration failed. See the Log tab for details, then click Retry / Resume Remaining.");
       }
     }
+    loadSavedRuns();
     render();
   } catch (e) {
     toast(e.message);
@@ -1302,9 +1700,39 @@ document.addEventListener("click", async (e) => {
   const action = el.dataset.action;
   if (action === "edit-connect") { S.editConnect = true; S.problems = {}; render(); }
   if (action === "cancel-connect") { S.editConnect = false; render(); }
-  if (action === "check") startCheck();
+  if (action === "go-mode") {
+    e.preventDefault();
+    const dest = el.dataset.href || "/";
+    location.href = modeHref(dest);
+    return;
+  }
+  if (action === "open-runs-drawer") {
+    await loadSavedRuns();
+    S.drawerMode = "runs";
+    renderDrawer();
+    return;
+  }
+  if (action === "refresh-runs") {
+    await loadSavedRuns();
+    toast("Refreshed saved runs.");
+    return;
+  }
+  if (action === "recover-run") {
+    await recoverRun(el.dataset.config, el.dataset.mode);
+    return;
+  }
+  if (action === "check") startCheck(false);
+  if (action === "resume-check") startCheck(true);
   if (action === "import") startImport();
   if (action === "rollback") startRollback();
+  if (action === "pause" && S.job) {
+    try {
+      await api(`/api/jobs/${S.job.id}/pause`, {});
+      toast("Pausing after the current ticket finishes...");
+    } catch (err) {
+      toast(err.message);
+    }
+  }
   if (action === "export-validation-csv") exportValidationCsv();
   if (action === "download-file") downloadServerFile(el.dataset.path, el.dataset.name);
   if (action === "open-help") { S.drawerMode = "help"; renderDrawer(); }
@@ -1406,6 +1834,8 @@ document.addEventListener("change", (e) => {
   if (action === "include-done") { S.includeDone = el.checked; render(); }
   if (action === "include-hierarchy") { S.includeHierarchy = el.checked; render(); }
   if (action === "history-mode") { S.historyMode = el.checked; render(); }
+  if (action === "force-export") { S.forceExport = el.checked; render(); }
+  if (action === "select-batch-size") { S.batchSize = el.value; render(); }
   if (action === "select-target") {
     S.isOther = el.value === "__other";
     if (!S.isOther) S.target = el.value;
@@ -1443,7 +1873,7 @@ document.addEventListener("input", (e) => {
   if (action === "new-iteration") {
     S.newIteration = el.value;
     const check = document.querySelector("[data-action=check]");
-    if (check) check.disabled = !(S.source && S.picked.size && targetName() && chosenIteration()) || busy();
+    if (check) check.disabled = !(sourceReady() && targetName() && chosenIteration()) || busy();
   }
   if (action === "other-target") S.other = el.value;
   if (action === "filter-sprints") {
@@ -1495,6 +1925,10 @@ async function init() {
     if (connected()) {
       loadProjects();
       loadTargets();
+    }
+    await loadSavedRuns();
+    if (INITIAL_RECOVER_CFG && S.pageMode !== "hub" && S.pageMode !== "jql") {
+      await recoverRun(INITIAL_RECOVER_CFG, S.pageMode);
     }
     if (d.running) {
       S.job = await api(`/api/jobs/${d.running}`);

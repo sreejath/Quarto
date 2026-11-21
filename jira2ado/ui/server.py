@@ -44,6 +44,10 @@ TARGETS = os.path.join("configs", "targets.yaml")
 SETTINGS = "ui-settings.json"          # last email, URLs, and choices; never tokens
 
 FILES = {"/": ("index.html", "text/html; charset=utf-8"),
+         "/sprints": ("sprints.html", "text/html; charset=utf-8"),
+         "/board": ("board.html", "text/html; charset=utf-8"),
+         "/project": ("project.html", "text/html; charset=utf-8"),
+         "/jql": ("jql.html", "text/html; charset=utf-8"),
          "/app.js": ("app.js", "text/javascript; charset=utf-8"),
          "/app.css": ("app.css", "text/css; charset=utf-8"),
          "/logo.svg": ("logo.svg", "image/svg+xml")}
@@ -158,6 +162,8 @@ class Job:
         self.result = {}
         self.proc = None
         self.stopped = False
+        self.paused = False
+        self.config_path = None
 
     def public(self, since=0):
         return {"id": self.id, "kind": self.kind, "status": self.status, "error": self.error,
@@ -211,6 +217,9 @@ def run_step(job, index, args, ok=(0,)):
     if job.stopped:
         step["status"] = "stopped"
         raise StopRun()
+    if proc.returncode == 2 or job.paused:
+        step["status"] = "paused"
+        return 2, out
     step["status"] = "done" if proc.returncode in ok else "failed"
     return proc.returncode, out
 
@@ -250,35 +259,56 @@ def start(job, target):
     return job
 
 
-def check_job(params):
+def _clear_pause_file(cfg_path):
+    try:
+        full_cfg = inside_runs(cfg_path)
+        pfile = os.path.join(os.path.dirname(full_cfg), ".pause")
+        if os.path.exists(pfile):
+            os.remove(pfile)
+    except Exception:
+        pass
+
+
+def check_job(params, existing_cfg=None):
     """Prepare the run, check the tokens and the query, export, and preview. Writes nothing to Azure DevOps."""
-    job = Job("check", ["Look up the board, sprint and project", "Check access", "Export from Jira",
+    job = Job("check", ["Look up the project, board and scope", "Check access", "Export from Jira",
                         "Resolve user identities", "Compare with Azure DevOps & map statuses", "Plan the work items"])
 
     def work(job):
-        args = ["prepare", "--from", params["source"], "--to", params["target"]]
-        if params.get("board"):
-            args += ["--board", str(params["board"])]
-        for sp in params["sprints"]:
-            args += ["--sprint", str(sp)]
-        if params.get("iteration"):
-            args += ["--iteration", params["iteration"]]
-        if params.get("area"):
-            args += ["--area", params["area"]]
-        if params.get("include_done"):
-            args += ["--include-done"]
-        if params.get("include_hierarchy"):
-            args += ["--include-hierarchy"]
-        if params.get("history") is not None:
-            args += ["--history", "true" if params["history"] else "false"]
-        code, out = run_step(job, 0, args)
-        if code != 0:
-            job.status, job.error = "failed", last_message(job)
-            return
-        cfg = out.strip().splitlines()[-1]
+        if existing_cfg:
+            cfg = existing_cfg
+            job.steps[0]["status"] = "done"
+        else:
+            mode = (params.get("mode") or "sprints").strip().lower()
+            args = ["prepare", "--mode", mode, "--from", params["source"], "--to", params["target"]]
+            if params.get("board"):
+                args += ["--board", str(params["board"])]
+            for sp in (params.get("sprints") or []):
+                args += ["--sprint", str(sp)]
+            if params.get("iteration"):
+                args += ["--iteration", params["iteration"]]
+            if params.get("area"):
+                args += ["--area", params["area"]]
+            if params.get("include_done"):
+                args += ["--include-done"]
+            if params.get("include_hierarchy"):
+                args += ["--include-hierarchy"]
+            if params.get("history") is not None:
+                args += ["--history", "true" if params["history"] else "false"]
+            code, out = run_step(job, 0, args)
+            if code != 0:
+                job.status, job.error = "failed", last_message(job)
+                return
+            cfg = out.strip().splitlines()[-1]
+        _clear_pause_file(cfg)
+        job.config_path = cfg
         job.result["config"] = cfg
-        for i, step in enumerate([["access"], ["export", "--force"], ["users"], ["check", "--online"], ["plan"]], 1):
+        exp_step = ["export", "--force"] if params.get("force_export") else ["export"]
+        for i, step in enumerate([["access"], exp_step, ["users"], ["check", "--online"], ["plan"]], 1):
             code, _ = run_step(job, i, ["-c", cfg] + step)
+            if code == 2:
+                job.status = "paused"
+                return
             if code != 0:
                 job.status, job.error = "failed", last_message(job)
                 return
@@ -356,22 +386,43 @@ def import_job(params):
     choice = params.get("possible_duplicates") or "skip"
     if choice not in ("skip", "create"):
         raise ApiError("possible_duplicates must be skip or create.")
+    batch_size = 0
+    if params.get("batch_size") not in (None, "", 0, "0", "all"):
+        try:
+            batch_size = max(0, int(params["batch_size"]))
+        except (TypeError, ValueError):
+            raise ApiError("batch_size must be a positive integer.")
+    only_keys = [str(k).strip() for k in (params.get("only_keys") or []) if str(k).strip()]
     apply_overrides_to_config(cfg_path, params)
+    _clear_pause_file(cfg_path)
     job = Job("import", ["Apply status & duplicate overrides", "Create & sync work items in Azure DevOps", "Verify migrated items"])
+    job.config_path = cfg_path
 
     def work(job):
         code, _ = run_step(job, 0, ["-c", cfg_path, "plan"], ok=(0,))
         if code != 0:
             job.status, job.error = "failed", last_message(job)
             return
-        code, _ = run_step(job, 1, ["-c", cfg_path, "import", "--possible-duplicates", choice], ok=(0,))
+        imp_args = ["-c", cfg_path, "import", "--possible-duplicates", choice]
+        if batch_size > 0:
+            imp_args += ["--limit", str(batch_size)]
+        if only_keys:
+            imp_args += only_keys
+        code, _ = run_step(job, 1, imp_args, ok=(0, 2))
         report = os.path.join(os.path.dirname(cfg_path), "verify.csv")
         if os.path.exists(os.path.join(os.path.dirname(full_cfg), "import-state.jsonl")):
             run_step(job, 2, ["-c", cfg_path, "verify", "--report", report], ok=(0, 1))
-        job.result["run"] = run_data(cfg_path)
+        r_data = run_data(cfg_path)
+        job.result["run"] = r_data
+        res_info = r_data.get("result") or {}
+        if code == 2 or res_info.get("paused"):
+            job.status = "paused"
+            return
         if code != 0:
             job.status, job.error = "failed", last_message(job)
             return
+        if batch_size > 0 and (res_info.get("remaining") or 0) > 0:
+            job.status = "batch_done"
 
     return start(job, work)
 
@@ -438,6 +489,7 @@ def run_data(cfg_path):
     org = cfg["ado"]["org_url"].rstrip("/")
     project = cfg["ado"]["project"]
     return {"config": cfg_path, "folder": folder,
+            "run_info": cfg.get("run") or {},
             "preview": read_json_file(os.path.join(full_folder, "preview.json")),
             "result": read_json_file(os.path.join(full_folder, "import-result.json")),
             "journal": journal, "held": held, "verify": verify,
@@ -445,6 +497,94 @@ def run_data(cfg_path):
             "jira_browse": cfg["jira"]["base_url"].rstrip("/") + "/browse/",
             "files": {name: os.path.join(folder, name) for name in ("duplicates.csv", "verify.csv")
                       if os.path.exists(os.path.join(full_folder, name))}}
+
+
+def list_saved_runs():
+    """Scan runs/ for existing run folders so interrupted, paused, or failed runs can be recovered."""
+    runs_root = os.path.join(KIT, "runs")
+    if not os.path.isdir(runs_root):
+        return []
+    out = []
+    for root, _, files in os.walk(runs_root):
+        if "config.yaml" not in files:
+            continue
+        full_cfg = os.path.join(root, "config.yaml")
+        rel_cfg = os.path.relpath(full_cfg, KIT)
+        try:
+            cfg = config.load(full_cfg)
+        except Exception:
+            continue
+        run_info = cfg.get("run") or {}
+        mode = run_info.get("mode") or ("sprints" if run_info.get("sprints") else "project")
+        source = run_info.get("from") or ""
+        target = run_info.get("to") or (cfg.get("ado") or {}).get("project") or ""
+        board_name = run_info.get("board_name") or run_info.get("board_id") or ""
+        sprints = [s.get("name") for s in (run_info.get("sprints") or []) if isinstance(s, dict) and s.get("name")]
+        if mode == "board":
+            scope_label = f"Board: {board_name or 'All board tickets'}"
+        elif mode == "project":
+            scope_label = f"Entire Project ({source})"
+        else:
+            scope_label = ", ".join(sprints[:3]) + (f" (+{len(sprints) - 3} more)" if len(sprints) > 3 else "") or "Sprint run"
+        pv = read_json_file(os.path.join(root, "preview.json"))
+        res = read_json_file(os.path.join(root, "import-result.json")) or {}
+        exp_keys = read_json_file(os.path.join(KIT, (cfg.get("paths") or {}).get("export_dir", ""), "keys.json")) or []
+        data = run_data(rel_cfg)
+        tickets = (pv or {}).get("tickets") or []
+        total = len(tickets) or len(exp_keys)
+        completed = 0
+        partial = 0
+        skipped = len(data.get("held") or {})
+        for t in tickets:
+            j = data["journal"].get(t["key"])
+            if j:
+                if j.get("found") or j.get("revs", 0) >= t.get("revisions", 1):
+                    completed += 1
+                elif j.get("revs", 0) > 0:
+                    partial += 1
+        if not tickets and data["journal"]:
+            completed = len(data["journal"])
+        failed_list = res.get("failed") or []
+        failed = len(failed_list)
+        remaining = res.get("remaining") if "remaining" in res else max(0, total - completed - skipped - failed)
+        if pv is None:
+            state = "export_incomplete"
+        elif failed > 0 or partial > 0:
+            state = "failed"
+        elif res.get("paused"):
+            state = "paused"
+        elif (completed > 0 or skipped > 0) and remaining > 0:
+            state = "batch_done"
+        elif (completed > 0 or skipped > 0) and remaining == 0 and res:
+            state = "completed"
+        else:
+            state = "validated"
+        mtime = os.path.getmtime(full_cfg)
+        for fn in ("import-state.jsonl", "import-result.json", "preview.json"):
+            fp = os.path.join(root, fn)
+            if os.path.exists(fp):
+                mtime = max(mtime, os.path.getmtime(fp))
+        out.append({
+            "config": rel_cfg,
+            "mode": mode,
+            "source": source,
+            "target": target,
+            "board_id": run_info.get("board_id"),
+            "board_name": board_name,
+            "scope_label": scope_label,
+            "has_preview": pv is not None,
+            "total": total,
+            "completed": completed,
+            "partial": partial,
+            "failed": failed,
+            "failed_keys": failed_list,
+            "skipped": skipped,
+            "remaining": remaining,
+            "state": state,
+            "updated_ts": mtime,
+        })
+    out.sort(key=lambda r: r["updated_ts"], reverse=True)
+    return out
 
 
 # ---------------------------------------------------------------- API
@@ -590,13 +730,21 @@ def api(method, path, query, body):
     if path == "/api/check" and method == "POST":
         if not (S.tokens.get("jira_token") and S.tokens.get("ado_token")):
             raise ApiError("Connect to Jira and Azure DevOps first.", 401)
+        mode = (body.get("mode") or "sprints").strip().lower()
+        if mode not in ("sprints", "board", "project"):
+            raise ApiError(f"Unsupported migration mode '{mode}'.")
         source, target = (body.get("source") or "").strip(), (body.get("target") or "").strip()
         board = (body.get("board") or "").strip() or None
         sprints = [str(x) for x in body.get("sprints") or [] if str(x).strip()]
-        if not (source and target and sprints):
+        if mode == "sprints" and not (source and target and sprints):
             raise ApiError("Choose a Jira project, at least one sprint and an Azure DevOps project.")
-        save_settings(source=source, board=board, target=target)
+        if mode == "board" and not (source and board and target):
+            raise ApiError("Choose a Jira project, a Jira board and an Azure DevOps project.")
+        if mode == "project" and not (source and target):
+            raise ApiError("Choose a Jira project and an Azure DevOps project.")
+        save_settings(source=source, board=board, target=target, mode=mode)
         return check_job({
+            "mode": mode,
             "source": source,
             "board": board,
             "target": target,
@@ -606,7 +754,26 @@ def api(method, path, query, body):
             "include_done": bool(body.get("include_done")),
             "include_hierarchy": bool(body.get("include_hierarchy")),
             "history": body.get("history", True),
+            "force_export": bool(body.get("force_export")),
         }).public()
+
+    if path == "/api/runs" and method == "GET":
+        return {"runs": list_saved_runs()}
+
+    if path == "/api/runs/recover" and method == "POST":
+        cfg_path = (body.get("config") or "").strip()
+        if not cfg_path:
+            raise ApiError("Missing run config path.")
+        full_cfg = inside_runs(cfg_path)
+        if not os.path.exists(full_cfg):
+            raise ApiError("Run config file not found.", 404)
+        pv_path = os.path.join(os.path.dirname(full_cfg), "preview.json")
+        if os.path.exists(pv_path):
+            return {"ok": True, "recovered": "loaded", "run": run_data(cfg_path)}
+        if not (S.tokens.get("jira_token") and S.tokens.get("ado_token")):
+            raise ApiError("Connect to Jira and Azure DevOps first to resume an incomplete export/validation.", 401)
+        job = check_job({}, existing_cfg=cfg_path)
+        return {"ok": True, "recovered": "resuming_check", "job": job.public()}
 
     if path == "/api/override" and method == "POST":
         cfg_path = body.get("config") or ""
@@ -655,6 +822,17 @@ def api(method, path, query, body):
             job.stopped = True
             if job.proc:
                 job.proc.terminate()
+            return job.public()
+        if len(parts) > 4 and parts[4] == "pause" and method == "POST":
+            job.paused = True
+            if job.config_path:
+                try:
+                    full_cfg = inside_runs(job.config_path)
+                    with open(os.path.join(os.path.dirname(full_cfg), ".pause"), "w", encoding="utf-8") as fh:
+                        fh.write("pause\n")
+                except Exception:
+                    pass
+            job.log.append("Pause requested — finishing current ticket cleanly...")
             return job.public()
         return job.public(int((query.get("since") or ["0"])[0]))
 

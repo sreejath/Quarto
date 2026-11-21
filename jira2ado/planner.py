@@ -136,6 +136,14 @@ def closest_ado_state(status, wit, valid_states=None, cfg=None, meta=None, resol
     return apply_resolution(cat_choice, ok, "category" if ok else "fallback")
 
 
+def is_subtask_issue(issue):
+    """Return True if the Jira issue is a Sub-task (by issuetype.subtask flag or type name)."""
+    it = ((issue or {}).get("fields") or {}).get("issuetype") or {}
+    if it.get("subtask") is True:
+        return True
+    return (it.get("name") or "").strip().lower() in ("sub-task", "subtask")
+
+
 def type_for(issue, cfg, available_wits=None):
     key = issue.get("key")
     m = cfg["mapping"]
@@ -661,7 +669,7 @@ class Planner:
                 else:
                     target_rev["fields"].pop("Microsoft.VSTS.Common.ClosedDate", None)
 
-        return {"key": key, "type": wit, "revisions": revs}
+        return {"key": key, "type": wit, "subtask": is_subtask_issue(issue), "revisions": revs}
 
 
 def sprints_in(issue, meta, cfg):

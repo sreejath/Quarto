@@ -11,6 +11,7 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -212,12 +213,13 @@ def run_step(job, index, args, ok=(0,)):
         out = ""
         for line in proc.stdout:
             job.log.append(line.rstrip("\n"))
+        proc.stdout.close()
         proc.wait()
     job.proc = None
     if job.stopped:
         step["status"] = "stopped"
         raise StopRun()
-    if proc.returncode == 2 or job.paused:
+    if proc.returncode == 2:
         step["status"] = "paused"
         return 2, out
     step["status"] = "done" if proc.returncode in ok else "failed"
@@ -304,7 +306,8 @@ def check_job(params, existing_cfg=None):
         job.config_path = cfg
         job.result["config"] = cfg
         exp_step = ["export", "--force"] if params.get("force_export") else ["export"]
-        for i, step in enumerate([["access"], exp_step, ["users"], ["check", "--online"], ["plan"]], 1):
+        steps_list = [["access"], exp_step, ["users"], ["check", "--online"], ["plan"]]
+        for i, step in enumerate(steps_list, 1):
             code, _ = run_step(job, i, ["-c", cfg] + step)
             if code == 2:
                 job.status = "paused"
@@ -312,6 +315,11 @@ def check_job(params, existing_cfg=None):
             if code != 0:
                 job.status, job.error = "failed", last_message(job)
                 return
+            if job.paused and i < len(steps_list):
+                _clear_pause_file(cfg)
+                job.status = "paused"
+                return
+        _clear_pause_file(cfg)
         job.result["run"] = run_data(cfg)
 
     return start(job, work)
@@ -349,8 +357,6 @@ def apply_overrides_to_config(cfg_path, body):
         m.setdefault("status_overrides", {}).update({k: v.strip() for k, v in body["status_overrides"].items() if v and v.strip()})
         changed = True
     if changed:
-        with open(full_cfg, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True, width=120)
         pv_path = os.path.join(os.path.dirname(full_cfg), "preview.json")
         pv = read_json_file(pv_path)
         if pv and isinstance(pv.get("tickets"), list):
@@ -360,18 +366,27 @@ def apply_overrides_to_config(cfg_path, body):
             so = m.get("status_overrides") or {}
             for t in pv["tickets"]:
                 k = t["key"]
-                if t.get("jira_status") in so and k not in ts:
-                    t["ado_state"] = so[t["jira_status"]]
-                    t["state_match_reason"] = "override"
-                if k in ts:
-                    t["ado_state"] = ts[k]
-                    t["state_match_reason"] = "override"
                 if k in tt:
                     t["ado_type"] = tt[k]
+                valid = t.get("valid_states") or (pv.get("valid_states") or {}).get(t.get("ado_type")) or []
+                if t.get("jira_status") in so and k not in ts:
+                    cand = so[t["jira_status"]]
+                    if not valid or cand in valid:
+                        t["ado_state"] = cand
+                        t["state_match_reason"] = "override"
+                if k in ts:
+                    cand = ts[k]
+                    if not valid or cand in valid:
+                        t["ado_state"] = cand
+                        t["state_match_reason"] = "override"
+                    else:
+                        ts.pop(k, None)
                 if k in ta:
                     t["action"] = ta[k]
             with open(pv_path, "w", encoding="utf-8") as fh:
                 json.dump(pv, fh, indent=1)
+        with open(full_cfg, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True, width=120)
     return raw
 
 
@@ -393,6 +408,9 @@ def import_job(params):
         except (TypeError, ValueError):
             raise ApiError("batch_size must be a positive integer.")
     only_keys = [str(k).strip() for k in (params.get("only_keys") or []) if str(k).strip()]
+    for k in only_keys:
+        if not re.match(r"^[A-Z][A-Z0-9_]*-\d+$", k, re.I):
+            raise ApiError(f"Invalid Jira ticket key '{k}'.", 400)
     apply_overrides_to_config(cfg_path, params)
     _clear_pause_file(cfg_path)
     job = Job("import", ["Apply status & duplicate overrides", "Create & sync work items in Azure DevOps", "Verify migrated items"])
@@ -403,6 +421,10 @@ def import_job(params):
         if code != 0:
             job.status, job.error = "failed", last_message(job)
             return
+        if job.paused:
+            _clear_pause_file(cfg_path)
+            job.status = "paused"
+            return
         imp_args = ["-c", cfg_path, "import", "--possible-duplicates", choice]
         if batch_size > 0:
             imp_args += ["--limit", str(batch_size)]
@@ -410,16 +432,28 @@ def import_job(params):
             imp_args += only_keys
         code, _ = run_step(job, 1, imp_args, ok=(0, 2))
         report = os.path.join(os.path.dirname(cfg_path), "verify.csv")
+        res_pre = read_json_file(os.path.join(os.path.dirname(full_cfg), "import-result.json")) or {}
+        batch_keys = res_pre.get("batch_keys") or []
         if os.path.exists(os.path.join(os.path.dirname(full_cfg), "import-state.jsonl")):
-            run_step(job, 2, ["-c", cfg_path, "verify", "--report", report], ok=(0, 1))
+            if batch_size > 0:
+                if batch_keys:
+                    run_step(job, 2, ["-c", cfg_path, "verify", "--report", report] + list(batch_keys), ok=(0, 1))
+                else:
+                    job.steps[2]["status"] = "done"
+            else:
+                run_step(job, 2, ["-c", cfg_path, "verify", "--report", report], ok=(0, 1))
         r_data = run_data(cfg_path)
         job.result["run"] = r_data
         res_info = r_data.get("result") or {}
-        if code == 2 or res_info.get("paused"):
-            job.status = "paused"
+        failed_list = res_info.get("failed") or []
+        if failed_list or code not in (0, 2):
+            job.status = "failed"
+            job.error = (f"Failed on {', '.join(failed_list)}: {last_message(job)}"
+                         if failed_list else last_message(job))
             return
-        if code != 0:
-            job.status, job.error = "failed", last_message(job)
+        if code == 2 or res_info.get("paused") or job.paused:
+            _clear_pause_file(cfg_path)
+            job.status = "paused"
             return
         if batch_size > 0 and (res_info.get("remaining") or 0) > 0:
             job.status = "batch_done"
@@ -457,8 +491,8 @@ def read_json_file(path):
         return None
 
 
-def run_data(cfg_path):
-    """Everything the page shows for one run: the preview, the import log and the reports."""
+def run_data(cfg_path, include_preview=True):
+    """Everything the page shows for one run: the preview (when include_preview=True), the import log and the reports."""
     full_cfg = inside_runs(cfg_path)
     cfg = config.load(full_cfg)
     folder = os.path.dirname(cfg_path)
@@ -488,15 +522,37 @@ def run_data(cfg_path):
             verify = {r["jira_key"]: r.get("problems", "") for r in csv.DictReader(fh)}
     org = cfg["ado"]["org_url"].rstrip("/")
     project = cfg["ado"]["project"]
-    return {"config": cfg_path, "folder": folder,
-            "run_info": cfg.get("run") or {},
-            "preview": read_json_file(os.path.join(full_folder, "preview.json")),
-            "result": read_json_file(os.path.join(full_folder, "import-result.json")),
-            "journal": journal, "held": held, "verify": verify,
-            "item_url": f"{org}/{quote(project)}/_workitems/edit/",
-            "jira_browse": cfg["jira"]["base_url"].rstrip("/") + "/browse/",
-            "files": {name: os.path.join(folder, name) for name in ("duplicates.csv", "verify.csv")
-                      if os.path.exists(os.path.join(full_folder, name))}}
+    out = {"config": cfg_path, "folder": folder,
+           "run_info": cfg.get("run") or {},
+           "result": read_json_file(os.path.join(full_folder, "import-result.json")),
+           "journal": journal, "held": held, "verify": verify,
+           "item_url": f"{org}/{quote(project)}/_workitems/edit/",
+           "jira_browse": cfg["jira"]["base_url"].rstrip("/") + "/browse/",
+           "files": {name: os.path.join(folder, name) for name in ("duplicates.csv", "verify.csv")
+                     if os.path.exists(os.path.join(full_folder, name))}}
+    if include_preview:
+        out["preview"] = read_json_file(os.path.join(full_folder, "preview.json"))
+    return out
+
+
+def ticket_detail(cfg_path, key):
+    """Return full description_html for a single ticket when the Inspector drawer opens."""
+    from ..exporter import issue_path, load_users_file
+    from ..planner import _description_html
+    if not key or not re.match(r"^[A-Z][A-Z0-9_]*-\d+$", key, re.I):
+        raise ApiError("Invalid Jira ticket key.", 400)
+    full_cfg = inside_runs(cfg_path)
+    cfg = config.load(full_cfg)
+    export_dir = os.path.join(KIT, (cfg.get("paths") or {}).get("export_dir", ""))
+    iss = read_json_file(issue_path(export_dir, key))
+    if not iss:
+        raise ApiError(f"Ticket {key} not found in export.", 404)
+    users_path = os.path.join(KIT, (cfg.get("paths") or {}).get("users_file") or "users.csv")
+    users = load_users_file(users_path) or {"ids": {}, "names": {}}
+    return {
+        "key": key,
+        "description_html": _description_html(iss, users.get("names") or "") or "",
+    }
 
 
 def list_saved_runs():
@@ -529,7 +585,7 @@ def list_saved_runs():
         pv = read_json_file(os.path.join(root, "preview.json"))
         res = read_json_file(os.path.join(root, "import-result.json")) or {}
         exp_keys = read_json_file(os.path.join(KIT, (cfg.get("paths") or {}).get("export_dir", ""), "keys.json")) or []
-        data = run_data(rel_cfg)
+        data = run_data(rel_cfg, include_preview=False)
         tickets = (pv or {}).get("tickets") or []
         total = len(tickets) or len(exp_keys)
         completed = 0
@@ -836,8 +892,14 @@ def api(method, path, query, body):
             return job.public()
         return job.public(int((query.get("since") or ["0"])[0]))
 
+    if path == "/api/run/progress":
+        return run_data((query.get("config") or [""])[0], include_preview=False)
+
     if path == "/api/run":
-        return run_data((query.get("config") or [""])[0])
+        return run_data((query.get("config") or [""])[0], include_preview=True)
+
+    if path == "/api/ticket":
+        return ticket_detail((query.get("config") or [""])[0], (query.get("key") or [""])[0].strip().upper())
 
     if path == "/api/open" and method == "POST":
         full = inside_runs(body.get("path") or "")

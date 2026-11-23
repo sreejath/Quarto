@@ -54,17 +54,21 @@ def slug(text):
 
 
 def sprint_folder_slug(chosen):
-    """Deterministic, filesystem-safe folder name for 1..N selected sprints (always <= 80 chars)."""
+    """Deterministic, filesystem-safe folder name for 1..N selected sprints (always <= 80 chars), independent of tick order."""
     if not chosen:
         return "unnamed"
-    joined = "+".join(slug(s["name"]) for s in chosen)
-    if len(chosen) <= 3 and len(joined) <= 80:
+    ordered = sorted(
+        chosen,
+        key=lambda s: (int(s["id"]) if str(s.get("id", "")).isdigit() else 0, str(s.get("id", "")), slug(s.get("name", ""))),
+    )
+    joined = "+".join(slug(s["name"]) for s in ordered)
+    if len(ordered) <= 3 and len(joined) <= 80:
         return joined or "unnamed"
     import hashlib
-    sig = hashlib.sha1(",".join(str(s.get("id", s.get("name", ""))) for s in sorted(chosen, key=lambda x: str(x.get("id", x.get("name", ""))))).encode()).hexdigest()[:8]
-    first = slug(chosen[0]["name"])[:28].rstrip("-")
-    last = slug(chosen[-1]["name"])[:28].rstrip("-")
-    return f"{first}..{last}-{len(chosen)}-sprints-{sig}"
+    sig = hashlib.sha1(",".join(str(s.get("id", s.get("name", ""))) for s in ordered).encode()).hexdigest()[:8]
+    first = slug(ordered[0]["name"])[:28].rstrip("-")
+    last = slug(ordered[-1]["name"])[:28].rstrip("-")
+    return f"{first}..{last}-{len(ordered)}-sprints-{sig}"
 
 
 def read_json(path, default=None):
@@ -129,6 +133,7 @@ class Journal:
                 self.synced[e["k"]] = {
                     "id": e["id"],
                     "before_fields": e.get("before_fields") or {},
+                    "after_fields": e.get("after_fields") or {},
                     "before_rel_urls": list(e.get("before_rel_urls") or []),
                 }
 

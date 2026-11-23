@@ -1,5 +1,8 @@
 """Phase 2: replay the exported issues into Azure DevOps, plus delta sync and rollback."""
+from collections import Counter
+import html
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 
@@ -7,8 +10,8 @@ from .adf import esc, rewrite_html
 from .ado_client import AdoError
 from .duplicates import SAME_KEY, describe
 from .exporter import load_issues
-from .planner import Planner, override_node, sprint_info, sprints_in
-from .util import Journal, bump, iso, name_key, node_name, parse_dt, read_json
+from .planner import Planner, discover_sprint_collisions, override_node, sprint_info, sprint_label, sprints_in
+from .util import Journal, bump, iso, name_key, node_name, parse_dt, read_json, write_json
 
 MAX_ATTACHMENT = 60 * 1024 * 1024  # Azure DevOps Services limit per file
 
@@ -63,7 +66,7 @@ def build_ops(rev, users, att_urls, jira_base, when, issue_url=None, key_to_ado=
     for a in rev["attachments"]:
         if a["id"] in att_urls:
             add("/relations/-", {"rel": "AttachedFile", "url": att_urls[a["id"]],
-                                 "attributes": {"comment": "Imported from Jira", "name": a["filename"]}})
+                                 "attributes": {"comment": f"Jira attachment {a['id']}", "name": a["filename"]}})
     for rel in rev.get("relations", []):
         add("/relations/-", rel)
     return ops
@@ -75,18 +78,20 @@ def create_iterations(ado, cfg, meta, journal, log=print):
         return
     sub_fn = getattr(ado, "subscribe_team_iteration", None) if cfg["ado"].get("subscribe_team_iterations", True) else None
     team = cfg["ado"].get("team")
+    colliding = meta.get("_colliding_sprints") if "_colliding_sprints" in meta else discover_sprint_collisions(cfg, meta)
     sprints, every = {}, {}
-    for sp in (cfg.get("run") or {}).get("sprints") or []:
+    for sp in list((cfg.get("run") or {}).get("sprints") or []) + list((meta or {}).get("sprints") or []):
         if isinstance(sp, dict) and sp.get("name"):
-            every.setdefault(sp["name"], (sp.get("start") or sp.get("startDate"), sp.get("end") or sp.get("endDate"), sp.get("state")))
+            lbl = sprint_label(sp, colliding)
+            every.setdefault(lbl, (sp.get("start") or sp.get("startDate"), sp.get("end") or sp.get("endDate"), sp.get("state")))
     for issue in load_issues(cfg["paths"]["export_dir"]):
-        found = sprints_in(issue, meta, cfg)
+        found = sprints_in(issue, meta, cfg, colliding=colliding)
         for k, v in found.items():
             if k in every and not v[0] and every[k][0]:
                 found[k] = every[k]
         every.update({k: v for k, v in found.items() if k not in every or v[0]})
         if not m["history"]:  # only the sprint each item ends up in is needed
-            current = sprint_info(issue, meta, m.get("only_sprints"))[0]
+            current = sprint_info(issue, meta, m.get("only_sprints"), colliding=colliding)[0]
             found = {current: found[current]} if current in found else {}
         for name, info in found.items():
             if name not in sprints or info[0]:
@@ -210,20 +215,30 @@ def plan_title(plan):
     return title
 
 
-def check_duplicates(ado, cfg, plans, journal):
+def check_duplicates(ado, cfg, plans, journal, use_cache=False, save_cache=False):
     """Look in the target project for items that may already hold these tickets. Tickets this
     import log already knows are not checked. Returns (already there {key: id}, possible {key: [match]})."""
-    finder = getattr(ado, "find_duplicates", None)
     todo = [p for p in plans if p["key"] not in journal.items]
-    if not finder or not todo:
+    if not todo:
+        return {}, {}
+    want_titles = bool(cfg["mapping"].get("duplicate_check_titles", True))
+    dup_path = os.path.join(state_dir(cfg), "duplicates.json")
+    if use_cache and os.path.exists(dup_path):
+        cached = read_json(dup_path, {}) or {}
+        if cached.get("checked_online") is True and cached.get("duplicate_check_titles", True) == want_titles:
+            todo_keys = {p["key"] for p in todo}
+            there = {k: v for k, v in (cached.get("already_there") or {}).items() if k in todo_keys}
+            possible = {k: v for k, v in (cached.get("possible") or {}).items() if k in todo_keys}
+            return there, possible
+    finder = getattr(ado, "find_duplicates", None)
+    if not finder:
         return {}, {}
     key_ref = cfg["mapping"].get("jira_key_field")
     getter = getattr(ado, "type_fields", None)
-    has_field = bool(key_ref and getter and any(key_ref in (getter(t) or set()) for t in {p["type"] for p in todo}))
+    has_field = bool(key_ref and (not getter or any((getter(t) is None or key_ref in (getter(t) or set())) for t in {p["type"] for p in todo})))
     # For sub-tasks, use only the Jira ID/Key (never summary title) because sub-tasks across stories share identical names
     entries = [(p["key"], "" if p.get("subtask") else plan_title(p)) for p in todo]
-    found = finder(entries, key_ref if has_field else None,
-                   cfg["mapping"].get("duplicate_check_titles", True))
+    found = finder(entries, key_ref if has_field else None, want_titles)
     there, possible = {}, {}
     for key, matches in found.items():
         same = [m for m in matches if m["kind"] == SAME_KEY]
@@ -231,6 +246,13 @@ def check_duplicates(ado, cfg, plans, journal):
             there[key] = same[0]["id"]
         else:
             possible[key] = matches
+    if save_cache:
+        write_json(dup_path, {
+            "checked_online": True,
+            "duplicate_check_titles": want_titles,
+            "already_there": there,
+            "possible": possible,
+        })
     return there, possible
 
 
@@ -270,6 +292,12 @@ def _norm_comment(s):
     return " ".join((s or "").split())
 
 
+def _norm_comment_text(s):
+    """Strip HTML tags and unescape entities so comments reformatted by Azure DevOps still match."""
+    plain = html.unescape(re.sub(r"<[^>]+>", " ", s or ""))
+    return " ".join(plain.split()).casefold()
+
+
 def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal, base, planner,
                        key_to_ado=None, ado_edit_base="", log=print):
     """Delta Sync (for exact Jira key matches only): update an existing ADO work item with the latest
@@ -285,7 +313,9 @@ def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal
     live_rel_urls = {r.get("url") for r in live_rels if r.get("url")}
     before_rel_urls = set(live_rel_urls)
 
-    # Map existing attached filenames on the ADO item so syncing from another run folder reuses them
+    # Count attachment filenames on the Jira issue so duplicate filenames are only matched by Jira attachment ID
+    jira_name_counts = Counter(a["filename"] for rev in revs for a in rev["attachments"])
+    existing_att_by_id = {}
     existing_att_by_name = {}
     for r in live_rels:
         url = r.get("url") or ""
@@ -293,8 +323,14 @@ def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal
             continue
         if r.get("rel") == "AttachedFile" or "/attachments/" in url:
             attrs = r.get("attributes") or {}
+            rcmt = (attrs.get("comment") or "").strip()
+            if rcmt.startswith("Jira attachment "):
+                att_id = rcmt[len("Jira attachment "):].strip()
+                if att_id:
+                    existing_att_by_id[att_id] = url
+                    continue
             rname = attrs.get("name") or (parse_qs(urlparse(url).query).get("fileName") or [""])[0]
-            if rname:
+            if rname and jira_name_counts.get(rname, 0) == 1:
                 existing_att_by_name[rname] = url
 
     existing_comments = []
@@ -304,12 +340,16 @@ def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal
         except Exception:
             existing_comments = []
     existing_norm = {_norm_comment(c) for c in existing_comments if c}
+    existing_text_norm = {_norm_comment_text(c) for c in existing_comments if c}
 
     new_atts = []
     for rev in revs:
         for a in rev["attachments"]:
-            if a["id"] not in journal.atts and a["filename"] in existing_att_by_name:
-                journal.log(t="att", a=a["id"], u=existing_att_by_name[a["filename"]])
+            if a["id"] not in journal.atts:
+                if a["id"] in existing_att_by_id:
+                    journal.log(t="att", a=a["id"], u=existing_att_by_id[a["id"]])
+                elif a["filename"] in existing_att_by_name:
+                    journal.log(t="att", a=a["id"], u=existing_att_by_name[a["filename"]])
             if a["id"] not in journal.atts:
                 path = os.path.join(out, a["local_path"])
                 if os.path.exists(path) and os.path.getsize(path) <= MAX_ATTACHMENT:
@@ -338,11 +378,16 @@ def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal
                 seen_tags.add(t.casefold())
         final_fields["System.Tags"] = "; ".join(merged_tags)
 
-    # Save a pre-sync snapshot in the journal so rollback can restore the item
+    # Save a pre-sync snapshot of only the fields actually modified by this sync (never read-only System.* fields)
+    # along with after_fields so rollback only reverts fields that were not subsequently edited in ADO.
+    readonly_sys = {"System.CreatedDate", "System.CreatedBy", "System.ChangedDate", "System.ChangedBy",
+                    "System.Id", "System.Rev", "System.WorkItemType", "System.TeamProject", "System.Watermark"}
     if key not in journal.synced:
-        tracked_keys = (set(final_fields) | set(live_fields)) - {"System.CreatedDate", "System.CreatedBy", "System.ChangedDate", "System.ChangedBy"}
-        before_fields = {k: live_fields.get(k) for k in sorted(tracked_keys)}
-        journal.log(t="sync", k=key, id=item_id, before_fields=before_fields, before_rel_urls=sorted(before_rel_urls))
+        changed_keys = sorted(k for k in final_fields if k not in readonly_sys and live_fields.get(k) != final_fields[k])
+        before_fields = {k: live_fields.get(k) for k in changed_keys}
+        after_fields = {k: final_fields[k] for k in changed_keys}
+        journal.log(t="sync", k=key, id=item_id, before_fields=before_fields, after_fields=after_fields,
+                    before_rel_urls=sorted(before_rel_urls))
 
     live_last = parse_dt(live_fields.get("System.ChangedDate")) if live_fields.get("System.ChangedDate") else None
     when = bump(datetime.now(timezone.utc), live_last)
@@ -371,10 +416,17 @@ def sync_existing_item(ado, item_id, issue, plan, supported, cfg, users, journal
         raw_html = rewrite_html(crev["comment"], journal.atts, base, key_to_ado=key_to_ado, ado_edit_base=ado_edit_base)
         norm_full = _norm_comment(c_html)
         norm_raw = _norm_comment(raw_html)
-        if norm_full in existing_norm or (norm_raw and any(norm_raw in ec for ec in existing_norm)):
+        text_full = _norm_comment_text(c_html)
+        text_raw = _norm_comment_text(raw_html)
+        if (norm_full in existing_norm
+                or (norm_raw and any(norm_raw in ec for ec in existing_norm))
+                or (text_full and text_full in existing_text_norm)
+                or (text_raw and any(text_raw in et for et in existing_text_norm))):
             continue
         ado.update_item(item_id, c_ops)
         existing_norm.add(norm_full)
+        if text_full:
+            existing_text_norm.add(text_full)
         last = when
     journal.log(t="rev", k=key, id=item_id, n=len(revs), d=iso(last), found=True)
     log(f"  {key} delta-synced onto existing #{item_id}")
@@ -401,15 +453,18 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
     existing_policy = cfg["mapping"].get("existing_duplicates") or "skip"
     ticket_actions = cfg["mapping"].get("ticket_actions") or {}
     stats = {"created": 0, "resumed": 0, "complete": 0, "revisions": 0, "failed": [], "existing": {},
-             "possible": {}, "held": [], "synced": [], "remaining": 0, "paused": False}
+             "possible": {}, "held": [], "synced": [], "batch_keys": [], "remaining": 0, "paused": False}
     type_fields = {}
     pfile = pause_path(cfg)
     try:
         issues_list = [i for i in load_issues(out) if not only or i["key"] in only]
         plans = [planner.plan(i) for i in issues_list]
+        plans_by_key = {p["key"]: p for p in plans}
         preflight_states(ado, plans)
         planner.warnings.clear()
-        existing, possible = check_duplicates(ado, cfg, plans, journal)
+        existing, possible = check_duplicates(
+            ado, cfg, plans, journal, use_cache=True, save_cache=bool(limit)
+        )
         force_duplicate = {}
         sync_targets = {}
         for p in plans:
@@ -448,11 +503,12 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
         create_iterations(ado, cfg, meta, journal, log)
         n = 0
         key_ref = cfg["mapping"].get("jira_key_field")
+        key_to_ado = {k: v["id"] for k, v in journal.items.items() if v.get("id")} if ado_edit_base else None
         for issue in issues_list:
             key = issue["key"]
             if key in held:
                 continue
-            plan = planner.plan(issue)
+            plan = plans_by_key[key]
             st = journal.items.get(key, {})
             done = st.get("revs", 0)
             if key not in sync_targets and done >= len(plan["revisions"]):
@@ -473,13 +529,15 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                 getter = getattr(ado, "type_fields", None)
                 type_fields[plan["type"]] = getter(plan["type"]) if getter else None
             supported = type_fields[plan["type"]]
-            has_key_field = bool(key_ref and supported and key_ref in supported)
-            key_to_ado = {k: v["id"] for k, v in journal.items.items() if v.get("id")} if ado_edit_base else None
+            has_key_field = bool(key_ref and (supported is None or key_ref in supported))
             if key in sync_targets:
                 try:
                     sync_existing_item(ado, sync_targets[key], issue, plan, supported, cfg, users, journal, base, planner,
                                        key_to_ado=key_to_ado, ado_edit_base=ado_edit_base, log=log)
+                    if key_to_ado is not None:
+                        key_to_ado[key] = sync_targets[key]
                     stats["synced"].append(key)
+                    stats["batch_keys"].append(key)
                     stats["revisions"] += 1
                 except (AdoError, OSError) as e:
                     stats["failed"].append(key)
@@ -524,9 +582,12 @@ def import_items(ado, cfg, users, only=None, limit=None, log=print, possible_dup
                         stats["created"] += 1
                     else:
                         ado.update_item(item_id, ops)
+                    if key_to_ado is not None and item_id is not None:
+                        key_to_ado[key] = item_id
                     last = when
                     journal.log(t="rev", k=key, id=item_id, n=i + 1, d=iso(when))
                     stats["revisions"] += 1
+                stats["batch_keys"].append(key)
                 if done:
                     stats["resumed"] += 1
                     log(f"  {key} finished on #{item_id}")
@@ -635,6 +696,9 @@ def rollback_run(ado, cfg, log=print):
         if key in journal.synced:
             sync_info = journal.synced[key]
             b_fields = sync_info.get("before_fields") or {}
+            a_fields = sync_info.get("after_fields") or {}
+            readonly_sys = {"System.CreatedDate", "System.CreatedBy", "System.ChangedDate", "System.ChangedBy",
+                            "System.Id", "System.Rev", "System.WorkItemType", "System.TeamProject", "System.Watermark"}
             try:
                 live = ado.get_item(item_id) if getattr(ado, "get_item", None) else {"fields": {}, "relations": []}
                 cur_fields = live.get("fields") or {}
@@ -642,6 +706,11 @@ def rollback_run(ado, cfg, log=print):
                 when = bump(datetime.now(timezone.utc), live_last)
                 ops = [{"op": "add", "path": "/fields/System.ChangedDate", "value": iso(when)}]
                 for ref, val in b_fields.items():
+                    if ref in readonly_sys:
+                        continue
+                    # Only revert fields that were not subsequently edited in Azure DevOps after the sync
+                    if a_fields and ref in a_fields and cur_fields.get(ref) != a_fields[ref]:
+                        continue
                     if val is None:
                         if ref in cur_fields:
                             ops.append({"op": "remove", "path": f"/fields/{ref}"})
@@ -652,7 +721,8 @@ def rollback_run(ado, cfg, log=print):
                 for idx in range(len(rels) - 1, -1, -1):
                     if rels[idx].get("url") and rels[idx]["url"] not in before_urls:
                         ops.append({"op": "remove", "path": f"/relations/{idx}"})
-                ado.update_item(item_id, ops)
+                if len(ops) > 1:
+                    ado.update_item(item_id, ops)
                 restored.append({"key": key, "id": item_id})
                 kept.append({"key": key, "id": item_id})
                 log(f"  Restored {key} (#{item_id}) to its pre-sync state")

@@ -1,8 +1,15 @@
 import os
+import re
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from .util import backoff_sleep
+
+
+def _strip_order_by(jql):
+    """Remove a trailing top-level ORDER BY clause from a JQL string so scope filters can be appended."""
+    return re.sub(r"\s+ORDER\s+BY\s+[^)]+$", "", (jql or "").strip(), flags=re.I).strip()
 
 
 class JiraClient:
@@ -12,7 +19,13 @@ class JiraClient:
         self.base = (base_url or "").strip().rstrip("/")
         if self.base.lower().startswith("http://"):
             raise RuntimeError("Jira URL must use https:// so your API token is never sent over plain HTTP.")
-        self.s = session or requests.Session()
+        if session is None:
+            self.s = requests.Session()
+            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+            self.s.mount("https://", adapter)
+            self.s.mount("http://", adapter)
+        else:
+            self.s = session
         self.s.auth = (email, token)
         self.s.headers.update({"Accept": "application/json"})
 
@@ -50,11 +63,25 @@ class JiraClient:
         while True:
             p = dict(params or {}, startAt=start, maxResults=50)
             data = self._request("GET", path, params=p).json()
-            values = data.get("values", [])
+            values = data.get("values") if "values" in data else data.get("issues", [])
             yield from values
             start += len(values)
-            if data.get("isLast", True) or not values:
+            total = data.get("total")
+            if not values or data.get("isLast") is True or (total is not None and start >= total) or ("isLast" not in data and total is None):
                 return
+
+    def board_filter_jql(self, board_id):
+        """Return the board's saved filter JQL (with trailing ORDER BY stripped), or None if unavailable."""
+        try:
+            cfg_data = self._request("GET", f"/rest/agile/1.0/board/{board_id}/configuration").json()
+            filter_id = (cfg_data.get("filter") or {}).get("id")
+            if not filter_id:
+                return None
+            filt_data = self._request("GET", f"/rest/api/3/filter/{filter_id}").json()
+            raw_jql = (filt_data.get("jql") or "").strip()
+            return _strip_order_by(raw_jql) or None
+        except RuntimeError:
+            return None
 
     def boards(self, project=None):
         """Every Agile board for a project (or all boards if project is None): [{id, name, type}]."""
@@ -113,21 +140,26 @@ class JiraClient:
 
     def search_keys(self, jql):
         """Yield issue keys. Uses /search/jql, which replaced the removed /search endpoint."""
+        for key, _ in self.search_key_timestamps(jql):
+            yield key
+
+    def search_key_timestamps(self, jql):
+        """Yield (key, updated) pairs from /rest/api/3/search/jql so export only re-fetches changed tickets."""
         token = None
         while True:
-            body = {"jql": jql, "maxResults": 100, "fields": ["key"]}
+            body = {"jql": jql, "maxResults": 100, "fields": ["key", "updated"]}
             if token:
                 body["nextPageToken"] = token
             data = self._request("POST", "/rest/api/3/search/jql", json=body).json()
             for i in data.get("issues", []):
-                yield i["key"]
+                yield i["key"], (i.get("fields") or {}).get("updated")
             token = data.get("nextPageToken")
             if not token or data.get("isLast"):
                 return
 
     def issue(self, key):
         return self._request(
-            "GET", f"/rest/api/3/issue/{key}", params={"fields": "*all", "expand": "renderedFields"}
+            "GET", f"/rest/api/3/issue/{key}", params={"fields": "*all", "expand": "renderedFields,changelog"}
         ).json()
 
     def _paged(self, path, list_key, params=None):

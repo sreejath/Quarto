@@ -8,17 +8,40 @@ from .planner import Planner
 from .util import Journal
 
 
-def verify(ado, cfg, users, report_path, log=print):
+def verify(ado, cfg, users, report_path, log=print, only=None):
     out = cfg["paths"]["export_dir"]
     meta = load_meta(cfg)
     journal = Journal(journal_path(cfg), readonly=True)
     planner = Planner(cfg, meta, users)
+    only_set = set(only) if only else None
+    existing_by_key = {}
+    if only_set and report_path and os.path.exists(report_path):
+        try:
+            with open(report_path, newline="", encoding="utf-8") as fh:
+                existing_by_key = {r["jira_key"]: r for r in csv.DictReader(fh) if r.get("jira_key")}
+        except OSError:
+            existing_by_key = {}
     rows, bad, held, before = [], 0, 0, 0
     for issue in load_issues(out):
         key = issue["key"]
+        st = journal.items.get(key, {})
+        if only_set is not None and key not in only_set:
+            if key in existing_by_key:
+                prev = existing_by_key[key]
+                prob = (prev.get("problems") or "").strip()
+                if prob.startswith("already there before this run"):
+                    before += 1
+                elif prob.startswith("left out, possible duplicate"):
+                    held += 1
+                elif prob and prob != "not imported":
+                    bad += 1
+                rows.append(prev)
+            elif not st.get("id") and key in journal.held:
+                rows.append({"jira_key": key, "ado_id": "", "problems": f"left out, possible duplicate: {journal.held[key]}"})
+                held += 1
+            continue
         plan = planner.plan(issue)
         revs = plan["revisions"]
-        st = journal.items.get(key, {})
         row = {"jira_key": key, "ado_id": st.get("id", ""), "problems": ""}
         problems = []
         if not st.get("id") and key in journal.held:

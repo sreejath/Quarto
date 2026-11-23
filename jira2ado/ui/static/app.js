@@ -30,6 +30,8 @@ const S = {
   lastChangedKey: "",   // key whose status dropdown was just changed (shows "Apply to all" pill)
   searchFilter: "",
   outcomeFilter: "all", // "all" | "create" | "duplicates" | "there" | "failed"
+  page: 1,
+  pageSize: 100,        // 100 | 250 | 500 | 0 (All)
   drawerMode: null,     // null | "help" | "ticket" | "runs"
   drawerTicketKey: null,
   peopleEdits: {},      // {account_id: ado_identity}
@@ -168,8 +170,11 @@ function effectiveAction(t) {
 }
 
 function effectiveState(t) {
-  if (S.ticketStates[t.key]) return S.ticketStates[t.key];
-  if (S.statusOverrides[t.jira_status]) return S.statusOverrides[t.jira_status];
+  const valid = t.valid_states || [];
+  const ts = S.ticketStates[t.key];
+  if (ts && (!valid.length || valid.includes(ts))) return ts;
+  const so = S.statusOverrides[t.jira_status];
+  if (so && (!valid.length || valid.includes(so))) return so;
   return t.ado_state || "";
 }
 
@@ -869,8 +874,32 @@ function renderManifest() {
   ];
 
   const visibleTickets = filterTickets(pv.tickets, run);
+  const totalVisible = visibleTickets.length;
+  const effPageSize = S.pageSize > 0 ? S.pageSize : Math.max(1, totalVisible);
+  const totalPages = Math.max(1, Math.ceil(totalVisible / effPageSize));
+  if (S.page > totalPages) S.page = totalPages;
+  if (S.page < 1) S.page = 1;
+  const startIdx = (S.page - 1) * effPageSize;
+  const pageTickets = S.pageSize > 0 ? visibleTickets.slice(startIdx, startIdx + effPageSize) : visibleTickets;
   const dupCount = pv.tickets.filter(isDuplicateTicket).length;
   const failCount = pv.tickets.filter((t) => isFailedOrPartialTicket(t, run)).length;
+  const pagerHtml = (totalPages > 1 || pv.tickets.length > 100) ? `
+    <div class="table-toolbar" style="margin-top:8px">
+      <div class="soft">
+        Showing <b>${totalVisible ? startIdx + 1 : 0}–${startIdx + pageTickets.length}</b> of <b>${totalVisible}</b> matching ticket(s)
+      </div>
+      <div class="row">
+        <button type="button" class="btn secondary btn-sm" data-action="page-prev" ${S.page <= 1 ? "disabled" : ""}>← Prev</button>
+        <span class="soft">Page <b>${S.page}</b> of <b>${totalPages}</b></span>
+        <button type="button" class="btn secondary btn-sm" data-action="page-next" ${S.page >= totalPages ? "disabled" : ""}>Next →</button>
+        <label class="soft" style="display:inline-flex;align-items:center;gap:6px;margin-left:8px">Rows:
+          <select data-action="select-page-size" style="width:auto;padding:4px 8px;font-size:12px">
+            ${[[100, "100"], [250, "250"], [500, "500"], [0, "All"]].map(([val, lbl]) =>
+              `<option value="${val}" ${S.pageSize === val ? "selected" : ""}>${lbl}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+    </div>` : "";
 
   m.innerHTML = `
     <div class="route">
@@ -917,9 +946,10 @@ function renderManifest() {
             <th scope="col" class="outcome-h">Outcome &amp; Duplicate Action</th>
           </tr>
         </thead>
-        <tbody>${visibleTickets.length ? visibleTickets.map((t) => ticketRow(t, run)).join("") : `<tr><td colspan="6" class="soft">No tickets match the current filter.</td></tr>`}</tbody>
+        <tbody>${pageTickets.length ? pageTickets.map((t) => ticketRow(t, run)).join("") : `<tr><td colspan="6" class="soft">No tickets match the current filter.</td></tr>`}</tbody>
       </table>
     </div>
+    ${pagerHtml}
     ${tabsHtml()}`;
 }
 
@@ -1438,9 +1468,20 @@ async function applyRecoveredRun(runObj) {
   if (rInfo.from) S.source = rInfo.from;
   if (rInfo.board_id) S.board = String(rInfo.board_id);
   if (rInfo.to) S.target = rInfo.to;
+  if (typeof rInfo.include_done === "boolean") S.includeDone = rInfo.include_done;
+  if (typeof rInfo.include_hierarchy === "boolean") S.includeHierarchy = rInfo.include_hierarchy;
+  if (typeof rInfo.history === "boolean") S.historyMode = rInfo.history;
+  if (rInfo.iteration) {
+    S.iterMode = "one";
+    S.iteration = rInfo.iteration;
+  } else {
+    S.iterMode = "sprint";
+    S.iteration = "";
+  }
   if (Array.isArray(rInfo.sprints) && S.pageMode === "sprints") {
     S.picked = new Set(rInfo.sprints.map((s) => String(s.number || s.id || "")));
   }
+  S.page = 1;
   S.checkedSig = signature();
   S.checkedAt = "recovered run";
   const res = runObj.result || {};
@@ -1631,8 +1672,19 @@ async function poll() {
     S.since = d.next;
     S.job = d;
     if ((d.kind === "import" || d.kind === "rollback") && S.run) {
-      const fresh = await api(`/api/run?config=${encodeURIComponent(S.run.config)}`);
-      S.run = { ...fresh, preview: fresh.preview || S.run.preview };
+      try {
+        const ep = S.noProgressEndpoint ? "/api/run" : "/api/run/progress";
+        const fresh = await api(`${ep}?config=${encodeURIComponent(S.run.config)}`);
+        S.run = { ...S.run, ...fresh, preview: fresh.preview || S.run.preview };
+      } catch (progErr) {
+        if (!S.noProgressEndpoint) {
+          S.noProgressEndpoint = true;
+          try {
+            const fresh = await api(`/api/run?config=${encodeURIComponent(S.run.config)}`);
+            S.run = { ...S.run, ...fresh, preview: fresh.preview || S.run.preview };
+          } catch (_) { /* keep existing S.run */ }
+        }
+      }
     }
     if (d.status === "running") {
       render();
@@ -1741,6 +1793,26 @@ document.addEventListener("click", async (e) => {
     S.drawerMode = "ticket";
     S.drawerTicketKey = el.dataset.key;
     renderDrawer();
+    if (S.run && S.run.config && S.run.preview) {
+      const t = S.run.preview.tickets.find((x) => x.key === S.drawerTicketKey);
+      if (t && !t._fullDescLoaded && (t.description_html || "").length >= 790) {
+        try {
+          const detail = await api(`/api/ticket?config=${encodeURIComponent(S.run.config)}&key=${encodeURIComponent(t.key)}`);
+          if (detail && detail.description_html !== undefined) {
+            t.description_html = detail.description_html;
+            t._fullDescLoaded = true;
+            if (S.drawerMode === "ticket" && S.drawerTicketKey === t.key) renderDrawer();
+          }
+        } catch (err) { /* use preview snippet */ }
+      }
+    }
+  }
+  if (action === "page-prev") {
+    if (S.page > 1) { S.page--; renderManifest(); }
+  }
+  if (action === "page-next") {
+    S.page++;
+    renderManifest();
   }
   if (action === "select-displayed-sprints") {
     const boxes = document.querySelectorAll('#step-tickets .sprints input[data-action="pick-sprint"]');
@@ -1762,6 +1834,7 @@ document.addEventListener("click", async (e) => {
   }
   if (action === "filter-outcome") {
     S.outcomeFilter = el.dataset.filter;
+    S.page = 1;
     renderManifest();
   }
   if (action === "bulk-dup" && S.run && S.run.preview) {
@@ -1782,13 +1855,16 @@ document.addEventListener("click", async (e) => {
     S.statusOverrides[jst] = ast;
     if (S.run && S.run.preview) {
       for (const t of S.run.preview.tickets) {
-        if (t.jira_status === jst) S.ticketStates[t.key] = ast;
+        const valid = t.valid_states || [];
+        if (t.jira_status === jst && (!valid.length || valid.includes(ast))) {
+          S.ticketStates[t.key] = ast;
+        }
       }
     }
     S.lastChangedKey = "";
     persistOverrides();
     render();
-    toast(`Mapped all "${jst}" tickets to "${ast}".`);
+    toast(`Mapped all "${jst}" tickets (where "${ast}" is a valid state) to "${ast}".`);
   }
   if (action === "save-people" && S.run) {
     S.savingPeople = true;
@@ -1803,7 +1879,13 @@ document.addEventListener("click", async (e) => {
     render();
   }
   if (action === "stop" && S.job) {
-    try { await api(`/api/jobs/${S.job.id}/stop`, {}); } catch (err) { toast(err.message); }
+    try {
+      await api(`/api/jobs/${S.job.id}/stop`, {});
+      toast("Stopping run...");
+      poll();
+    } catch (err) {
+      toast(err.message);
+    }
   }
   if (action === "tab") { S.tab = el.dataset.tab; render(); }
   if (action === "open-file" || action === "reveal") {
@@ -1836,6 +1918,7 @@ document.addEventListener("change", (e) => {
   if (action === "history-mode") { S.historyMode = el.checked; render(); }
   if (action === "force-export") { S.forceExport = el.checked; render(); }
   if (action === "select-batch-size") { S.batchSize = el.value; render(); }
+  if (action === "select-page-size") { S.pageSize = parseInt(el.value, 10) || 0; S.page = 1; renderManifest(); }
   if (action === "select-target") {
     S.isOther = el.value === "__other";
     if (!S.isOther) S.target = el.value;
@@ -1889,6 +1972,7 @@ document.addEventListener("input", (e) => {
   }
   if (action === "search-tickets") {
     S.searchFilter = el.value;
+    S.page = 1;
     renderManifest();
     const input = document.querySelector("[data-action=search-tickets]");
     if (input) {

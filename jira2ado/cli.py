@@ -156,14 +156,15 @@ def cmd_prepare(a):
         if not board_id:
             raise SystemExit("\nStopped: choose a Jira board (--board) for board migration mode.")
         chosen = list(sprints)
+        saved_filter_jql = jira.board_filter_jql(board_id) if getattr(jira, "board_filter_jql", None) else None
+        base_jql = f"({saved_filter_jql})" if saved_filter_jql else f'project = "{source}"'
         board_filter_jql = None if a.include_done else "statusCategory != Done"
-        jql = f'project = "{source}"' + ("" if a.include_done else " AND statusCategory != Done") + " ORDER BY key ASC"
-        b_slug = f"board-{slug(str(board_id))}" + (f"-{slug(board_name)}" if board_name else "")
-        run_dir = os.path.join("runs", slug(source), b_slug[:80])
+        jql = base_jql + ("" if a.include_done else " AND statusCategory != Done") + " ORDER BY key ASC"
+        run_dir = os.path.join("runs", slug(source), f"board-{slug(str(board_id))}")
     elif mode == "project":
         chosen = list(sprints)
         jql = f'project = "{source}"' + ("" if a.include_done else " AND statusCategory != Done") + " ORDER BY key ASC"
-        run_dir = os.path.join("runs", slug(source), "entire-project" if a.include_done else "entire-project-open")
+        run_dir = os.path.join("runs", slug(source), "entire-project")
     else:
         raise SystemExit(f"\nStopped: unknown migration mode '{mode}'.")
 
@@ -185,11 +186,20 @@ def cmd_prepare(a):
     if getattr(a, "history", None) in ("true", "false"):
         m["history"] = a.history == "true"
     raw["run"] = {"mode": mode, "from": source, "to": project, "board_id": board_id, "board_name": board_name,
-                  "include_done": bool(a.include_done), "iteration": a.iteration or None,
-                  "sprints": [{"number": s["id"], "name": s["name"], "state": s.get("state"),
+                  "include_done": bool(a.include_done),
+                  "include_hierarchy": bool(m.get("include_hierarchy", False)),
+                  "history": bool(m.get("history", True)),
+                  "iteration": a.iteration or None,
+                  "sprints": [{"id": s["id"], "number": s["id"], "name": s["name"], "state": s.get("state"),
                                "goal": s.get("goal", ""),
                                "start": (s.get("startDate") or "")[:10], "end": (s.get("endDate") or "")[:10]}
                               for s in chosen]}
+    write_json(os.path.join(run_dir, "scope.json"), {
+        "mode": mode,
+        "source": source,
+        "board_id": board_id,
+        "sprints": sorted(str(s["id"]) for s in chosen if s.get("id") is not None),
+    })
 
     os.makedirs(target_dir, exist_ok=True)
     path = os.path.join(target_dir, "config.yaml")
@@ -272,7 +282,9 @@ def _duplicate_report(cfg, plans, journal, ado):
                     "ado_iteration", "jira_keys_on_ado_item"])
         w.writerows(rows)
     write_json(os.path.join(folder, "duplicates.json"),
-               {"checked_online": ado is not None and not failed, "already_there": found,
+               {"checked_online": ado is not None and not failed,
+                "duplicate_check_titles": bool(cfg["mapping"].get("duplicate_check_titles", True)),
+                "already_there": found,
                 "possible": possible, "same_summary_in_run": groups})
     print(f"  Saved to {path}")
     return found, possible
@@ -542,14 +554,14 @@ def cmd_check(cfg, a):
             "ado_id": st.get("id") or found.get(key),
             "in_run_duplicates": in_run_dup_map.get(key, []),
             "matches": [{**m, "text": describe(m)} for m in possible.get(key, [])],
-            "description_html": (final.get(desc_field) or "")[:4000],
+            "description_html": (final.get(desc_field) or "")[:800],
             "custom_fields": custom_preview,
             "tags": final.get("System.Tags") or "",
         })
     report["tickets"] = tickets
     report["same_summary"] = same_groups
 
-    people = collect_users(out)
+    people = collect_users(out, issues=issues)
     rows = load_users_file(cfg["paths"]["users_file"], raw=True)
     report["people_without_identity"] = sorted(
         u["name"] or acc for acc, u in people.items() if not (rows.get(acc, {}).get("ado_identity") or "").strip())
@@ -609,16 +621,17 @@ def cmd_import(cfg, a):
         "revisions": stats["revisions"], "failed": stats["failed"], "warnings": len(stats["warnings"]),
         "already_there": stats["existing"], "held": stats["held"],
         "synced": stats.get("synced", []),
+        "batch_keys": stats.get("batch_keys", []),
         "remaining": stats.get("remaining", 0),
         "paused": bool(stats.get("paused")),
         "tagged": sorted(set(stats["possible"]) - set(stats["held"]) - set(stats.get("synced", [])))})
     if not a.no_links:
         links = import_links(ado, cfg, skip_keys=set(stats["failed"]))
         write_json(os.path.join(state_dir(cfg), "link-report.json"), links)
-    if stats.get("paused"):
-        sys.exit(2)
     if stats["failed"]:
         sys.exit(1)
+    if stats.get("paused"):
+        sys.exit(2)
 
 
 def cmd_links(cfg, a):
@@ -628,7 +641,8 @@ def cmd_links(cfg, a):
 
 def cmd_verify(cfg, a):
     from .verify import verify
-    _, bad = verify(_ado(cfg), cfg, _users(cfg), a.report)
+    only_keys = set(getattr(a, "keys", None) or ()) or None
+    _, bad = verify(_ado(cfg), cfg, _users(cfg), a.report, only=only_keys)
     sys.exit(1 if bad else 0)
 
 
@@ -682,6 +696,7 @@ def main(argv=None):
     sub.add_parser("links", help="add parent and issue links for imported items")
     s = sub.add_parser("verify", help="compare ADO with the export and write a CSV report")
     s.add_argument("--report", default="verify-report.csv")
+    s.add_argument("keys", nargs="*", help="only verify these Jira keys and merge into existing report")
     sub.add_parser("rollback", help="undo the run by deleting work items it created in ADO")
     a = p.parse_args(argv)
     if a.cmd == "prepare":

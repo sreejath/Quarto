@@ -581,8 +581,16 @@ class PrepareTests(unittest.TestCase):
         self.saved = ac.AdoClient, jc.JiraClient
 
         class FakeJira:
+            board_title = "Team Board"
+
             def __init__(self, *a, **k):
                 pass
+
+            def boards(self, project=None):
+                return [{"id": 42, "name": self.board_title, "type": "scrum"}]
+
+            def board_filter_jql(self, board_id):
+                return 'project = "PROJ" AND component in ("Cart", "Checkout")'
 
             def project_sprints(self, project, board_id=None):
                 return SPRINTS
@@ -655,6 +663,31 @@ class PrepareTests(unittest.TestCase):
             with redirect_stdout(buf):
                 cli.main(["-c", path, "show", key])
             self.assertEqual(buf.getvalue().strip(), want)
+
+    def test_board_and_project_stable_folders_and_board_filter_jql(self):
+        import jira2ado.jira_client as jc
+        # 1. Project mode: toggling --include-done keeps the exact same run folder
+        p_open, cfg_open, _ = self._prepare("--mode", "project", "--from", "PROJ", "--to", "Sandbox")
+        p_done, cfg_done, _ = self._prepare("--mode", "project", "--from", "PROJ", "--to", "Sandbox", "--include-done")
+        self.assertEqual(p_open, p_done)
+        self.assertEqual(p_open, os.path.join("runs", "proj", "entire-project", "to-sandbox", "config.yaml"))
+        self.assertFalse(cfg_open["run"]["include_done"])
+        self.assertTrue(cfg_done["run"]["include_done"])
+
+        # 2. Board mode: renaming the board keeps the exact same run folder (keyed by board_id) and uses board filter JQL
+        p_b1, cfg_b1, _ = self._prepare("--mode", "board", "--from", "PROJ", "--to", "Sandbox", "--board", "42")
+        jc.JiraClient.board_title = "Team Board Renamed"
+        p_b2, cfg_b2, _ = self._prepare("--mode", "board", "--from", "PROJ", "--to", "Sandbox", "--board", "42", "--include-done")
+        self.assertEqual(p_b1, p_b2)
+        self.assertEqual(p_b1, os.path.join("runs", "proj", "board-42", "to-sandbox", "config.yaml"))
+        self.assertEqual(
+            cfg_b1["jira"]["jql"],
+            '(project = "PROJ" AND component in ("Cart", "Checkout")) AND statusCategory != Done ORDER BY key ASC',
+        )
+        self.assertEqual(
+            cfg_b2["jira"]["jql"],
+            '(project = "PROJ" AND component in ("Cart", "Checkout")) ORDER BY key ASC',
+        )
 
 
 class PlacementTests(unittest.TestCase):
@@ -782,23 +815,23 @@ class DuplicateMatchTests(unittest.TestCase):
 
     def test_kinds_of_match(self):
         from jira2ado.duplicates import KEY_IN_TITLE, SAME_KEY, SAME_TITLE, classify
-        entries = [("PROJ-3637", "Fix  the Banner"), ("PROJ-3", "Other")]
-        items = [self.item(1, "Anything", "NAV; proj-3637"),
-                 self.item(2, "Anything", "", **{"Custom.JiraKey": "PROJ-3637"}),
-                 self.item(3, "[PROJ-3637] copied by hand"),
+        entries = [("PROJ-4200", "Fix  the Banner"), ("PROJ-3", "Other")]
+        items = [self.item(1, "Anything", "NAV; proj-4200"),
+                 self.item(2, "Anything", "", **{"Custom.JiraKey": "PROJ-4200"}),
+                 self.item(3, "[PROJ-4200] copied by hand"),
                  self.item(4, "fix the banner"),
-                 self.item(5, "PROJ-36370 is a different ticket"),
+                 self.item(5, "PROJ-42000 is a different ticket"),
                  self.item(6, "Follow-up to PROJ-3 work")]
         found = classify(entries, items, "Custom.JiraKey")
-        self.assertEqual([(m["id"], m["kind"]) for m in found["PROJ-3637"]],
+        self.assertEqual([(m["id"], m["kind"]) for m in found["PROJ-4200"]],
                          [(1, SAME_KEY), (2, SAME_KEY), (3, KEY_IN_TITLE), (4, SAME_TITLE)])
         self.assertEqual([(m["id"], m["kind"]) for m in found["PROJ-3"]], [(6, KEY_IN_TITLE)])
-        self.assertNotIn(4, [m["id"] for m in classify(entries, items, titles=False).get("PROJ-3637", [])])
+        self.assertNotIn(4, [m["id"] for m in classify(entries, items, titles=False).get("PROJ-4200", [])])
 
     def test_descriptions_and_groups(self):
         from jira2ado.duplicates import classify, describe, same_summary_groups
-        m = classify([("PROJ-9", "Release prep")], [self.item(17990, "Release Prep", "PROJ-8")])["PROJ-9"][0]
-        self.assertEqual(describe(m), "same title as #17990 (Committed, from PROJ-8)")
+        m = classify([("PROJ-9", "Release prep")], [self.item(18500, "Release Prep", "PROJ-8")])["PROJ-9"][0]
+        self.assertEqual(describe(m), "same title as #18500 (Committed, from PROJ-8)")
         self.assertEqual(same_summary_groups([("A-1", "Release prep"), ("A-2", "release  PREP "), ("A-3", "Other")]),
                          [["A-1", "A-2"]])
 
@@ -1168,6 +1201,39 @@ class BrowserViewTests(unittest.TestCase):
         self.assertEqual(rec_data["recovered"], "loaded")
         self.assertEqual(rec_data["run"]["preview"]["project"], "Shop")
 
+        # Medium #8: /api/run/progress omits preview.json so polling on 10,000-ticket projects stays tiny
+        status, prog_data = self.call(f"/api/run/progress?config={rel}")
+        self.assertEqual(status, 200)
+        self.assertNotIn("preview", prog_data)
+        self.assertEqual(prog_data["result"]["failed"], ["DEMO-2"])
+
+        # Smaller #3: /api/import rejects only_keys starting with '--' or non-Jira key strings
+        self.call("/api/connect", {"jira_email": "me@x.com", "jira_token": "good", "ado_token": "good"})
+        status, bad_key_resp = self.call("/api/import", {
+            "config": rel,
+            "confirm": "Shop",
+            "only_keys": ["--no-links"],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("Invalid Jira ticket key", bad_key_resp["error"])
+
+        # Medium #7: run_step only reports "paused" when exit code is 2 (never overriding exit code 0 or 1)
+        job = self.server.Job("import", ["Plan", "Import"])
+        job.paused = True
+        saved_cmd = self.server.CMD
+        try:
+            self.server.CMD = [sys.executable, "-c", "import sys; sys.exit(0)"]
+            code0, _ = self.server.run_step(job, 0, ["plan"])
+            self.assertEqual(code0, 0)
+            self.assertEqual(job.steps[0]["status"], "done")
+
+            self.server.CMD = [sys.executable, "-c", "import sys; sys.exit(1)"]
+            code1, _ = self.server.run_step(job, 1, ["import"])
+            self.assertEqual(code1, 1)
+            self.assertEqual(job.steps[1]["status"], "failed")
+        finally:
+            self.server.CMD = saved_cmd
+
 
 class ClosestAdoStateTests(unittest.TestCase):
     def test_exact_synonym_and_category_matching(self):
@@ -1444,6 +1510,22 @@ class CodeReviewRegressionTests(unittest.TestCase):
         sub_plan = p.plan(sample.subtask())
         self.assertEqual(sub_plan["revisions"][0]["fields"]["System.State"], "Done")
         self.assertTrue(sub_plan["revisions"][0]["fields"].get("Microsoft.VSTS.Common.ClosedDate"))
+        # Cross-type bulk override (e.g. applying PBI 'New' or 'Done' across Task and Test Case tickets) must adapt to valid_states
+        meta_valid = dict(sample.META, valid_states_by_type={
+            "Task": ["To Do", "In Progress", "Done", "Removed"],
+            "Test Case": ["Design", "Ready", "Closed"],
+        })
+        cfg["mapping"]["types"]["Test"] = "Test Case"
+        cfg["mapping"]["ticket_states"] = {"DEMO-2": "New", "DEMO-TEST1": "New", "DEMO-TEST2": "Done"}
+        p_valid = Planner(cfg, meta_valid, USERS)
+        self.assertEqual(p_valid.plan(sample.subtask())["revisions"][0]["fields"]["System.State"], "To Do")
+        tc1 = copy.deepcopy(sample.subtask())
+        tc1["key"] = "DEMO-TEST1"
+        tc1["fields"]["issuetype"] = {"name": "Test"}
+        tc2 = copy.deepcopy(tc1)
+        tc2["key"] = "DEMO-TEST2"
+        self.assertEqual(p_valid.plan(tc1)["revisions"][0]["fields"]["System.State"], "Design")
+        self.assertEqual(p_valid.plan(tc2)["revisions"][0]["fields"]["System.State"], "Closed")
 
     def test_smaller5_http_date_retry_after_and_truncated_journal(self):
         from unittest.mock import patch
@@ -1621,27 +1703,30 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(staged, "local")))
 
     def test_round2_no_company_strings_in_tracked_files(self):
+        import hashlib
+        import re
         import subprocess
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         tracked = subprocess.check_output(["git", "-C", repo_root, "ls-files"], text=True).splitlines()
-        forbidden = (
-            "petvalu", "petretailbrands", "Fin Corp", "Fin&Corp", "Fin-Corp",
-            "DEA-", "PVE-", "17990", "3637", "customfield_10330", "customfield_10455",
-            "PO/BA Review", "Pre-Prod Promotion",
-        )
+        # SHA-256 prefixes of forbidden lowercase tokens so the test itself never stores the literal terms
+        forbidden_hashes = {
+            "7d873d138de7ddb5", "6568421ed8b0c51a", "40de80a7f7386b54",
+            "2b65e2f45f23ac94", "81cabe6d5e7a09c3", "7e93bf8ba9708c55",
+            "831e6bd92db10f33", "0f334a448c32623c", "8d462078db7248de",
+        }
         for rel in tracked:
-            if rel == "tests/test_all.py":
-                continue
             full = os.path.join(repo_root, rel)
             if not os.path.isfile(full):
                 continue
             try:
                 with open(full, encoding="utf-8") as fh:
-                    text = fh.read()
+                    text = fh.read().lower()
             except UnicodeDecodeError:
                 continue
-            for term in forbidden:
-                self.assertNotIn(term.lower(), text.lower(), f"Forbidden term '{term}' found in {rel}")
+            tokens = set(re.findall(r"[a-z0-9_&\-]+", text))
+            for tok in tokens:
+                digest = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16]
+                self.assertNotIn(digest, forbidden_hashes, f"Forbidden token found in {rel}")
 
     def test_subtask_duplicates_checked_by_jira_key_only_never_by_title(self):
         from jira2ado.cli import _duplicate_report
@@ -1695,24 +1780,62 @@ class CodeReviewRegressionTests(unittest.TestCase):
 
     def test_mode2_board_and_mode3_project_prepare_and_unsprinted_tickets(self):
         from jira2ado.exporter import search_run_keys
+        from jira2ado.jira_client import JiraClient
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         cfg = cfg_for(folder)
         cfg["run"] = {"mode": "board", "from": "DEMO", "to": "Shop", "board_id": "42", "board_name": "Team Board",
-                      "sprints": [{"number": 7, "name": "Sprint 2&A", "state": "active",
+                      "sprints": [{"id": 7, "number": 7, "name": "Sprint 2&A", "state": "active",
                                    "start": "2024-01-01", "end": "2024-01-15"}]}
         cfg["jira"]["board_id"] = "42"
         cfg["jira"]["board_filter_jql"] = "statusCategory != Done"
         cfg["mapping"]["only_sprints"] = None
 
-        class BoardJira:
-            def board_keys(self, board_id, jql=None):
-                self.called = (board_id, jql)
-                return ["DEMO-1", "DEMO-2", "DEMO-UNSPRINTED"]
+        # 1. Test JiraClient.board_keys against the real documented Agile response shape (using 'issues' + 'total')
+        class AgileResp:
+            def __init__(self, body):
+                self.status_code = 200
+                self.headers = {"Content-Type": "application/json"}
+                self.text = json.dumps(body)
+                self._b = body
+            def json(self):
+                return self._b
 
-        bj = BoardJira()
-        self.assertEqual(search_run_keys(bj, cfg), ["DEMO-1", "DEMO-2", "DEMO-UNSPRINTED"])
-        self.assertEqual(bj.called, ("42", "statusCategory != Done"))
+        class AgileSession:
+            headers = {}
+            def request(self, method, url, **kw):
+                params = kw.get("params") or {}
+                if url.endswith("/rest/agile/1.0/board/42/configuration"):
+                    return AgileResp({"id": 42, "filter": {"id": "990"}})
+                if url.endswith("/rest/api/3/filter/990"):
+                    return AgileResp({"id": "990", "jql": 'project = "DEMO" AND component = "Core" ORDER BY Rank ASC'})
+                if url.endswith("/rest/agile/1.0/board/42/issue"):
+                    start = params.get("startAt", 0)
+                    if start == 0:
+                        return AgileResp({
+                            "startAt": 0, "maxResults": 2, "total": 3,
+                            "issues": [{"key": "DEMO-1"}, {"key": "DEMO-2"}],
+                        })
+                    return AgileResp({
+                        "startAt": 2, "maxResults": 2, "total": 3,
+                        "issues": [{"key": "DEMO-UNSPRINTED"}],
+                    })
+                if url.endswith("/rest/api/3/search/jql"):
+                    return AgileResp({
+                        "issues": [
+                            {"key": "DEMO-1", "fields": {"updated": "2024-01-20T09:00:00.000-0500"}},
+                            {"key": "DEMO-2", "fields": {"updated": "2024-01-06T09:00:00.000-0500"}},
+                            {"key": "DEMO-UNSPRINTED", "fields": {"updated": "2024-01-10T09:00:00.000-0500"}},
+                        ],
+                        "isLast": True,
+                    })
+                raise AssertionError(f"Unexpected URL {url}")
+
+        real_jc = JiraClient("https://demo.atlassian.net", "a@b.com", "tok", session=AgileSession())
+        self.assertEqual(real_jc.board_filter_jql(42), 'project = "DEMO" AND component = "Core"')
+        self.assertEqual(list(real_jc.board_keys(42)), ["DEMO-1", "DEMO-2", "DEMO-UNSPRINTED"])
+        cfg["jira"]["jql"] = '(project = "DEMO" AND component = "Core") AND statusCategory != Done ORDER BY key ASC'
+        self.assertEqual(search_run_keys(real_jc, cfg), ["DEMO-1", "DEMO-2", "DEMO-UNSPRINTED"])
 
         # Unsprinted backlog ticket on the board must be placed at the base/root iteration while sprinted ticket gets its sprint iteration
         unsprinted = sample.story()
@@ -1758,6 +1881,254 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertEqual(b2["complete"], 1)
         self.assertEqual(b2["remaining"], 0)
         self.assertEqual(len(ado.items), 2)
+
+    def test_round3_export_reexports_only_tickets_whose_updated_timestamp_changed(self):
+        from jira2ado.exporter import export
+        from jira2ado.util import read_json, write_json
+        folder = tempfile.mkdtemp()
+        state_dir = tempfile.mkdtemp()
+        cfg = cfg_for(folder)
+        cfg["paths"]["state_dir"] = state_dir
+        cfg["jira"]["jql"] = 'project = "DEMO"'
+        # Create a stale preview.json in state_dir; export() must remove it so paused exports aren't mistaken for valid previews
+        stale_preview = os.path.join(state_dir, "preview.json")
+        write_json(stale_preview, {"issues": 99})
+
+        story_v1 = sample.story()
+        sub_v1 = sample.subtask()
+        fetched_keys = []
+
+        class DeltaJira:
+            def __init__(self):
+                self.issues_map = {"DEMO-1": copy.deepcopy(story_v1), "DEMO-2": copy.deepcopy(sub_v1)}
+
+            def fields(self):
+                return [
+                    {"id": "customfield_10020", "name": "Sprint"},
+                    {"id": "customfield_10016", "name": "Story point estimate"},
+                    {"id": "customfield_10000", "name": "Development"},
+                ]
+
+            def statuses(self):
+                return [
+                    {"name": "To Do", "statusCategory": {"key": "new"}},
+                    {"name": "In Progress", "statusCategory": {"key": "indeterminate"}},
+                    {"name": "In Review", "statusCategory": {"key": "indeterminate"}},
+                    {"name": "Done", "statusCategory": {"key": "done"}},
+                ]
+
+            def search_key_timestamps(self, jql):
+                for k, iss in self.issues_map.items():
+                    yield k, iss["fields"]["updated"]
+
+            def issue(self, key):
+                fetched_keys.append(key)
+                return copy.deepcopy(self.issues_map[key])
+
+            def changelog(self, key):
+                return self.issues_map[key].get("changelog", [])
+
+            def comments(self, key):
+                return self.issues_map[key].get("comments", [])
+
+            def worklogs(self, key):
+                return []
+
+            def remote_links(self, key):
+                return []
+
+        dj = DeltaJira()
+        q = lambda *a, **k: None
+        done1, skipped1 = export(dj, cfg, force=False, log=q)
+        self.assertEqual((done1, skipped1), (2, 0))
+        self.assertEqual(sorted(fetched_keys), ["DEMO-1", "DEMO-2"])
+        self.assertFalse(os.path.exists(stale_preview))
+
+        # Second export when nothing changed: 0 tickets fetched!
+        fetched_keys.clear()
+        done2, skipped2 = export(dj, cfg, force=False, log=q)
+        self.assertEqual((done2, skipped2), (0, 2))
+        self.assertEqual(fetched_keys, [])
+
+        # Modify DEMO-1's status, comments, and updated timestamp in Jira -> only DEMO-1 is re-exported!
+        dj.issues_map["DEMO-1"]["fields"]["status"] = {"name": "In Review"}
+        dj.issues_map["DEMO-1"]["fields"]["updated"] = "2024-02-01T10:00:00.000-0500"
+        dj.issues_map["DEMO-1"]["comments"].append({
+            "id": "c99", "author": sample.U1, "created": "2024-02-01T10:00:00.000-0500",
+            "renderedBody": "<p>New comment after first export</p>",
+        })
+        fetched_keys.clear()
+        done3, skipped3 = export(dj, cfg, force=False, log=q)
+        self.assertEqual((done3, skipped3), (1, 1))
+        self.assertEqual(fetched_keys, ["DEMO-1"])
+        on_disk = read_json(os.path.join(folder, "issues", "DEMO-1.json"))
+        self.assertEqual(on_disk["fields"]["status"]["name"], "In Review")
+        self.assertEqual(len(on_disk["comments"]), 3)
+
+    def test_round3_open_backlog_ticket_with_only_closed_sprint_stays_on_backlog(self):
+        # Serious #3: An "In Progress" ticket whose only sprint is the closed Sprint 27 must go to
+        # the root/base iteration ("Shop"), both with history ON and with history OFF.
+        open_issue = sample.story()
+        open_issue["fields"]["status"] = {"name": "In Progress"}
+        open_issue["fields"]["resolution"] = None
+        open_issue["fields"]["resolutiondate"] = None
+        open_issue["fields"]["customfield_10020"] = [
+            {"id": 27, "name": "Sprint 27", "state": "closed",
+             "startDate": "2024-01-01T00:00:00.000Z", "endDate": "2024-01-14T00:00:00.000Z"}
+        ]
+        open_issue["changelog"] = [
+            {"created": "2024-01-03T09:00:00.000-0500", "author": sample.U1, "items": [
+                sample.item("status", "To Do", "In Progress"),
+                sample.item("Sprint", "", "Sprint 27", "", "27"),
+            ]}
+        ]
+
+        # 1. History OFF
+        cfg_no_hist = cfg_for("x")
+        cfg_no_hist["mapping"]["history"] = False
+        p_no_hist = Planner(cfg_no_hist, sample.META, USERS).plan(open_issue)
+        self.assertEqual(p_no_hist["revisions"][0]["fields"]["System.IterationPath"], "Shop")
+
+        # 2. History ON
+        cfg_hist = cfg_for("x")
+        cfg_hist["mapping"]["history"] = True
+        planner_hist = Planner(cfg_hist, sample.META, USERS)
+        p_hist = planner_hist.plan(open_issue)
+        final_fields = {}
+        for r in p_hist["revisions"]:
+            final_fields.update(r["fields"])
+        self.assertEqual(final_fields["System.IterationPath"], "Shop")
+        self.assertFalse(any("did not add up" in w for w in planner_hist.warnings))
+
+    def test_round3_same_name_sprints_with_different_ids_are_not_merged(self):
+        # Serious #4: Two "Sprint 1"s on different boards, a year apart (ID 10 in 2024, ID 20 in 2025)
+        # must create two distinct iterations with their own dates and keep their tickets separate.
+        from jira2ado.util import write_json
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        iss1 = sample.story()
+        iss1["key"] = "DEMO-1"
+        iss1["changelog"] = []
+        iss1["fields"]["customfield_10020"] = [{
+            "id": 10, "name": "Sprint 1", "state": "closed",
+            "startDate": "2024-01-01T00:00:00.000Z", "endDate": "2024-01-14T00:00:00.000Z",
+        }]
+        iss2 = sample.subtask()
+        iss2["key"] = "DEMO-2"
+        iss2["fields"]["status"] = {"name": "Done"}
+        iss2["fields"]["customfield_10020"] = [{
+            "id": 20, "name": "Sprint 1", "state": "closed",
+            "startDate": "2025-01-01T00:00:00.000Z", "endDate": "2025-01-14T00:00:00.000Z",
+        }]
+        write_json(os.path.join(folder, "issues", "DEMO-1.json"), iss1)
+        write_json(os.path.join(folder, "issues", "DEMO-2.json"), iss2)
+
+        cfg = cfg_for(folder)
+        cfg["mapping"]["history"] = False
+        ado = sample.FakeAdo()
+        stats = import_items(ado, cfg, USERS, log=lambda *a, **k: None)
+        self.assertEqual(stats["created"], 2)
+        self.assertIn(("Sprint 1 (10)", "2024-01-01T00:00:00.000Z", "2024-01-14T00:00:00.000Z"), ado.iterations)
+        self.assertIn(("Sprint 1 (20)", "2025-01-01T00:00:00.000Z", "2025-01-14T00:00:00.000Z"), ado.iterations)
+        self.assertEqual(ado.items[101]["fields"]["System.IterationPath"], "Shop\\Sprint 1 (10)")
+        self.assertEqual(ado.items[102]["fields"]["System.IterationPath"], "Shop\\Sprint 1 (20)")
+
+    def test_round3_batched_import_reuses_duplicates_and_verifies_only_current_batch(self):
+        # Serious #5: Across batches, duplicate search runs once (not repeated per batch) and
+        # batch-scoped verify checks only the keys in the current batch.
+        from jira2ado.util import write_json
+        folder = tempfile.mkdtemp()
+        write_json(os.path.join(folder, "meta.json"), sample.META)
+        keys = [f"DEMO-{i}" for i in range(1, 7)]
+        write_json(os.path.join(folder, "keys.json"), keys)
+        for k in keys:
+            iss = sample.subtask()
+            iss["key"] = k
+            iss["fields"]["parent"] = None
+            write_json(os.path.join(folder, "issues", f"{k}.json"), iss)
+
+        cfg = cfg_for(folder)
+        cfg["paths"]["state_dir"] = tempfile.mkdtemp()
+        q = lambda *a, **k: None
+        ado = sample.FakeAdo()
+        get_item_calls = []
+        orig_get = ado.get_item
+        def tracked_get(item_id):
+            get_item_calls.append(item_id)
+            return orig_get(item_id)
+        ado.get_item = tracked_get
+
+        report = os.path.join(cfg["paths"]["state_dir"], "verify.csv")
+        # Run 3 batches of 2 tickets (6 tickets total)
+        for _ in range(3):
+            st = import_items(ado, cfg, USERS, limit=2, log=q)
+            self.assertEqual(len(st["batch_keys"]), 2)
+            verify(ado, cfg, USERS, report, log=q, only=st["batch_keys"])
+
+        # Duplicate search was only called ONCE on Batch 1 (6 tickets total, not 6 + 4 + 2 = 12)
+        self.assertEqual(len(ado.key_searches), 1)
+        self.assertEqual(len(ado.key_searches[0][0]), 6)
+        # Verify called get_item only 2 times per batch = 6 times total (not 2 + 4 + 6 = 12)
+        self.assertEqual(len(get_item_calls), 6)
+
+    def test_round3_stable_run_folders_and_tick_order_independence(self):
+        # Medium #6: Run folder paths stay stable when include_done or board name changes,
+        # and sprint folder names are independent of sprint tick order.
+        from jira2ado.util import sprint_folder_slug
+        s1 = {"id": 101, "name": "Sprint 27"}
+        s2 = {"id": 102, "name": "Sprint 28"}
+        self.assertEqual(sprint_folder_slug([s1, s2]), sprint_folder_slug([s2, s1]))
+
+    def test_round3_sync_rollback_preserves_post_sync_edits_and_matches_attachment_ids(self):
+        # Open items:
+        # 1) Two attachments with the same filename have distinct IDs and are both attached.
+        # 2) Comments reformatted by ADO (e.g. <br/> instead of <br>) are not duplicated on re-sync.
+        # 3) Rolling back a sync does not undo edits made in ADO after the sync or write read-only System.* fields.
+        from jira2ado.importer import rollback_run
+        from jira2ado.util import write_json
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        os.makedirs(os.path.join(folder, "attachments", "DEMO-1"), exist_ok=True)
+        with open(os.path.join(folder, "attachments", "DEMO-1", "901_shot.png"), "wb") as fh:
+            fh.write(b"png-bytes-2")
+        iss = sample.story()
+        iss["fields"]["attachment"].append({
+            "id": "901", "filename": "shot.png", "created": "2024-01-03T11:00:00.000-0500",
+            "author": sample.U1, "local_path": "attachments/DEMO-1/901_shot.png",
+        })
+        write_json(os.path.join(folder, "issues", "DEMO-1.json"), iss)
+
+        cfg = cfg_for(folder)
+        cfg["mapping"]["history"] = False
+        q = lambda *a, **k: None
+        ado = sample.FakeAdo()
+        import_items(ado, cfg, USERS, only={"DEMO-1"}, log=q)
+        # Both attachments named shot.png (IDs 900 and 901) were uploaded
+        self.assertEqual(len(ado.uploads), 2)
+
+        # Simulate ADO reformatting comment HTML tags and user changing Title & State in ADO before sync
+        ado.items[101]["comments"] = [(d, c.replace("<p>", "<div>").replace("</p>", "</div>")) for d, c in ado.items[101]["comments"]]
+        ado.items[101]["fields"]["System.State"] = "New"
+        ado.items[101]["fields"]["System.Title"] = "Pre-Sync Title"
+
+        sync_cfg = copy.deepcopy(cfg)
+        sync_cfg["paths"]["state_dir"] = tempfile.mkdtemp()
+        sync_cfg["mapping"]["ticket_actions"] = {"DEMO-1": "sync"}
+        comment_count_before = len(ado.items[101]["comments"])
+        import_items(ado, sync_cfg, USERS, only={"DEMO-1"}, log=q)
+        # Neither attachment was re-uploaded and existing comments were not duplicated (only the 1 delta-sync note added)
+        self.assertEqual(len(ado.uploads), 2)
+        self.assertEqual(len(ado.items[101]["comments"]), comment_count_before + 1)
+        self.assertEqual(ado.items[101]["fields"]["System.State"], "Done")
+        self.assertEqual(ado.items[101]["fields"]["System.Title"], "Checkout fails on retry")
+
+        # Now user edits System.Title in ADO AFTER the sync!
+        ado.items[101]["fields"]["System.Title"] = "Post-Sync Manual Edit in ADO"
+        rb = rollback_run(ado, sync_cfg, log=q)
+        self.assertEqual(len(rb["restored"]), 1)
+        # System.State (not edited after sync) is reverted to "New", while System.Title (edited after sync) is preserved!
+        self.assertEqual(ado.items[101]["fields"]["System.State"], "New")
+        self.assertEqual(ado.items[101]["fields"]["System.Title"], "Post-Sync Manual Edit in ADO")
 
 
 if __name__ == "__main__":

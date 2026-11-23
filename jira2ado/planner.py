@@ -9,6 +9,7 @@ Two modes, set by mapping.history:
 Pure logic: no network calls, so it is testable and can be run as a dry run.
 """
 from difflib import SequenceMatcher
+import os
 import re
 
 from .adf import adf_to_html, esc, plain_to_html
@@ -243,32 +244,122 @@ def custom_value(issue, fid, kind, names, user_names=None):
     return str(v), []
 
 
-def sprint_info(issue, meta, only=None):
-    """(the issue's current sprint, {sprint name: state}).
+def _is_issue_done(issue, meta):
+    """Return True if the Jira issue is currently in a Done/completed status or resolved."""
+    f = (issue or {}).get("fields") or {}
+    status_name = (f.get("status") or {}).get("name") or ""
+    cat = ((meta or {}).get("statuses") or {}).get(status_name)
+    if cat == "done":
+        return True
+    if cat in ("new", "indeterminate"):
+        return False
+    if (f.get("resolution") or {}).get("name"):
+        return True
+    return status_name.strip().lower() in ("done", "closed", "resolved", "completed", "complete")
+
+
+def sprint_label(s, colliding=None):
+    """Return the sprint's iteration label, disambiguated with its Jira Sprint ID if another sprint shares its name."""
+    if not isinstance(s, dict):
+        return str(s or "")
+    name = s.get("name") or ""
+    sid = s.get("id") if s.get("id") is not None else s.get("number")
+    if colliding and sid is not None and name_key(name) in colliding:
+        return f"{name} ({sid})"
+    return name
+
+
+def discover_sprint_collisions(cfg, meta, issues=None):
+    """Return the set of normalized sprint names (name_key) that belong to 2+ distinct Jira Sprint IDs."""
+    ids_by_norm = {}
+
+    def _add(sid, sname):
+        if sid is not None and sname:
+            ids_by_norm.setdefault(name_key(sname), set()).add(str(sid))
+
+    for sp in ((cfg or {}).get("run") or {}).get("sprints") or []:
+        if isinstance(sp, dict):
+            _add(sp.get("id") if sp.get("id") is not None else sp.get("number"), sp.get("name"))
+    for sp in (meta or {}).get("sprints") or []:
+        if isinstance(sp, dict):
+            _add(sp.get("id") if sp.get("id") is not None else sp.get("number"), sp.get("name"))
+
+    sprint_fids = (meta or {}).get("sprint_fields") or []
+    if issues is None and cfg and sprint_fids:
+        export_dir = ((cfg.get("paths") or {}).get("export_dir")) or ""
+        if export_dir and os.path.isdir(os.path.join(export_dir, "issues")):
+            from .exporter import load_issues
+            try:
+                issues = list(load_issues(export_dir))
+            except Exception:
+                issues = []
+    for iss in (issues or []):
+        f = (iss or {}).get("fields") or {}
+        for fid in sprint_fids:
+            for s in f.get(fid) or []:
+                if isinstance(s, dict):
+                    _add(s.get("id") if s.get("id") is not None else s.get("number"), s.get("name"))
+    return {nk for nk, sids in ids_by_norm.items() if len(sids) > 1}
+
+
+def _issue_sprint_lookup(issue, meta, colliding):
+    """Build {sprint_id_or_norm_name: disambiguated_label} from the issue's sprint fields."""
+    by_id, by_norm = {}, {}
+    f = (issue or {}).get("fields") or {}
+    for fid in (meta or {}).get("sprint_fields") or []:
+        for s in f.get(fid) or []:
+            if isinstance(s, dict) and s.get("name"):
+                lbl = sprint_label(s, colliding)
+                sid = s.get("id") if s.get("id") is not None else s.get("number")
+                if sid is not None:
+                    by_id[str(sid)] = lbl
+                by_norm[name_key(s["name"])] = lbl
+    return by_id, by_norm
+
+
+def sprint_info(issue, meta, only=None, colliding=None):
+    """(the issue's current sprint, {sprint label: state}).
 
     Jira does not keep the sprint list in date order, so the current sprint is
-    the active one, else the next future one, else the most recent closed one.
-    With only (sprint names), the choice is limited to those sprints."""
+    the active one, else the next future one, else (for Done tickets or explicit
+    only_sprints) the most recent closed one. Under the Backlog Rule, an open
+    ticket whose only attached sprints are closed belongs on the Backlog (None)."""
     sprints, states = [], {}
     for fid in meta.get("sprint_fields", []):
         val = issue["fields"].get(fid)
         for s in val if isinstance(val, list) else []:
             if isinstance(s, dict) and s.get("name"):
+                lbl = sprint_label(s, colliding)
+                states[lbl] = s.get("state")
                 states[s["name"]] = s.get("state")
                 sprints.append(s)
     if only:
-        wanted = {name_key(n) for n in only}
-        sprints = [s for s in sprints if name_key(s["name"]) in wanted] or sprints
+        wanted_names = {name_key(str(n)) for n in only}
+        wanted_ids = {str(n) for n in only}
+        sprints = [
+            s for s in sprints
+            if str(s.get("id")) in wanted_ids
+            or name_key(s["name"]) in wanted_names
+            or name_key(sprint_label(s, colliding)) in wanted_names
+        ] or sprints
     if not sprints:
         return None, states
     if not any(s.get("state") for s in sprints):
-        return sprints[-1]["name"], states  # no state information: keep Jira's order
+        return sprint_label(sprints[-1], colliding), states  # no state information: keep Jira's order
     active = [s for s in sprints if s.get("state") == "active"]
     future = sorted((s for s in sprints if s.get("state") == "future"), key=lambda s: (s.get("startDate") or "9", s.get("id", 0)))
     closed = [s for _, s in sorted(((s.get("endDate") or s.get("startDate") or "", i), s)
                                    for i, s in enumerate(sprints) if s.get("state") not in ("active", "future"))]
-    pick = active[0] if active else future[0] if future else closed[-1]
-    return pick["name"], states
+    if active:
+        pick = active[0]
+    elif future:
+        pick = future[0]
+    else:
+        # Backlog rule: open/unfinished tickets whose only sprints are closed returned to the backlog
+        if not only and not _is_issue_done(issue, meta):
+            return None, states
+        pick = closed[-1]
+    return sprint_label(pick, colliding), states
 
 
 def override_node(cfg):
@@ -286,7 +377,7 @@ def override_node(cfg):
     return f'{iteration_node(m["iteration_parent"])}\\{node}' if m.get("iteration_parent") else node
 
 
-def current_state(issue, meta, only=None, user_names=None):
+def current_state(issue, meta, only=None, user_names=None, colliding=None):
     f = issue["fields"]
     points = None
     for fid in meta.get("points_fields", []):  # first filled field wins, in the configured order
@@ -302,13 +393,13 @@ def current_state(issue, meta, only=None, user_names=None):
         "assignee": (f.get("assignee") or {}).get("accountId"),
         "labels": list(f.get("labels") or []),
         "points": points,
-        "sprint": sprint_info(issue, meta, only)[0],
+        "sprint": sprint_info(issue, meta, only, colliding=colliding)[0],
         "components": [c["name"] for c in f.get("components") or []],
         "versions": [v["name"] for v in f.get("fixVersions") or []],
     }
 
 
-def classify(item, cfg, att_by_name=None, user_names=None):
+def classify(item, cfg, att_by_name=None, user_names=None, sprint_lookup=None):
     """Map one changelog item to (logical field, old value, new value), or None."""
     name = (item.get("field") or "").lower()
     frm, to = item.get("fromString"), item.get("toString")
@@ -330,8 +421,19 @@ def classify(item, cfg, att_by_name=None, user_names=None):
     if name in [n.lower() for n in m["points_jira_names"]]:
         return "points", _num(frm), _num(to)
     if name == m["sprint_jira_name"].lower():
-        last = lambda s: [p.strip() for p in s.split(",") if p.strip()][-1] if s and s.strip() else None
-        return "sprint", last(frm), last(to)
+        by_id, by_norm = sprint_lookup or ({}, {})
+
+        def _resolve_last(names_str, ids_str):
+            raw_ids = [p.strip() for p in (ids_str or "").split(",") if p.strip()]
+            if raw_ids and raw_ids[-1] in by_id:
+                return by_id[raw_ids[-1]]
+            raw_names = [p.strip() for p in (names_str or "").split(",") if p.strip()]
+            if not raw_names:
+                return None
+            last_name = raw_names[-1]
+            return by_norm.get(name_key(last_name), last_name)
+
+        return "sprint", _resolve_last(frm, item.get("from")), _resolve_last(to, item.get("to"))
     if name == "component":
         return "components", frm, to
     if name in ("fix version", "fixversion", "fix versions"):
@@ -395,11 +497,15 @@ def extract_remote_relations(issue):
 
 
 class Planner:
-    def __init__(self, cfg, meta, users=None, valid_states_by_type=None, available_wits=None):
+    def __init__(self, cfg, meta, users=None, valid_states_by_type=None, available_wits=None, colliding_sprints=None):
         self.cfg, self.meta = cfg, meta or {}
         self.users = users or {"ids": {}, "names": {}}
         self.valid_states_by_type = valid_states_by_type if valid_states_by_type is not None else (self.meta.get("valid_states_by_type") or {})
         self.available_wits = available_wits if available_wits is not None else self.meta.get("available_wits")
+        if colliding_sprints is not None:
+            self.colliding_sprints = colliding_sprints
+        else:
+            self.colliding_sprints = discover_sprint_collisions(cfg, self.meta)
         self.warnings = []
 
     def warn(self, key, msg):
@@ -507,19 +613,20 @@ class Planner:
         wit = type_for(issue, cfg, self.available_wits)
         if f["issuetype"]["name"] not in m["types"] and key not in (m.get("ticket_types") or {}):
             self.warn(key, f"issue type '{f['issuetype']['name']}' has no mapping, used '{wit}'")
-        cur = current_state(issue, self.meta, m.get("only_sprints"), user_names)
+        cur = current_state(issue, self.meta, m.get("only_sprints"), user_names, colliding=self.colliding_sprints)
         names = _att_names(issue)
         closed = f.get("resolutiondate") or f.get("updated")
-        ctx = {"jira_type": f["issuetype"]["name"], "sprint_states": sprint_info(issue, self.meta)[1],
+        ctx = {"jira_type": f["issuetype"]["name"], "sprint_states": sprint_info(issue, self.meta, colliding=self.colliding_sprints)[1],
                "closed_date": iso(parse_dt(closed)) if closed and not m["history"] else None}
         hist = sorted(issue.get("changelog", []), key=lambda h: parse_dt(h["created"])) if m["history"] else []
+        sp_lookup = _issue_sprint_lookup(issue, self.meta, self.colliding_sprints)
 
         # In history mode, work out the starting values by reading the log backwards.
         init = {k: (list(v) if isinstance(v, list) else v) for k, v in cur.items()}
         seen, last_desc = set(), None
         for hi, h in enumerate(hist):
             for ii, it in enumerate(h.get("items", [])):
-                c = classify(it, cfg, names, user_names)
+                c = classify(it, cfg, names, user_names, sprint_lookup=sp_lookup)
                 if not c:
                     continue
                 if c[0] == "description":
@@ -531,7 +638,7 @@ class Planner:
             vals = list(cur[name])
             for h in reversed(hist):
                 for it in reversed(h.get("items", [])):
-                    c = classify(it, cfg, names, user_names)
+                    c = classify(it, cfg, names, user_names, sprint_lookup=sp_lookup)
                     if c and c[0] == name:
                         if c[2] and c[2] in vals:
                             vals.remove(c[2])
@@ -595,7 +702,7 @@ class Planner:
                 hi, h = payload
                 changed, notes = set(), []
                 for ii, it in enumerate(h.get("items", [])):
-                    c = classify(it, cfg, names, user_names)
+                    c = classify(it, cfg, names, user_names, sprint_lookup=sp_lookup)
                     if c:
                         name, old, new = c
                         if name in SETS:
@@ -641,16 +748,28 @@ class Planner:
             for k in diff:
                 state[k] = cur[k]
             date = iso(parse_dt(f.get("updated") or f["created"]))
-            self.warn(key, f"history did not add up for {sorted(diff)}; final values were set from current Jira state")
+            # When an open ticket returned to the backlog after a sprint closed (cur["sprint"] is None),
+            # Jira keeps the closed sprint on the issue without always adding a changelog entry; don't warn on that.
+            warn_diff = diff - ({"sprint"} if cur.get("sprint") is None else set())
+            if warn_diff:
+                self.warn(key, f"history did not add up for {sorted(warn_diff)}; final values were set from current Jira state")
+                note_html = ("<div><i>Migration note: " + ", ".join(sorted(warn_diff)) +
+                             " set from the final Jira values because the change log was incomplete.</i></div>")
+            else:
+                note_html = None
             revs.append({"date": date, "author": None, "author_name": None,
                          "fields": self.ado_fields(diff, state, key, wit, date, flags, ctx),
-                         "comment": "<div><i>Migration note: " + ", ".join(sorted(diff)) +
-                                    " set from the final Jira values because the change log was incomplete.</i></div>",
+                         "comment": note_html,
                          "attachments": []})
 
         # Apply per-ticket status override from the interactive validation UI if present
         ticket_state_ov = (m.get("ticket_states") or {}).get(key)
         if ticket_state_ov:
+            valid_states = self.valid_states_by_type.get(wit)
+            if valid_states and ticket_state_ov not in valid_states:
+                ticket_state_ov, _, _ = closest_ado_state(
+                    ticket_state_ov, wit, valid_states, cfg, self.meta, cur.get("resolution")
+                )
             ado_cats = ((self.meta.get("state_categories_by_type") or {}).get(wit)) or {}
             is_done = ticket_state_ov in m["done_states"] or ado_cats.get(ticket_state_ov) == "Completed"
             target_rev = revs[-1]
@@ -672,19 +791,24 @@ class Planner:
         return {"key": key, "type": wit, "subtask": is_subtask_issue(issue), "revisions": revs}
 
 
-def sprints_in(issue, meta, cfg):
-    """All sprints an issue was ever in: {name: (start, end, state)}."""
+def sprints_in(issue, meta, cfg, colliding=None):
+    """All sprints an issue was ever in: {sprint_label: (start, end, state)}."""
     out = {}
+    by_id, by_norm = _issue_sprint_lookup(issue, meta, colliding)
     for fid in meta.get("sprint_fields", []):
         for s in issue["fields"].get(fid) or []:
             if isinstance(s, dict) and s.get("name"):
-                out[s["name"]] = (s.get("startDate"), s.get("endDate"), s.get("state"))
+                lbl = sprint_label(s, colliding)
+                out[lbl] = (s.get("startDate"), s.get("endDate"), s.get("state"))
     if cfg["mapping"]["history"]:
         for h in issue.get("changelog", []):
             for it in h.get("items", []):
                 if (it.get("field") or "").lower() == cfg["mapping"]["sprint_jira_name"].lower():
-                    for side in ("fromString", "toString"):
-                        for n in (it.get(side) or "").split(","):
-                            if n.strip():
-                                out.setdefault(n.strip(), (None, None, None))
+                    for str_side, id_side in (("fromString", "from"), ("toString", "to")):
+                        names = [p.strip() for p in (it.get(str_side) or "").split(",") if p.strip()]
+                        ids = [p.strip() for p in (it.get(id_side) or "").split(",") if p.strip()]
+                        for idx, n in enumerate(names):
+                            sid = ids[idx] if idx < len(ids) else None
+                            lbl = (by_id.get(sid) if sid else None) or by_norm.get(name_key(n), n)
+                            out.setdefault(lbl, (None, None, None))
     return out

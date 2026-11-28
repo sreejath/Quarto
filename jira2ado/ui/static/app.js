@@ -12,11 +12,15 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + "s")}`;
 
 const S = {
   pageMode: PAGE_MODE,
-  jira: null, ado: null, jiraUrl: "", adoUrl: "", settings: {}, problems: {}, connecting: false, editConnect: false,
+  jira: null, ado: null, zephyr: null, jiraUrl: "", adoUrl: "", zephyrUrl: "",
+  hasEnvFile: false, envFileName: "", connectedFromEnv: false,
+  settings: {}, problems: {}, connecting: false, editConnect: false,
   projects: [], projectsError: "", source: "",
   boards: [], boardsLoading: false, board: "",
   sprints: [], sprintsLoading: false, sprintsError: "", picked: new Set(), sprintFilter: "",
   includeDone: PAGE_MODE === "project", includeHierarchy: false, historyMode: true, forceExport: false,
+  boardsToAreas: PAGE_MODE === "project", createBoardTeams: PAGE_MODE === "project",
+  includeZephyr: false, includeTestPlans: true,
   targets: [], target: "", other: "", isOther: false,
   iterations: [], areas: [], iterationsFor: "", iterationsError: "", iterMode: "sprint", iteration: "", newIteration: "", area: "",
   job: null, since: 0, log: [], phase: "setup", checkedSig: "", checkedAt: null, error: "",
@@ -36,6 +40,7 @@ const S = {
   drawerTicketKey: null,
   peopleEdits: {},      // {account_id: ado_identity}
   savingPeople: false,
+  progressSession: null,
 };
 
 /* ------------------------------------------------------------ server calls */
@@ -98,7 +103,7 @@ const connected = () => Boolean(S.jira && S.ado);
 const targetName = () => (S.isOther ? S.other.trim() : S.target);
 const targetInfo = () => S.targets.find((t) => t.name === targetName());
 const chosenIteration = () => (S.iterMode === "one" ? (S.iteration === "__new" ? S.newIteration.trim() : S.iteration) : "");
-const busy = () => S.phase === "checking" || S.phase === "importing" || S.phase === "rolling_back";
+const busy = () => S.phase === "checking" || S.phase === "importing" || S.phase === "rolling_back" || S.phase === "syncing_zephyr";
 
 function isDoublePaste(tok) {
   const v = (tok || "").trim();
@@ -117,6 +122,10 @@ function signature() {
   return JSON.stringify({
     m: S.pageMode, s: S.source, b: S.board, p: [...S.picked].sort(), t: targetName(),
     i: chosenIteration(), a: S.area, d: S.includeDone, h: S.includeHierarchy, hm: S.historyMode,
+    b2a: S.pageMode === "project" ? S.boardsToAreas : false,
+    cbt: S.pageMode === "project" ? (S.boardsToAreas && S.createBoardTeams) : false,
+    z: Boolean(S.includeZephyr && S.zephyr),
+    tp: Boolean(S.includeZephyr && S.zephyr && S.includeTestPlans),
   });
 }
 
@@ -258,6 +267,7 @@ function renderWho() {
   const parts = [];
   if (S.jira) parts.push(`<span>Jira: <b>${esc(S.jira)}</b></span>`);
   if (S.ado) parts.push(`<span>Azure DevOps: <b>${esc(S.ado)}</b></span>`);
+  if (S.zephyr) parts.push(`<span>Zephyr: <b>Connected</b></span>`);
   $("#who").innerHTML = parts.join("");
 }
 
@@ -276,6 +286,8 @@ function renderConnect() {
       <div class="step-body">
         <p class="okline">Jira: <b>${esc(S.jira)}</b> <span class="soft">(${esc(S.jiraUrl.replace(/^https?:\/\//, ""))})</span></p>
         <p class="okline">Azure DevOps: <b>${esc(S.ado)}</b> <span class="soft">(${esc(S.adoUrl.replace(/^https?:\/\//, ""))})</span></p>
+        ${S.zephyr ? `<p class="okline">Zephyr: <b>${esc(S.zephyr)}</b></p>` : `<p class="hint">Zephyr Squad keys not connected (optional — add them to migrate Test Steps &amp; Test Plans).</p>`}
+        ${S.connectedFromEnv ? `<p class="hint">Loaded automatically from local git-ignored <code>${esc(S.envFileName || ".env")}</code>.</p>` : ""}
         <div class="row"><button class="quiet" type="button" data-action="edit-connect">Change connection / tokens</button></div>
       </div>`);
     return;
@@ -283,9 +295,15 @@ function renderConnect() {
   const p = S.problems;
   const defJiraUrl = S.jiraUrl || S.settings.jira_url || "";
   const defAdoUrl = S.adoUrl || S.settings.ado_url || "";
+  const defZephyrUrl = S.zephyrUrl || S.settings.zephyr_base_url || "https://prod-api.zephyr4jiracloud.com/connect";
+  const envBtn = S.hasEnvFile ? `
+    <div class="row" style="margin-bottom:8px">
+      <button class="btn secondary btn-sm" type="button" data-action="connect-env" ${S.connecting ? "disabled" : ""}>Load &amp; Connect from local ${esc(S.envFileName || ".env")}</button>
+    </div>` : "";
   setStep("#step-connect", "current", `
     <h2>Connect</h2>
-    <p class="lede">Tokens stay in memory on this machine until you quit. Nothing secret is written to disk.</p>
+    <p class="lede">Tokens stay in memory on this machine (or load from your git-ignored <code>.env</code> file). Nothing secret is committed or written to configs.</p>
+    ${envBtn}
     <form class="step-body" data-action="connect-form" autocomplete="off">
       <label class="field">Atlassian Jira URL
         <input type="url" id="jira-url" value="${esc(defJiraUrl)}" placeholder="https://your-org.atlassian.net" required>
@@ -302,14 +320,43 @@ function renderConnect() {
       </label>
       <label class="field">Azure DevOps PAT
         <input type="password" id="ado-token" autocomplete="off" required>
-        <span class="hint">Needs Work Items (Read, write &amp; manage) scope and Bypass rules permission.</span>
+        <span class="hint">Needs Work Items (Read, write &amp; manage), Bypass rules, and (for Test Plans/Teams) Project &amp; Team + Test Management (Read &amp; write).</span>
       </label>
       ${p.ado ? `<p class="problem">${esc(p.ado)}</p>` : S.ado ? `<p class="okline">Azure DevOps: <b>${esc(S.ado)}</b></p>` : ""}
+      <details style="margin:6px 0" ${p.zephyr || S.zephyr ? "open" : ""}>
+        <summary style="cursor:pointer;font-size:13px;font-weight:600">Zephyr Squad Cloud API Keys (Optional)</summary>
+        <div class="step-body" style="margin-top:8px">
+          <label class="field">Zephyr Access Key
+            <input type="password" id="zephyr-access-key" autocomplete="off" placeholder="Jira -> Apps -> Zephyr Squad -> API Keys">
+          </label>
+          <label class="field">Zephyr Secret Key
+            <input type="password" id="zephyr-secret-key" autocomplete="off">
+          </label>
+          <label class="field">Zephyr Squad API URL
+            <input type="url" id="zephyr-url" value="${esc(defZephyrUrl)}" placeholder="https://prod-api.zephyr4jiracloud.com/connect">
+          </label>
+          ${p.zephyr ? `<p class="problem">${esc(p.zephyr)}</p>` : S.zephyr ? `<p class="okline">Zephyr: <b>${esc(S.zephyr)}</b></p>` : ""}
+        </div>
+      </details>
       <div class="row">
         <button class="btn" type="submit" ${S.connecting ? "disabled" : ""}>${S.connecting ? "Connecting..." : "Connect"}</button>
         ${S.editConnect ? `<button class="quiet" type="button" data-action="cancel-connect">Keep current connection</button>` : ""}
       </div>
     </form>`);
+}
+
+function zephyrCheckboxesHtml() {
+  const disabled = !S.zephyr || busy();
+  const checked = Boolean(S.zephyr && S.includeZephyr);
+  return `
+    <label class="check" title="${S.zephyr ? "" : "Connect Zephyr Squad API keys (or add them to .env) to enable"}">
+      <input type="checkbox" data-action="include-zephyr" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}>
+      <span>Migrate <b>Zephyr Squad</b> test steps, step attachments &amp; <code>Tested By</code> ticket links${S.zephyr ? "" : " <i>(connect Zephyr keys first)</i>"}</span>
+    </label>
+    ${checked ? `<label class="check" style="margin-left:22px">
+      <input type="checkbox" data-action="include-test-plans" ${S.includeTestPlans ? "checked" : ""} ${busy() ? "disabled" : ""}>
+      <span>Migrate Zephyr Test Cycles &amp; Folders → <b>Azure Test Plans &amp; Suites</b> (needs <i>Test Management</i> PAT scope)</span>
+    </label>` : ""}`;
 }
 
 function renderTickets() {
@@ -336,12 +383,17 @@ function renderTickets() {
           </select>
         </label>
         <p class="hint">Fetches all issues in <b>${esc(S.source || "the project")}</b> (across all boards, sprints, and backlog). Sprints attached to tickets are automatically created in Azure DevOps.</p>
+        <label class="check"><input type="checkbox" data-action="boards-to-areas" ${S.boardsToAreas ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Organize by Jira board (per-board <b>Area Paths</b> &amp; nested <b>Board → Sprint</b> Iterations)</span></label>
+        ${S.boardsToAreas ? `<label class="check" style="margin-left:22px"><input type="checkbox" data-action="create-board-teams" ${S.createBoardTeams ? "checked" : ""} ${busy() ? "disabled" : ""}>
+          <span>Auto-create an <b>ADO Team</b> per Jira board (assigns default Area, Backlog &amp; Sprints; needs <i>Project &amp; Team</i> write scope)</span></label>` : ""}
         <label class="check"><input type="checkbox" data-action="include-done" ${S.includeDone ? "checked" : ""} ${busy() ? "disabled" : ""}>
           <span>Include tickets whose status category is <b>Done</b></span></label>
         <label class="check"><input type="checkbox" data-action="include-hierarchy" ${S.includeHierarchy ? "checked" : ""} ${busy() ? "disabled" : ""}>
           <span>Auto-include parent Epics &amp; child Sub-tasks outside the project</span></label>
         <label class="check"><input type="checkbox" data-action="history-mode" ${S.historyMode ? "checked" : ""} ${busy() ? "disabled" : ""}>
           <span>Migrate full changelog revision history, worklogs &amp; links</span></label>
+        ${zephyrCheckboxesHtml()}
         <label class="check"><input type="checkbox" data-action="force-export" ${S.forceExport ? "checked" : ""} ${busy() ? "disabled" : ""}>
           <span>Force fresh re-export from Jira (uncheck to resume cached export)</span></label>
       </div>`);
@@ -374,6 +426,7 @@ function renderTickets() {
           <span>Auto-include parent Epics &amp; child Sub-tasks outside the board</span></label>
         <label class="check"><input type="checkbox" data-action="history-mode" ${S.historyMode ? "checked" : ""} ${busy() ? "disabled" : ""}>
           <span>Migrate full changelog revision history, worklogs &amp; links</span></label>
+        ${zephyrCheckboxesHtml()}
         <label class="check"><input type="checkbox" data-action="force-export" ${S.forceExport ? "checked" : ""} ${busy() ? "disabled" : ""}>
           <span>Force fresh re-export from Jira (uncheck to resume cached export)</span></label>
       </div>`);
@@ -434,6 +487,7 @@ function renderTickets() {
         <span>Auto-include parent Epics &amp; child Sub-tasks outside the sprint</span></label>
       <label class="check"><input type="checkbox" data-action="history-mode" ${S.historyMode ? "checked" : ""} ${busy() ? "disabled" : ""}>
         <span>Migrate full changelog revision history, worklogs &amp; links</span></label>
+      ${zephyrCheckboxesHtml()}
       <label class="check"><input type="checkbox" data-action="force-export" ${S.forceExport ? "checked" : ""} ${busy() ? "disabled" : ""}>
         <span>Force fresh re-export from Jira (uncheck to resume cached export)</span></label>
     </div>`);
@@ -578,10 +632,21 @@ function renderImport() {
   const pv = run.preview;
   const project = pv.project;
   let body = "";
-  if ((S.phase === "importing" || S.phase === "rolling_back") && S.job) {
-    body = `${progressList(S.job)}
+  if ((S.phase === "importing" || S.phase === "rolling_back" || S.phase === "syncing_zephyr") && S.job) {
+    const mp = S.phase === "importing" ? computeMigrationProgress() : null;
+    const miniBar = mp ? `
+      <div class="rail-progress">
+        <div class="rail-progress-top">
+          <span><b>${esc(fmtNum(mp.ticketsDone))}</b> / ${esc(fmtNum(mp.ticketsTotal))} tickets</span>
+          <span class="num"><b>${mp.pct.toFixed(1)}%</b> · ${esc(mp.etaLabel)}</span>
+        </div>
+        <div class="progress-track rail-track" role="progressbar" aria-valuenow="${Math.round(mp.pct)}" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-fill active" style="width:${mp.pct.toFixed(2)}%"></div>
+        </div>
+      </div>` : "";
+    body = `${miniBar}${progressList(S.job)}
       <div class="row">
-        ${S.phase === "importing" ? `<button class="btn secondary btn-sm" type="button" data-action="pause">⏸ Pause after current ticket</button>` : ""}
+        ${S.phase === "importing" ? `<button class="btn secondary btn-sm" type="button" data-action="pause">⏸ Pause after in-flight tickets</button>` : ""}
         <button class="quiet" type="button" data-action="stop">Stop</button>
       </div>`;
   } else if (S.phase === "imported") {
@@ -593,6 +658,7 @@ function renderImport() {
       </div>
       <div class="row">
         ${files["verify.csv"] ? `<button class="btn secondary btn-sm" type="button" data-action="download-file" data-path="${esc(files["verify.csv"])}" data-name="verify.csv">Download Verify CSV</button>` : ""}
+        ${S.zephyr ? `<button class="btn secondary btn-sm" type="button" data-action="sync-zephyr">Sync Zephyr Steps &amp; Test Plans</button>` : ""}
         <button class="btn danger btn-sm" type="button" data-action="rollback">Undo / Rollback Run</button>
       </div>`;
   } else if (S.phase === "import_paused" || S.phase === "batch_done") {
@@ -858,7 +924,10 @@ function renderManifest() {
     const it = belowProject(places[0].iteration, pv.project);
     where = it ? `${it}${places[0].iteration_exists === false ? " (will be created)" : ""}` : "Project root iteration";
   } else if (places.length > 1) {
-    where = `${places.length} iteration paths`;
+    const uniqAreas = new Set(places.map((p) => p.area).filter(Boolean));
+    where = uniqAreas.size > 1
+      ? `${uniqAreas.size} area paths · ${places.length} iteration paths`
+      : `${places.length} iteration paths`;
   }
   const c = tally(run);
   const after = S.phase === "importing" || S.phase === "imported" || S.phase === "import_paused" || S.phase === "batch_done" || S.phase === "import_failed";
@@ -953,14 +1022,260 @@ function renderManifest() {
     ${tabsHtml()}`;
 }
 
+function fmtNum(n) {
+  return Number(n || 0).toLocaleString("en-US");
+}
+
+function fmtDuration(sec) {
+  if (sec == null || !isFinite(sec) || sec < 0) return "—";
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return remS ? `${m}m ${String(remS).padStart(2, "0")}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `${h}h ${String(remM).padStart(2, "0")}m`;
+}
+
+function initMigrationProgressSession(job) {
+  if (!S.run || !S.run.preview || !job) return null;
+  const run = S.run;
+  const tickets = run.preview.tickets || [];
+  const migratable = tickets.filter((t) => {
+    const j = run.journal[t.key];
+    if (j && j.found) return false;
+    if (run.held[t.key] !== undefined) return false;
+    const act = effectiveAction(t);
+    return (j && j.revs > 0) || act === "create" || act === "duplicate" || act === "sync";
+  });
+  const incompleteAtStart = migratable.filter((t) => {
+    const j = run.journal[t.key];
+    const req = Math.max(1, t.revisions || 1);
+    return !(j && j.revs >= req);
+  });
+  const bSize = S.batchSize !== "all" ? (parseInt(S.batchSize, 10) || 0) : 0;
+  const isBatched = bSize > 0 && incompleteAtStart.length > bSize;
+  const scopeTickets = isBatched ? incompleteAtStart.slice(0, bSize) : migratable;
+  const scopeKeySet = new Set(scopeTickets.map((t) => t.key));
+  let baseRevsDone = 0;
+  for (const t of scopeTickets) {
+    const j = run.journal[t.key];
+    const req = Math.max(1, t.revisions || 1);
+    baseRevsDone += Math.min(req, (j && j.revs) || 0);
+  }
+  const nowMs = Date.now();
+  S.progressSession = {
+    jobId: job.id,
+    isBatched,
+    batchLimit: bSize,
+    scopeKeySet,
+    startedAtMs: job.started_at ? job.started_at * 1000 : nowMs,
+    baseRevsDone,
+    lastRevsDone: baseRevsDone,
+    lastSampleMs: nowMs,
+    smoothedRate: 0,
+  };
+  return S.progressSession;
+}
+
+function computeMigrationProgress() {
+  if (!S.run || !S.run.preview || !S.job) return null;
+  const run = S.run;
+  const job = S.job;
+  if (!S.progressSession || S.progressSession.jobId !== job.id) {
+    initMigrationProgressSession(job);
+  }
+  const ps = S.progressSession;
+  const tickets = run.preview.tickets || [];
+  const migratable = tickets.filter((t) => {
+    const j = run.journal[t.key];
+    if (j && j.found) return false;
+    if (run.held[t.key] !== undefined) return false;
+    const act = effectiveAction(t);
+    return (j && j.revs > 0) || act === "create" || act === "duplicate" || act === "sync";
+  });
+
+  let overallTicketsDone = 0;
+  let overallRevsTotal = 0;
+  let overallRevsDone = 0;
+  let scopeTicketsTotal = 0;
+  let scopeTicketsDone = 0;
+  let scopeRevsTotal = 0;
+  let scopeRevsDone = 0;
+  const inFlight = [];
+
+  for (const t of migratable) {
+    const req = Math.max(1, t.revisions || 1);
+    const j = run.journal[t.key];
+    const doneRevs = Math.min(req, (j && j.revs) || 0);
+    const isComplete = Boolean(j && j.revs >= req);
+    overallRevsTotal += req;
+    overallRevsDone += doneRevs;
+    if (isComplete) overallTicketsDone++;
+    else if (j && j.revs > 0) {
+      inFlight.push({ key: t.key, revs: j.revs, total: req, id: j.id });
+    }
+    if (!ps || ps.scopeKeySet.has(t.key)) {
+      scopeTicketsTotal++;
+      scopeRevsTotal += req;
+      scopeRevsDone += doneRevs;
+      if (isComplete) scopeTicketsDone++;
+    }
+  }
+
+  const ticketsTotal = ps && ps.isBatched ? scopeTicketsTotal : migratable.length;
+  const ticketsDone = ps && ps.isBatched ? scopeTicketsDone : overallTicketsDone;
+  const ticketsRemaining = Math.max(0, ticketsTotal - ticketsDone);
+  const revsTotal = ps && ps.isBatched ? scopeRevsTotal : overallRevsTotal;
+  const revsDone = ps && ps.isBatched ? scopeRevsDone : overallRevsDone;
+  const revsRemaining = Math.max(0, revsTotal - revsDone);
+
+  const nowMs = Date.now();
+  const elapsedSec = Math.max(0.5, job.elapsed_seconds != null ? job.elapsed_seconds : ((nowMs - (ps ? ps.startedAtMs : nowMs)) / 1000));
+  const sessionRevsDone = Math.max(0, scopeRevsDone - (ps ? ps.baseRevsDone : 0));
+  const sessionAvgRate = sessionRevsDone > 0 ? (sessionRevsDone / elapsedSec) : 0;
+
+  if (ps && scopeRevsDone > ps.lastRevsDone) {
+    const dtSec = Math.max(0.25, (nowMs - ps.lastSampleMs) / 1000);
+    const instRate = (scopeRevsDone - ps.lastRevsDone) / dtSec;
+    const blended = 0.6 * sessionAvgRate + 0.4 * instRate;
+    ps.smoothedRate = ps.smoothedRate > 0 ? (0.65 * ps.smoothedRate + 0.35 * blended) : blended;
+    ps.lastRevsDone = scopeRevsDone;
+    ps.lastSampleMs = nowMs;
+  }
+  const rate = (ps && ps.smoothedRate > 0) ? (0.5 * ps.smoothedRate + 0.5 * sessionAvgRate) : sessionAvgRate;
+
+  const activeStep = (job.steps || []).find((s) => s.status === "running");
+  const isVerifying = activeStep && /verify/i.test(activeStep.label);
+  let pct = revsTotal > 0 ? Math.min(100, (revsDone / revsTotal) * 100) : (ticketsTotal > 0 ? (ticketsDone / ticketsTotal) * 100 : 0);
+  if (isVerifying && revsRemaining === 0) pct = 100;
+
+  let etaLabel = "Calculating...";
+  if (isVerifying && revsRemaining === 0) {
+    etaLabel = "Verifying...";
+  } else if (revsRemaining === 0) {
+    etaLabel = "Finishing...";
+  } else if (sessionRevsDone > 0 && rate > 0.02) {
+    const etaSec = Math.ceil(revsRemaining / rate);
+    etaLabel = etaSec <= 3 ? "< 5s left" : `~${fmtDuration(etaSec)} left`;
+  }
+
+  return {
+    isBatched: Boolean(ps && ps.isBatched),
+    overallTicketsDone,
+    overallTicketsTotal: migratable.length,
+    ticketsDone,
+    ticketsTotal,
+    ticketsRemaining,
+    revsDone,
+    revsTotal,
+    revsRemaining,
+    pct,
+    rate,
+    elapsedSec,
+    etaLabel,
+    inFlight,
+    stepLabel: activeStep ? activeStep.label : "Migrating work items",
+    isVerifying,
+  };
+}
+
 function liveStrip() {
   const job = S.job;
   if (!job) return "";
   const step = job.steps.find((s) => s.status === "running");
   const last = S.log.length ? S.log[S.log.length - 1] : "";
-  return `<div class="live"><b>${esc(step ? step.label : "Working")}</b><span class="last">${esc(last)}</span>
-    <button class="btn secondary btn-sm" type="button" data-action="pause">⏸ Pause</button>
-    <button class="quiet" type="button" data-action="stop">Stop</button></div>`;
+
+  if (S.phase === "importing" && S.run && S.run.preview) {
+    const mp = computeMigrationProgress();
+    if (mp) {
+      const inFlightHtml = mp.inFlight.length
+        ? `<div class="inflight-row">
+             <span class="inflight-label">In flight (${mp.inFlight.length}):</span>
+             ${mp.inFlight.slice(0, 6).map((f) =>
+               `<span class="inflight-pill num">${esc(f.key)} <span class="soft">${f.revs}/${f.total}</span></span>`
+             ).join("")}
+             ${mp.inFlight.length > 6 ? `<span class="soft">+${mp.inFlight.length - 6} more</span>` : ""}
+           </div>`
+        : `<div class="inflight-row"><span class="inflight-label">${mp.isVerifying ? "Batch verification running against Azure DevOps" : "Parallel Azure DevOps writers active"}</span></div>`;
+
+      return `
+        <div class="live-progress-card" role="region" aria-label="Migration progress">
+          <div class="progress-header">
+            <div class="progress-title-wrap">
+              <span class="pulse-dot" aria-hidden="true"></span>
+              <div>
+                <div class="progress-title">${esc(mp.stepLabel)}${mp.isBatched ? ` <span class="mode-pill">Batch of ${mp.ticketsTotal}</span>` : ""}</div>
+                <div class="progress-subtitle">ETA weighted by revisions remaining (${esc(fmtNum(mp.revsRemaining))} rev${mp.revsRemaining === 1 ? "" : "s"} left)${mp.isBatched ? ` · Overall: ${esc(fmtNum(mp.overallTicketsDone))} / ${esc(fmtNum(mp.overallTicketsTotal))} tickets` : ""}</div>
+              </div>
+            </div>
+            <div class="row">
+              <button class="btn secondary btn-sm" type="button" data-action="pause">⏸ Pause after in-flight tickets</button>
+              <button class="quiet" type="button" data-action="stop">Stop</button>
+            </div>
+          </div>
+          <div class="progress-bar-row">
+            <div class="progress-track" role="progressbar" aria-valuenow="${Math.round(mp.pct)}" aria-valuemin="0" aria-valuemax="100">
+              <div class="progress-fill active" style="width:${mp.pct.toFixed(2)}%"></div>
+            </div>
+            <div class="progress-pct num">${mp.pct.toFixed(1)}%</div>
+          </div>
+          <div class="progress-metrics">
+            <div class="metric-tile">
+              <span class="metric-label">${mp.isBatched ? "Batch Tickets" : "Tickets Migrated"}</span>
+              <span class="metric-val num">${esc(fmtNum(mp.ticketsDone))} <span class="metric-dim">/ ${esc(fmtNum(mp.ticketsTotal))}</span></span>
+              <span class="metric-sub num">${esc(fmtNum(mp.ticketsRemaining))} ticket${mp.ticketsRemaining === 1 ? "" : "s"} remaining</span>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-label">Est. Time Remaining</span>
+              <span class="metric-val accent num">${esc(mp.etaLabel)}</span>
+              <span class="metric-sub num">Elapsed ${esc(fmtDuration(mp.elapsedSec))}</span>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-label">Revisions Replayed</span>
+              <span class="metric-val num">${esc(fmtNum(mp.revsDone))} <span class="metric-dim">/ ${esc(fmtNum(mp.revsTotal))}</span></span>
+              <span class="metric-sub num">${esc(fmtNum(mp.revsRemaining))} rev${mp.revsRemaining === 1 ? "" : "s"} remaining</span>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-label">Write Throughput</span>
+              <span class="metric-val num">${mp.rate > 0 ? `${mp.rate.toFixed(1)} rev/s` : "Starting..."}</span>
+              <span class="metric-sub">6 concurrent ADO writers</span>
+            </div>
+          </div>
+          ${inFlightHtml}
+          ${last ? `<div class="live-ticker"><span class="last">${esc(last)}</span></div>` : ""}
+        </div>`;
+    }
+  }
+
+  const totalSteps = (job.steps || []).length || 1;
+  const doneSteps = (job.steps || []).filter((s) => s.status === "done").length;
+  const stepPct = Math.min(96, Math.max(6, Math.round(((doneSteps + 0.45) / totalSteps) * 100)));
+  const elapsed = job.elapsed_seconds != null ? fmtDuration(job.elapsed_seconds) : "";
+  return `
+    <div class="live-progress-card compact">
+      <div class="progress-header">
+        <div class="progress-title-wrap">
+          <span class="pulse-dot" aria-hidden="true"></span>
+          <div>
+            <div class="progress-title">${esc(step ? step.label : "Working")}</div>
+            <div class="progress-subtitle num">Step ${Math.min(totalSteps, doneSteps + 1)} of ${totalSteps}${elapsed ? ` · Elapsed ${esc(elapsed)}` : ""}</div>
+          </div>
+        </div>
+        <div class="row">
+          ${S.phase === "checking" ? `<button class="btn secondary btn-sm" type="button" data-action="pause">⏸ Pause</button>` : ""}
+          <button class="quiet" type="button" data-action="stop">Stop</button>
+        </div>
+      </div>
+      <div class="progress-bar-row">
+        <div class="progress-track" role="progressbar" aria-valuenow="${stepPct}" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-fill active" style="width:${stepPct}%"></div>
+        </div>
+        <div class="progress-pct num">${stepPct}%</div>
+      </div>
+      ${last ? `<div class="live-ticker"><span class="last">${esc(last)}</span></div>` : ""}
+    </div>`;
 }
 
 function ticketRow(t, run) {
@@ -976,6 +1291,7 @@ function ticketRow(t, run) {
     t.comments ? plural(t.comments, "comment") : "",
     t.attachments ? plural(t.attachments, "attachment") : "",
     t.worklogs ? plural(t.worklogs, "worklog") : "",
+    t.test_steps ? plural(t.test_steps, "test step") : "",
     t.links ? plural(t.links, "link") : "",
     t.hierarchy_auto_included ? "auto-included hierarchy" : "",
   ].filter(Boolean).join(" · ");
@@ -1091,9 +1407,21 @@ function panelHtml(tab, pv) {
   }
   if (tab === "where") {
     const files = (S.run && S.run.files) || {};
-    return `<table><thead><tr><th>Items</th><th>Area Path</th><th>Iteration Path</th><th>Status</th></tr></thead><tbody>
-      ${pv.places.map((p) => `<tr><td class="num">${p.count}</td><td>${esc(p.area)}</td><td>${esc(p.iteration)}</td>
-        <td class="${p.iteration_exists === false ? "note" : "soft"}">${p.iteration_exists === false ? "Will be created & subscribed during migration" : p.iteration_exists ? "Exists in ADO" : ""}</td></tr>`).join("")}
+    const boardsInfo = (pv.boards_to_areas && Array.isArray(pv.boards) && pv.boards.length)
+      ? `<p class="soft">Per-board organization enabled for <b>${esc(plural(pv.boards.length, "Jira board"))}</b> (${esc(pv.boards.map((b) => b.area || b.name).join(", "))})${pv.create_board_teams ? " · ADO Teams will be auto-created and configured per board." : "."}</p>`
+      : "";
+    return `${boardsInfo}<table><thead><tr><th>Items</th><th>Area Path</th><th>Iteration Path</th><th>Status</th></tr></thead><tbody>
+      ${pv.places.map((p) => {
+        const needArea = p.area_exists === false;
+        const needIter = p.iteration_exists === false;
+        let statusText = "";
+        if (needArea && needIter) statusText = "Area & Iteration will be created during migration";
+        else if (needArea) statusText = "Area will be created during migration";
+        else if (needIter) statusText = "Iteration will be created & subscribed during migration";
+        else if (p.iteration_exists) statusText = "Exists in ADO";
+        return `<tr><td class="num">${p.count}</td><td>${esc(p.area)}</td><td>${esc(p.iteration)}</td>
+        <td class="${(needArea || needIter) ? "note" : "soft"}">${esc(statusText)}</td></tr>`;
+      }).join("")}
       </tbody></table>
       <p class="soft">Migration mode: <b>${esc(pv.mode)}</b> · Links: <b>${esc(pv.links)}</b>.</p>
       ${files["duplicates.csv"] ? `<div class="row"><button class="btn secondary btn-sm" type="button" data-action="download-file" data-path="${esc(files["duplicates.csv"])}" data-name="duplicates.csv">Download Duplicate Report CSV</button></div>` : ""}`;
@@ -1202,9 +1530,12 @@ function renderDrawer() {
           <li><b>Azure DevOps PAT (Personal Access Token)</b>: Create one in Azure DevOps under <i>User Settings → Personal access tokens</i> with minimum scopes:
             <ul>
               <li><b>Work Items</b>: <i>Read &amp; write</i> (required)</li>
-              <li><b>Project and team</b>: <i>Read &amp; write</i> (optional — only needed when auto-creating sprint iterations and subscribing team boards)</li>
+              <li><b>Project and team</b>: <i>Read &amp; write</i> (optional — needed for auto-creating per-board ADO Teams and subscribing sprint boards)</li>
+              <li><b>Test Management</b>: <i>Read &amp; write</i> (optional — needed for migrating Zephyr Test Cycles &amp; Folders into Azure Test Plans &amp; Suites; requires Basic + Test Plans license)</li>
             </ul>
           </li>
+          <li><b>Zephyr Squad API Keys (Optional)</b>: Inside Jira, open <i>Apps → Zephyr Squad → API Keys</i> to generate an Access Key and Secret Key.</li>
+          <li><b>Local <code>.env</code> File (Git-Ignored)</b>: Copy <code>.env.example</code> to <code>.env</code> to auto-load Jira, ADO, and Zephyr keys into memory on startup without ever committing secrets to GitHub.</li>
         </ul>
 
         <h3>2. Enabling "Bypass Rules" in Azure DevOps</h3>
@@ -1285,6 +1616,20 @@ function renderDrawer() {
           <ul>
             ${t.matches.map((m) => `<li><b>#${esc(m.id)}</b> (${esc(m.kind)}, State: ${esc(m.state || "—")}): ${esc(m.title)}</li>`).join("")}
           </ul>` : ""}
+
+        ${((t._fullZephyrSteps || t.zephyr_steps_preview || []).length) ? `
+          <h3>Zephyr Test Steps (${esc((t._fullZephyrSteps || t.zephyr_steps_preview).length)}${!t._fullZephyrSteps && t.test_steps > 20 ? ` of ${esc(t.test_steps)}` : ""})</h3>
+          <table>
+            <thead><tr><th>#</th><th>Action &amp; Test Data</th><th>Expected Result</th></tr></thead>
+            <tbody>
+              ${(t._fullZephyrSteps || t.zephyr_steps_preview).map((st, idx) => `
+                <tr>
+                  <td class="num">${esc(st.order || idx + 1)}</td>
+                  <td>${esc(st.step || "")}${st.data ? `<div class="sub"><b>Data:</b> ${esc(st.data)}</div>` : ""}</td>
+                  <td>${esc(st.result || "")}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>` : ""}
 
         <h3>Rendered Description Preview</h3>
         <iframe class="html-preview-frame" sandbox="" title="Rendered Description Preview" srcdoc="${esc(safeDescriptionSrcdoc(t.description_html))}"></iframe>
@@ -1409,6 +1754,12 @@ async function connect(form) {
   const jt = form.querySelector("#jira-token").value.trim();
   const aUrl = form.querySelector("#ado-url").value.trim();
   const at = form.querySelector("#ado-token").value.trim();
+  const zAkEl = form.querySelector("#zephyr-access-key");
+  const zSkEl = form.querySelector("#zephyr-secret-key");
+  const zUrlEl = form.querySelector("#zephyr-url");
+  const zAk = zAkEl ? zAkEl.value.trim() : "";
+  const zSk = zSkEl ? zSkEl.value.trim() : "";
+  const zUrl = zUrlEl ? zUrlEl.value.trim() : "";
   if (!email || !jt || !at || !jUrl || !aUrl) {
     S.problems = {
       jira: !jUrl || !email || !jt ? "Fill in the Jira URL, email, and API token." : "",
@@ -1431,11 +1782,16 @@ async function connect(form) {
   try {
     const d = await api("/api/connect", {
       jira_url: jUrl, jira_email: email, jira_token: jt, ado_url: aUrl, ado_token: at,
+      zephyr_access_key: zAk, zephyr_secret_key: zSk, zephyr_base_url: zUrl,
     });
     S.jira = d.jira;
     S.ado = d.ado;
+    S.zephyr = d.zephyr || null;
+    S.connectedFromEnv = Boolean(d.connected_from_env);
+    if (S.zephyr) S.includeZephyr = true;
     S.jiraUrl = d.jira_url || jUrl;
     S.adoUrl = d.ado_url || aUrl;
+    S.zephyrUrl = d.zephyr_url || zUrl;
     S.problems = d.problems || {};
     S.settings.jira_email = email;
     S.settings.jira_url = S.jiraUrl;
@@ -1450,6 +1806,53 @@ async function connect(form) {
   }
   S.connecting = false;
   render();
+}
+
+async function connectFromEnv() {
+  S.connecting = true;
+  S.problems = {};
+  render();
+  try {
+    const d = await api("/api/connect-env", {});
+    S.jira = d.jira;
+    S.ado = d.ado;
+    S.zephyr = d.zephyr || null;
+    S.connectedFromEnv = Boolean(d.connected_from_env);
+    if (S.zephyr) S.includeZephyr = true;
+    S.jiraUrl = d.jira_url || S.jiraUrl;
+    S.adoUrl = d.ado_url || S.adoUrl;
+    S.zephyrUrl = d.zephyr_url || S.zephyrUrl;
+    S.problems = d.problems || {};
+    if (connected() && !Object.keys(S.problems).length) {
+      S.editConnect = false;
+      loadProjects();
+      loadTargets();
+      toast(`Connected using local ${S.envFileName || ".env"} file.`);
+    }
+  } catch (e) {
+    S.problems = { jira: e.message };
+  }
+  S.connecting = false;
+  render();
+}
+
+async function startSyncZephyr() {
+  if (!S.run || !S.run.config) return;
+  S.error = "";
+  try {
+    S.job = await api("/api/sync-zephyr", {
+      config: S.run.config,
+      include_test_plans: S.includeTestPlans,
+    });
+    S.log = [];
+    S.since = 0;
+    S.phase = "syncing_zephyr";
+    S.tab = "log";
+    render();
+    poll();
+  } catch (e) {
+    toast(e.message);
+  }
 }
 
 async function loadSavedRuns() {
@@ -1471,6 +1874,10 @@ async function applyRecoveredRun(runObj) {
   if (typeof rInfo.include_done === "boolean") S.includeDone = rInfo.include_done;
   if (typeof rInfo.include_hierarchy === "boolean") S.includeHierarchy = rInfo.include_hierarchy;
   if (typeof rInfo.history === "boolean") S.historyMode = rInfo.history;
+  if (typeof rInfo.boards_to_areas === "boolean") S.boardsToAreas = rInfo.boards_to_areas;
+  if (typeof rInfo.create_board_teams === "boolean") S.createBoardTeams = rInfo.create_board_teams;
+  if (typeof rInfo.include_zephyr === "boolean") S.includeZephyr = rInfo.include_zephyr;
+  if (typeof rInfo.include_test_plans === "boolean") S.includeTestPlans = rInfo.include_test_plans;
   if (rInfo.iteration) {
     S.iterMode = "one";
     S.iteration = rInfo.iteration;
@@ -1561,6 +1968,10 @@ async function startCheck(resumeOnly = false) {
       include_done: S.includeDone,
       include_hierarchy: S.includeHierarchy,
       history: S.historyMode,
+      boards_to_areas: S.pageMode === "project" ? S.boardsToAreas : false,
+      create_board_teams: S.pageMode === "project" ? (S.boardsToAreas && S.createBoardTeams) : false,
+      include_zephyr: Boolean(S.zephyr && S.includeZephyr),
+      include_test_plans: Boolean(S.zephyr && S.includeZephyr && S.includeTestPlans),
       force_export: resumeOnly ? false : S.forceExport,
     });
     S.phase = "checking";
@@ -1604,6 +2015,7 @@ async function startImport() {
     S.log = [];
     S.since = 0;
     S.phase = "importing";
+    initMigrationProgressSession(S.job);
     render();
     poll();
   } catch (e) {
@@ -1710,6 +2122,10 @@ async function poll() {
       if (d.result && d.result.run) S.run = { ...d.result.run, preview: S.run.preview };
       S.phase = "checked";
       toast(d.status === "done" ? "Rollback completed. Work items created in this run were removed." : (d.error || "Rollback failed."));
+    } else if (d.kind === "sync_zephyr") {
+      if (d.result && d.result.run) S.run = { ...d.result.run, preview: (d.result.run.preview || S.run.preview) };
+      S.phase = "imported";
+      toast(d.status === "done" ? "Zephyr test steps, Tested By links & Test Plans synced to Azure DevOps." : (d.error || "Zephyr sync failed."));
     } else {
       if (d.result && d.result.run) S.run = { ...d.result.run, preview: S.run.preview };
       if (d.status === "done") {
@@ -1718,7 +2134,7 @@ async function poll() {
       } else if (d.status === "paused") {
         S.phase = "import_paused";
         S.error = "";
-        toast("Migration paused cleanly after finishing the current ticket.");
+        toast("Migration paused cleanly after finishing in-flight tickets.");
       } else if (d.status === "batch_done") {
         S.phase = "batch_done";
         S.error = "";
@@ -1752,6 +2168,8 @@ document.addEventListener("click", async (e) => {
   const action = el.dataset.action;
   if (action === "edit-connect") { S.editConnect = true; S.problems = {}; render(); }
   if (action === "cancel-connect") { S.editConnect = false; render(); }
+  if (action === "connect-env") { connectFromEnv(); return; }
+  if (action === "sync-zephyr") { startSyncZephyr(); return; }
   if (action === "go-mode") {
     e.preventDefault();
     const dest = el.dataset.href || "/";
@@ -1780,7 +2198,7 @@ document.addEventListener("click", async (e) => {
   if (action === "pause" && S.job) {
     try {
       await api(`/api/jobs/${S.job.id}/pause`, {});
-      toast("Pausing after the current ticket finishes...");
+      toast(S.phase === "importing" ? "Pausing after in-flight tickets finish..." : "Pausing validation cleanly...");
     } catch (err) {
       toast(err.message);
     }
@@ -1795,11 +2213,12 @@ document.addEventListener("click", async (e) => {
     renderDrawer();
     if (S.run && S.run.config && S.run.preview) {
       const t = S.run.preview.tickets.find((x) => x.key === S.drawerTicketKey);
-      if (t && !t._fullDescLoaded && (t.description_html || "").length >= 790) {
+      if (t && !t._fullDescLoaded && ((t.description_html || "").length >= 790 || (t.test_steps || 0) > 20)) {
         try {
           const detail = await api(`/api/ticket?config=${encodeURIComponent(S.run.config)}&key=${encodeURIComponent(t.key)}`);
-          if (detail && detail.description_html !== undefined) {
-            t.description_html = detail.description_html;
+          if (detail) {
+            if (detail.description_html !== undefined) t.description_html = detail.description_html;
+            if (Array.isArray(detail.zephyr_steps)) t._fullZephyrSteps = detail.zephyr_steps;
             t._fullDescLoaded = true;
             if (S.drawerMode === "ticket" && S.drawerTicketKey === t.key) renderDrawer();
           }
@@ -1916,6 +2335,10 @@ document.addEventListener("change", (e) => {
   if (action === "include-done") { S.includeDone = el.checked; render(); }
   if (action === "include-hierarchy") { S.includeHierarchy = el.checked; render(); }
   if (action === "history-mode") { S.historyMode = el.checked; render(); }
+  if (action === "boards-to-areas") { S.boardsToAreas = el.checked; render(); }
+  if (action === "create-board-teams") { S.createBoardTeams = el.checked; render(); }
+  if (action === "include-zephyr") { S.includeZephyr = el.checked; render(); }
+  if (action === "include-test-plans") { S.includeTestPlans = el.checked; render(); }
   if (action === "force-export") { S.forceExport = el.checked; render(); }
   if (action === "select-batch-size") { S.batchSize = el.value; render(); }
   if (action === "select-page-size") { S.pageSize = parseInt(el.value, 10) || 0; S.page = 1; renderManifest(); }
@@ -2003,8 +2426,14 @@ async function init() {
     const d = await api("/api/state");
     S.jira = d.jira;
     S.ado = d.ado;
+    S.zephyr = d.zephyr || null;
+    S.hasEnvFile = Boolean(d.has_env_file);
+    S.envFileName = d.env_file_name || "";
+    S.connectedFromEnv = Boolean(d.connected_from_env);
+    if (S.zephyr) S.includeZephyr = true;
     S.jiraUrl = d.jira_url || "";
     S.adoUrl = d.ado_url || "";
+    S.zephyrUrl = d.zephyr_url || "";
     S.settings = d.settings || {};
     if (connected()) {
       loadProjects();

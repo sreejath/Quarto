@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -26,9 +27,11 @@ def iso(dt):
 
 
 def bump(dt, last):
-    """ADO needs every revision date (at millisecond precision) to be later than the one before it."""
-    if last and (dt <= last or iso(dt) <= iso(last)):
-        dt = last + timedelta(milliseconds=1)
+    """ADO stores System.ChangedDate in SQL Server DATETIME (1/300s = 3.33ms ticks: .xx0, .xx3, .xx7),
+    rounding .xx5Z up to .xx7Z. Stepping by 10ms (>= 3 SQL ticks) guarantees strictly increasing dates."""
+    min_next = (last + timedelta(milliseconds=10)) if last else None
+    if min_next and (dt < min_next or iso(dt) <= iso(last)):
+        dt = min_next
     return dt
 
 
@@ -92,12 +95,18 @@ class Journal:
 
     def __init__(self, path, readonly=False):
         self.path = path
+        self._lock = threading.RLock()
         self.items = {}       # key -> {"id": int, "revs": int, "last": iso, "links": bool}
         self.held = {}        # key -> why it was left out (a possible duplicate)
         self.atts = {}        # jira attachment id -> ado url
-        self.synced = {}      # key -> {"id": int, "before_fields": dict, "before_rel_urls": list}
+        self.synced = {}      # key -> {"id": int, "before_fields": dict, "before_rel_urls": list, "added_rel_urls": list|None}
         self.iterations = set()
         self.areas = set()
+        self.teams = set()
+        self.test_plans = {}   # plan_key -> {"id": int, "root_suite_id": int, "name": str}
+        self.test_suites = {}  # suite_key -> {"plan_id": int, "id": int, "name": str}
+        self.suite_cases = {}  # str(suite_id) -> set of ADO work item IDs
+        self.coalesced_noops = None
         if os.path.exists(path):
             with open(path, encoding="utf-8") as fh:
                 for line in fh:
@@ -128,6 +137,17 @@ class Journal:
             self.iterations.add(e["n"])
         elif e["t"] == "area":
             self.areas.add(e["n"])
+        elif e["t"] == "team":
+            self.teams.add(e["n"])
+        elif e["t"] == "tplan":
+            self.test_plans[e["k"]] = {"id": e["id"], "root_suite_id": e.get("root_suite_id"), "name": e.get("n", "")}
+        elif e["t"] == "tsuite":
+            self.test_suites[e["k"]] = {"plan_id": e["plan_id"], "id": e["id"], "name": e.get("n", "")}
+        elif e["t"] == "tsuite_cases":
+            skey = str(e["suite_id"])
+            self.suite_cases.setdefault(skey, set()).update(int(x) for x in (e.get("ids") or []))
+        elif e["t"] == "mode":
+            self.coalesced_noops = bool(e.get("coalesced_noops"))
         elif e["t"] == "sync":
             if e["k"] not in self.synced:
                 self.synced[e["k"]] = {
@@ -135,17 +155,27 @@ class Journal:
                     "before_fields": e.get("before_fields") or {},
                     "after_fields": e.get("after_fields") or {},
                     "before_rel_urls": list(e.get("before_rel_urls") or []),
+                    "added_rel_urls": list(e.get("added_rel_urls")) if "added_rel_urls" in e else None,
                 }
+            elif e.get("added_rel_urls"):
+                cur_added = self.synced[e["k"]].get("added_rel_urls")
+                if cur_added is not None:
+                    for u in e["added_rel_urls"]:
+                        if u not in cur_added:
+                            cur_added.append(u)
 
     def log(self, **e):
-        self._apply(e)
-        self._fh.write(json.dumps(e) + "\n")
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
+        with self._lock:
+            self._apply(e)
+            self._fh.write(json.dumps(e) + "\n")
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
 
     def close(self):
-        if self._fh:
-            self._fh.close()
+        with self._lock:
+            if self._fh:
+                self._fh.close()
+                self._fh = None
 
 
 def backoff_sleep(attempt, retry_after=None):

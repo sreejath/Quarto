@@ -6,7 +6,8 @@ import os
 import re
 from datetime import datetime, timezone
 
-from .util import read_json, write_json
+from .util import name_key, node_name, read_json, write_json
+from .zephyr import is_test_case_issue
 
 
 def issue_path(export_dir, key):
@@ -43,21 +44,88 @@ def _has_dev_status(issue, meta=None):
     return True
 
 
-def _export_single_issue(jira, key, out, m, force=False, expected_updated=None, meta=None, log=print):
+def _attachments_complete(cached, out):
+    """Return True only when every issue and Zephyr step attachment on a cached issue exists on disk."""
+    for att in ((cached or {}).get("fields") or {}).get("attachment") or []:
+        rel = att.get("local_path")
+        if not rel or not os.path.exists(os.path.join(out, rel)):
+            return False
+    for st in (cached or {}).get("zephyr_steps") or []:
+        for att in st.get("attachments") or []:
+            rel = att.get("local_path")
+            if not rel or not os.path.exists(os.path.join(out, rel)):
+                return False
+    return True
+
+
+def _zephyr_steps_ready(cached, cfg, zephyr):
+    """Return True if Zephyr is not active, issue is not a Test Case, or zephyr_steps were already fetched."""
+    if zephyr is None:
+        return True
+    if not is_test_case_issue(cached, cfg):
+        return True
+    return isinstance((cached or {}).get("zephyr_steps"), list)
+
+
+def _attach_zephyr_steps(zephyr, issue, out, cfg, meta=None, log=print):
+    """Fetch Zephyr Squad test steps and step-level attachments for a Jira Test issue."""
+    if zephyr is None or not is_test_case_issue(issue, cfg):
+        return False
+    key = issue.get("key") or ""
+    issue_id = issue.get("id")
+    project_id = ((issue.get("fields") or {}).get("project") or {}).get("id") or (meta or {}).get("project_id")
+    if not (issue_id and project_id):
+        return False
+    steps = zephyr.test_steps(issue_id, project_id) or []
+    zcfg = (cfg or {}).get("zephyr") or {}
+    if zcfg.get("include_step_attachments", True) and getattr(zephyr, "step_attachments", None):
+        for st in steps:
+            step_atts = zephyr.step_attachments(st["id"], issue_id, project_id) or []
+            saved = []
+            for att in step_atts:
+                clean_name = re.sub(r"[^\w.\-]+", "_", att["filename"])
+                local = os.path.join("attachments", key, f'zstep_{st["id"]}_{att["id"]}_{clean_name}')
+                dest = os.path.join(out, local)
+                entry = dict(att)
+                if not os.path.exists(dest):
+                    try:
+                        zephyr.download_attachment(att["id"], st["id"], issue_id, project_id, dest)
+                    except Exception as e:
+                        log(f"  {key}: Zephyr step attachment {att['filename']} failed: {e}")
+                        saved.append(entry)
+                        continue
+                entry["local_path"] = local
+                saved.append(entry)
+            st["attachments"] = saved
+    issue["zephyr_steps"] = steps
+    return True
+
+
+def _export_single_issue(jira, key, out, m, force=False, expected_updated=None, meta=None, log=print,
+                         prefetched_issue=None, cfg=None, zephyr=None):
     path = issue_path(out, key)
     cached = read_json(path) if (os.path.exists(path) and not force) else None
-    if cached is not None and expected_updated is not None:
+    if cached is not None and expected_updated is not None and _attachments_complete(cached, out):
         cached_updated = (cached.get("fields") or {}).get("updated")
         if cached_updated and cached_updated == expected_updated:
-            return cached, False
-    issue = jira.issue(key)
-    if cached is not None and expected_updated is None:
+            if _zephyr_steps_ready(cached, cfg, zephyr):
+                return cached, False
+            # Fast-path: Jira issue unchanged, only enrich with Zephyr steps without re-fetching Jira
+            _attach_zephyr_steps(zephyr, cached, out, cfg, meta=meta, log=log)
+            write_json(path, cached)
+            return cached, True
+    issue = prefetched_issue if prefetched_issue is not None else jira.issue(key)
+    if cached is not None and expected_updated is None and _attachments_complete(cached, out):
         live_updated = (issue.get("fields") or {}).get("updated")
         cached_updated = (cached.get("fields") or {}).get("updated")
         live_status = ((issue.get("fields") or {}).get("status") or {}).get("name")
         cached_status = ((cached.get("fields") or {}).get("status") or {}).get("name")
         if live_updated and live_updated == cached_updated and live_status == cached_status:
-            return cached, False
+            if _zephyr_steps_ready(cached, cfg, zephyr):
+                return cached, False
+            _attach_zephyr_steps(zephyr, cached, out, cfg, meta=meta, log=log)
+            write_json(path, cached)
+            return cached, True
 
     # Use inline expanded changelog when complete; otherwise fetch full paged changelog
     cl = issue.get("changelog")
@@ -128,6 +196,11 @@ def _export_single_issue(jira, key, out, m, force=False, expected_updated=None, 
                 log(f"  {key}: attachment {att['filename']} failed: {e}")
                 continue
         att["local_path"] = local
+    if zephyr is not None:
+        try:
+            _attach_zephyr_steps(zephyr, issue, out, cfg, meta=meta, log=log)
+        except Exception as e:
+            log(f"  {key}: Zephyr test steps fetch failed: {e}")
     write_json(path, issue)  # written last, so a present file means a complete issue
     return issue, True
 
@@ -152,7 +225,268 @@ def search_run_keys(jira, cfg):
     return [k for k, _ in search_run_key_timestamps(jira, cfg)]
 
 
-def export(jira, cfg, force=False, log=print):
+def _infer_project_key(cfg, keys):
+    proj = ((cfg.get("run") or {}).get("from") or "").strip().upper()
+    if proj:
+        return proj
+    jql = (cfg.get("jira") or {}).get("jql") or ""
+    m = re.search(r'\bproject\s*=\s*"?([A-Za-z][A-Za-z0-9_]*)"?', jql, re.I)
+    if m:
+        return m.group(1).upper()
+    prefixes = {k.rpartition("-")[0] for k in (keys or ()) if "-" in k}
+    if len(prefixes) == 1:
+        return next(iter(prefixes))
+    return ""
+
+
+def _board_sort_key(counts, bid_s):
+    return (counts.get(bid_s, 0), int(bid_s) if bid_s.isdigit() else 0, bid_s)
+
+
+def _assign_ticket_boards(target_keys, board_raw_keys, area_by_bid):
+    key_set = set(target_keys)
+    counts = {bid_s: len(raw_set & key_set) for bid_s, raw_set in board_raw_keys.items()}
+    ticket_boards = {}
+    for k in target_keys:
+        matches = [bid_s for bid_s, raw_set in board_raw_keys.items() if k in raw_set and bid_s in area_by_bid]
+        if matches:
+            best = min(matches, key=lambda bid_s: _board_sort_key(counts, bid_s))
+            ticket_boards[k] = area_by_bid[best]
+    return ticket_boards, counts
+
+
+def _discover_project_boards(jira, cfg, keys, meta, log=print):
+    """Discover project boards, their sprint ownership, and ticket-to-board mapping for boards_to_areas."""
+    meta["boards"] = []
+    meta["sprint_boards"] = {}
+    meta["ticket_boards"] = {}
+    project_key = _infer_project_key(cfg, keys)
+    if not project_key or not getattr(jira, "boards", None):
+        return {}, {}
+    try:
+        raw_boards = jira.boards(project_key) or []
+    except Exception as e:
+        log(f"  Warning: could not list Jira boards for project {project_key}: {e}")
+        return {}, {}
+    if not raw_boards:
+        log(f"  No Jira boards found for project {project_key}; items will use the target project root.")
+        return {}, {}
+
+    norm_counts = {}
+    for b in raw_boards:
+        clean = node_name(b.get("name") or f"Board {b.get('id')}")
+        nk = name_key(clean)
+        norm_counts[nk] = norm_counts.get(nk, 0) + 1
+
+    boards_meta, area_by_bid = [], {}
+    for b in raw_boards:
+        bid = b.get("id")
+        raw_name = b.get("name") or f"Board {bid}"
+        clean = node_name(raw_name)
+        area = f"{clean} ({bid})" if (norm_counts.get(name_key(clean), 0) > 1 and bid is not None) else clean
+        boards_meta.append({"id": bid, "name": raw_name, "type": b.get("type", "scrum"), "area": area})
+        if bid is not None:
+            area_by_bid[str(bid)] = area
+
+    board_raw_keys = {}
+    for b in boards_meta:
+        bid = b["id"]
+        if bid is None:
+            continue
+        bid_s = str(bid)
+        matched = set()
+        bf_jql = None
+        if getattr(jira, "board_filter_jql", None):
+            try:
+                bf_jql = jira.board_filter_jql(bid)
+            except Exception:
+                bf_jql = None
+        if bf_jql and getattr(jira, "search_keys", None):
+            scoped_jql = f'({bf_jql}) AND project = "{project_key}"'
+            try:
+                matched = set(jira.search_keys(scoped_jql))
+            except Exception as e:
+                log(f"  Warning: board '{b['name']}' filter query failed ({e}); falling back to board issues")
+                bf_jql = None
+        if not bf_jql and getattr(jira, "board_keys", None):
+            try:
+                matched = set(jira.board_keys(bid))
+            except Exception as e:
+                log(f"  Warning: could not list issues for board '{b['name']}': {e}")
+        board_raw_keys[bid_s] = matched
+
+    ticket_boards, counts = _assign_ticket_boards(keys, board_raw_keys, area_by_bid)
+
+    sprints_by_id = {}
+    sprint_candidates = {}
+    sprint_origin = {}
+
+    def _record_sprint(sp, owner_bid_s=None):
+        if not isinstance(sp, dict):
+            return
+        sid = sp.get("id") if sp.get("id") is not None else sp.get("number")
+        if sid is None:
+            return
+        sid_s = str(sid)
+        cur = sprints_by_id.get(sid_s)
+        if cur is None:
+            sprints_by_id[sid_s] = dict(sp)
+        else:
+            for k, v in sp.items():
+                if v not in (None, "", []):
+                    cur.setdefault(k, v)
+        if owner_bid_s is not None:
+            sprint_candidates.setdefault(sid_s, set()).add(owner_bid_s)
+        for bid in sp.get("board_ids") or []:
+            if bid is not None:
+                sprint_candidates.setdefault(sid_s, set()).add(str(bid))
+        orig = sp.get("originBoardId")
+        if orig is not None:
+            sprint_origin[sid_s] = str(orig)
+
+    for sp in meta.get("sprints") or []:
+        _record_sprint(sp)
+
+    if getattr(jira, "board_sprints", None):
+        for b in boards_meta:
+            bid = b["id"]
+            if bid is None:
+                continue
+            bid_s = str(bid)
+            try:
+                try:
+                    bsp_list = jira.board_sprints(bid, board_name=b["name"]) or []
+                except TypeError:
+                    bsp_list = jira.board_sprints(bid) or []
+            except Exception:
+                bsp_list = []
+            for sp in bsp_list:
+                _record_sprint(sp, owner_bid_s=bid_s)
+
+    sprint_boards = {}
+    for sid_s in set(sprint_candidates) | set(sprint_origin):
+        orig_bid = sprint_origin.get(sid_s)
+        if orig_bid and orig_bid in area_by_bid:
+            sprint_boards[sid_s] = area_by_bid[orig_bid]
+            continue
+        cands = [bid_s for bid_s in sprint_candidates.get(sid_s, ()) if bid_s in area_by_bid]
+        if cands:
+            best = min(cands, key=lambda bid_s: _board_sort_key(counts, bid_s))
+            sprint_boards[sid_s] = area_by_bid[best]
+
+    meta["boards"] = boards_meta
+    meta["sprint_boards"] = sprint_boards
+    meta["ticket_boards"] = ticket_boards
+    if sprints_by_id:
+        meta["sprints"] = list(sprints_by_id.values())
+    log(f"Boards mapped for per-board Areas/Iterations ({len(boards_meta)}): " + ", ".join(b["area"] for b in boards_meta))
+    return board_raw_keys, area_by_bid
+
+
+def export_zephyr_cycles(jira, zephyr, cfg, out, meta, keys=None, log=print):
+    """Export Zephyr Squad Test Cycles, Folders, and test-case memberships into export/zephyr-cycles.json."""
+    zcfg = (cfg or {}).get("zephyr") or {}
+    if zephyr is None or not zcfg.get("include_test_plans", True):
+        return None
+    project_key = _infer_project_key(cfg, keys or [])
+    project_id = (meta or {}).get("project_id")
+    if not project_id and project_key and getattr(jira, "project_info", None):
+        try:
+            project_id = (jira.project_info(project_key) or {}).get("id")
+        except Exception:
+            project_id = None
+    if not project_id:
+        log("  Warning: could not determine Jira numeric project ID; skipping Zephyr Test Cycles export.")
+        return None
+
+    versions = []
+    if project_key and getattr(jira, "project_versions", None):
+        try:
+            versions = list(jira.project_versions(project_key) or [])
+        except Exception as e:
+            log(f"  Warning: could not list Jira versions for {project_key}: {e}")
+    versions.append({"id": "-1", "name": "Unscheduled", "startDate": "", "releaseDate": "", "description": ""})
+
+    exported_versions = []
+    total_cycles = total_folders = 0
+    for v in versions:
+        vid = str(v["id"])
+        try:
+            cyc_list = zephyr.cycles(project_id, version_id=vid) or []
+        except Exception as e:
+            log(f"  Warning: could not fetch Zephyr cycles for version '{v['name']}': {e}")
+            continue
+        if not cyc_list:
+            continue
+        out_cycles = []
+        for c in cyc_list:
+            cid = str(c["id"])
+            folder_entries = []
+            folder_keys_seen = set()
+            if getattr(zephyr, "folders", None):
+                try:
+                    raw_folders = zephyr.folders(cid, project_id, version_id=vid) or []
+                except Exception:
+                    raw_folders = []
+                for fld in raw_folders:
+                    fkeys = []
+                    if getattr(zephyr, "folder_execution_keys", None):
+                        try:
+                            fkeys = list(zephyr.folder_execution_keys(fld["id"], cid, project_id, version_id=vid) or [])
+                        except Exception:
+                            fkeys = []
+                    folder_keys_seen.update(fkeys)
+                    folder_entries.append({
+                        "id": str(fld["id"]),
+                        "name": fld["name"],
+                        "description": fld.get("description") or "",
+                        "keys": fkeys,
+                    })
+                    total_folders += 1
+            direct_keys = []
+            if getattr(zephyr, "cycle_execution_keys", None):
+                try:
+                    all_ckeys = list(zephyr.cycle_execution_keys(cid, project_id, version_id=vid) or [])
+                except Exception:
+                    all_ckeys = []
+                direct_keys = [k for k in all_ckeys if k not in folder_keys_seen]
+            out_cycles.append({
+                "id": cid,
+                "name": c["name"],
+                "description": c.get("description") or "",
+                "startDate": c.get("startDate") or "",
+                "endDate": c.get("endDate") or "",
+                "direct_keys": direct_keys,
+                "folders": folder_entries,
+            })
+            total_cycles += 1
+        exported_versions.append({
+            "id": vid,
+            "name": v["name"],
+            "startDate": v.get("startDate") or "",
+            "releaseDate": v.get("releaseDate") or "",
+            "description": v.get("description") or "",
+            "cycles": out_cycles,
+        })
+
+    payload = {
+        "project_key": project_key,
+        "project_id": str(project_id),
+        "versions": exported_versions,
+    }
+    write_json(os.path.join(out, "zephyr-cycles.json"), payload)
+    meta["zephyr"] = {
+        "enabled": True,
+        "provider": zcfg.get("provider", "squad"),
+        "versions": len(exported_versions),
+        "cycles": total_cycles,
+        "folders": total_folders,
+    }
+    log(f"Zephyr Squad cycles exported: {len(exported_versions)} version(s), {total_cycles} cycle(s), {total_folders} folder(s).")
+    return payload
+
+
+def export(jira, cfg, force=False, log=print, zephyr=None):
     out = cfg["paths"]["export_dir"]
     state_folder = cfg["paths"].get("state_dir") or out
     pause_file = os.path.join(state_folder, ".pause")
@@ -190,6 +524,18 @@ def export(jira, cfg, force=False, log=print):
     keys = [k for k, _ in key_ts]
     live_updated = {k: ts for k, ts in key_ts}
     meta["rank_order"] = {k: idx + 1 for idx, k in enumerate(keys)}
+    if zephyr is not None:
+        proj_key = _infer_project_key(cfg, keys)
+        if proj_key and getattr(jira, "project_info", None):
+            try:
+                pinfo = jira.project_info(proj_key) or {}
+                if pinfo.get("id"):
+                    meta["project_id"] = str(pinfo["id"])
+            except Exception:
+                pass
+    board_raw_keys, area_by_bid = {}, {}
+    if m.get("boards_to_areas"):
+        board_raw_keys, area_by_bid = _discover_project_boards(jira, cfg, keys, meta, log=log)
     write_json(os.path.join(out, "meta.json"), meta)
     write_json(os.path.join(out, "keys.json"), keys)
 
@@ -209,8 +555,9 @@ def export(jira, cfg, force=False, log=print):
                     seen_keys.add(st_key)
                     extra_keys.append(st_key)
 
-    # Process in chunks of 16 across up to 8 worker threads so .pause is checked promptly and exports run concurrently
-    chunk_size = 16
+    # Process in chunks of 50 (matching bulk /search/jql page size) across up to 8 worker threads so .pause is checked promptly
+    chunk_size = 50
+    batch_fn = getattr(jira, "search_issues_batch", None)
     for start_idx in range(0, len(keys), chunk_size):
         if os.path.exists(pause_file):
             try:
@@ -230,7 +577,8 @@ def export(jira, cfg, force=False, log=print):
             exp_ts = live_updated.get(key)
             if not force and exp_ts is not None and os.path.exists(path):
                 cached = read_json(path)
-                if cached and (cached.get("fields") or {}).get("updated") == exp_ts:
+                if (cached and (cached.get("fields") or {}).get("updated") == exp_ts
+                        and _attachments_complete(cached, out) and _zephyr_steps_ready(cached, cfg, zephyr)):
                     skipped += 1
                     _record_hierarchy(cached)
                     continue
@@ -245,10 +593,27 @@ def export(jira, cfg, force=False, log=print):
             raise SystemExit(2)
         if not to_fetch:
             continue
+        prefetched = {}
+        # Only batch-fetch from Jira keys that don't already have an up-to-date local Jira issue (needing only Zephyr steps)
+        jira_fetch_keys = []
+        for key in to_fetch:
+            path = issue_path(out, key)
+            exp_ts = live_updated.get(key)
+            if not force and exp_ts is not None and os.path.exists(path):
+                cached = read_json(path)
+                if cached and (cached.get("fields") or {}).get("updated") == exp_ts and _attachments_complete(cached, out):
+                    continue
+            jira_fetch_keys.append(key)
+        if batch_fn and len(jira_fetch_keys) > 1:
+            try:
+                prefetched = batch_fn(jira_fetch_keys) or {}
+            except Exception:
+                prefetched = {}
         if len(to_fetch) == 1:
             key = to_fetch[0]
             issue, is_new = _export_single_issue(
-                jira, key, out, m, force=force, expected_updated=live_updated.get(key), meta=meta, log=log
+                jira, key, out, m, force=force, expected_updated=live_updated.get(key), meta=meta, log=log,
+                prefetched_issue=prefetched.get(key), cfg=cfg, zephyr=zephyr,
             )
             if is_new:
                 done += 1
@@ -262,7 +627,8 @@ def export(jira, cfg, force=False, log=print):
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
                     (key, pool.submit(
-                        _export_single_issue, jira, key, out, m, force, live_updated.get(key), meta, log
+                        _export_single_issue, jira, key, out, m, force, live_updated.get(key), meta, log,
+                        prefetched.get(key), cfg, zephyr,
                     ))
                     for key in to_fetch
                 ]
@@ -278,7 +644,9 @@ def export(jira, cfg, force=False, log=print):
 
     for key in extra_keys:
         try:
-            issue, is_new = _export_single_issue(jira, key, out, m, force=force, meta=meta, log=log)
+            issue, is_new = _export_single_issue(
+                jira, key, out, m, force=force, meta=meta, log=log, cfg=cfg, zephyr=zephyr
+            )
             if issue:
                 issue["hierarchy_auto_included"] = True
                 write_json(issue_path(out, key), issue)
@@ -290,6 +658,14 @@ def export(jira, cfg, force=False, log=print):
                 log(f"  auto-included hierarchy issue {key} ({issue['fields']['issuetype']['name']})")
         except Exception as e:
             log(f"  could not auto-include hierarchy issue {key}: {e}")
+
+    if zephyr is not None:
+        export_zephyr_cycles(jira, zephyr, cfg, out, meta, keys=keys, log=log)
+        write_json(os.path.join(out, "meta.json"), meta)
+
+    if extra_keys and m.get("boards_to_areas") and board_raw_keys:
+        meta["ticket_boards"], _ = _assign_ticket_boards(keys, board_raw_keys, area_by_bid)
+        write_json(os.path.join(out, "meta.json"), meta)
 
     write_json(os.path.join(out, "keys.json"), keys)
     log(f"Export finished. {done} new, {skipped} already on disk.")

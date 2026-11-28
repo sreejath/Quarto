@@ -172,6 +172,76 @@ input:focus, select:focus { border-color: var(--carbon); }
 .live { margin: 12px 0 4px; padding: 10px 12px; background: var(--carbon-wash); border-radius: 6px; font-size: var(--s2); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .live .last { font-family: var(--mono); font-size: var(--s1); color: var(--ink-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 240px; min-width: 0; }
 
+/* Live Migration & Validation Progress Card */
+.live-progress-card {
+  margin: 16px 0 12px; padding: 16px 18px; border-radius: 10px;
+  border: 1px solid var(--carbon); background: var(--rail);
+  box-shadow: 0 6px 20px rgba(44, 71, 181, 0.08); display: grid; gap: 12px;
+}
+.live-progress-card.compact { padding: 14px 16px; gap: 10px; }
+.progress-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.progress-title-wrap { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.pulse-dot {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--carbon); flex: none;
+  box-shadow: 0 0 0 0 rgba(44, 71, 181, 0.55); animation: pulseDot 1.8s infinite;
+}
+@keyframes pulseDot {
+  0% { box-shadow: 0 0 0 0 rgba(44, 71, 181, 0.5); }
+  70% { box-shadow: 0 0 0 8px rgba(44, 71, 181, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(44, 71, 181, 0); }
+}
+.progress-title { font-weight: 700; font-size: var(--s3); line-height: 1.25; }
+.progress-subtitle { font-size: var(--s1); color: var(--ink-soft); margin-top: 2px; }
+.progress-bar-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; }
+.progress-track {
+  height: 12px; border-radius: 999px; background: var(--paper); border: 1px solid var(--rule);
+  overflow: hidden; position: relative;
+}
+.progress-track.rail-track { height: 8px; }
+.progress-fill {
+  height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--carbon) 0%, #4b6bfb 50%, var(--green) 100%);
+  transition: width 420ms cubic-bezier(0.22, 1, 0.36, 1); position: relative;
+}
+.progress-fill.active::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.28) 50%, transparent 100%);
+  transform: translateX(-100%); animation: progressShimmer 1.9s infinite;
+}
+@keyframes progressShimmer { 100% { transform: translateX(100%); } }
+.progress-pct { font-weight: 700; font-size: var(--s3); min-width: 52px; text-align: right; color: var(--carbon); }
+.progress-metrics {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px;
+}
+.metric-tile {
+  padding: 10px 12px; border-radius: 8px; background: var(--paper); border: 1px solid var(--rule);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.metric-label { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-soft); }
+.metric-val { font-size: var(--s4); font-weight: 700; line-height: 1.2; color: var(--ink); }
+.metric-val.accent { color: var(--carbon); }
+.metric-dim { font-weight: 500; font-size: var(--s2); color: var(--ink-soft); }
+.metric-sub { font-size: 12px; color: var(--ink-soft); }
+.inflight-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: var(--s1); }
+.inflight-label { font-weight: 600; color: var(--ink-soft); }
+.inflight-pill {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px;
+  background: var(--carbon-wash); color: var(--carbon); font-weight: 600; font-size: 12px;
+}
+.live-ticker {
+  padding-top: 8px; border-top: 1px solid var(--rule); display: flex; align-items: center; min-width: 0;
+}
+.live-ticker .last {
+  font-family: var(--mono); font-size: 12px; color: var(--ink-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%;
+}
+.rail-progress { display: grid; gap: 5px; padding: 8px 10px; border-radius: 6px; background: var(--paper); border: 1px solid var(--rule); }
+.rail-progress-top { display: flex; justify-content: space-between; gap: 8px; font-size: var(--s1); }
+@media (prefers-reduced-motion: reduce) {
+  .pulse-dot, .progress-fill.active::after { animation: none; }
+  .progress-fill { transition: none; }
+}
+
 /* Validation Tickets Table */
 .table-wrap { overflow-x: auto; }
 table.tickets { width: 100%; border-collapse: collapse; margin-top: 4px; }

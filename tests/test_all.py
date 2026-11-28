@@ -1895,6 +1895,9 @@ class CodeReviewRegressionTests(unittest.TestCase):
         write_json(stale_preview, {"issues": 99})
 
         story_v1 = sample.story()
+        for a in story_v1["fields"].get("attachment") or []:
+            a.pop("local_path", None)
+            a["content"] = f"https://demo.atlassian.net/rest/api/3/attachment/content/{a['id']}"
         sub_v1 = sample.subtask()
         fetched_keys = []
 
@@ -1936,6 +1939,11 @@ class CodeReviewRegressionTests(unittest.TestCase):
 
             def remote_links(self, key):
                 return []
+
+            def download(self, url, dest):
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as fh:
+                    fh.write(b"png-bytes")
 
         dj = DeltaJira()
         q = lambda *a, **k: None
@@ -2129,6 +2137,1342 @@ class CodeReviewRegressionTests(unittest.TestCase):
         # System.State (not edited after sync) is reverted to "New", while System.Title (edited after sync) is preserved!
         self.assertEqual(ado.items[101]["fields"]["System.State"], "New")
         self.assertEqual(ado.items[101]["fields"]["System.Title"], "Post-Sync Manual Edit in ADO")
+
+    def test_sql_server_xx5z_rounding_bump_and_changeddate_auto_retry(self):
+        # Group A fix: .xx5Z timestamps rounded to .xx7Z by SQL Server DATETIME never collide,
+        # and a server-side ChangedDate rejection auto-recovers by reading live System.ChangedDate + 20ms.
+        from jira2ado.ado_client import AdoError
+        from jira2ado.util import bump, iso, parse_dt, write_json
+
+        last = parse_dt("2023-08-24T21:02:44.325Z")
+        nxt = bump(parse_dt("2023-08-24T21:02:44.100Z"), last)
+        # SQL Server rounds .325Z up to .327Z; 10ms step lands at .335Z (> .327Z)
+        self.assertEqual(iso(nxt), "2023-08-24T21:02:44.335Z")
+        self.assertGreater(iso(nxt), "2023-08-24T21:02:44.327Z")
+
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        iss = sample.story()
+        iss["changelog"][0]["created"] = "2024-01-03T09:00:00.325-0500"
+        iss["attachments_extra"] = []
+        iss["fields"]["attachment"][0]["created"] = "2024-01-03T09:00:00.100-0500"
+        write_json(os.path.join(folder, "issues", "DEMO-1.json"), iss)
+
+        cfg = cfg_for(folder)
+        ado = sample.FakeAdo()
+        orig_update = ado.update_item
+        injected = [False]
+
+        def picky_update(item_id, ops):
+            if not injected[0]:
+                injected[0] = True
+                # Simulate SQL Server having rounded System.ChangedDate 50ms ahead on the server
+                ado.items[item_id]["fields"]["System.ChangedDate"] = "2024-01-03T14:00:00.900Z"
+                ado.items[item_id]["last"] = "2024-01-03T14:00:00.900Z"
+                raise AdoError("TF400073: Invalid field value System.ChangedDate", 400)
+            return orig_update(item_id, ops)
+
+        ado.update_item = picky_update
+        stats = import_items(ado, cfg, USERS, only={"DEMO-1"}, log=lambda *a, **k: None)
+        self.assertEqual(stats["failed"], [])
+        self.assertEqual(stats["created"], 1)
+        self.assertTrue(injected[0])
+
+    def test_oversized_60mb_attachment_explicitly_skipped_and_verify_passes(self):
+        # Group C fix: > 60 MB files are explicitly marked skipped in warnings, noted on the ADO item,
+        # and recorded in verify.csv attachments_skipped without failing verification.
+        import csv
+        from unittest.mock import patch
+
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        # 900_shot.png has 9 bytes ("png-bytes"); patch MAX_ATTACHMENT to 4 bytes to simulate > 60 MB
+        cfg = cfg_for(folder)
+        q = lambda *a, **k: None
+        ado = sample.FakeAdo()
+        report = os.path.join(folder, "verify.csv")
+
+        with patch("jira2ado.importer.MAX_ATTACHMENT", 4), patch("jira2ado.verify.MAX_ATTACHMENT", 4):
+            stats = import_items(ado, cfg, USERS, log=q)
+            import_links(ado, cfg, log=q)
+            total, bad = verify(ado, cfg, USERS, report, log=q)
+
+        self.assertEqual(len(ado.uploads), 0)
+        self.assertTrue(any("skipped (> 60 MB ADO limit): shot.png" in w for w in stats["warnings"]))
+        self.assertTrue(any("Skipped attachment" in c for _, c in ado.items[101]["comments"]))
+        self.assertEqual((total, bad), (2, 0))
+        with open(report, newline="", encoding="utf-8") as fh:
+            rows = {r["jira_key"]: r for r in csv.DictReader(fh)}
+        self.assertEqual(rows["DEMO-1"]["attachments_expected"], "0")
+        self.assertEqual(rows["DEMO-1"]["attachments_found"], "0")
+        self.assertEqual(rows["DEMO-1"]["attachments_skipped"], "1")
+        self.assertEqual(rows["DEMO-1"]["problems"], "")
+
+    def test_noop_intermediate_revisions_coalesced_and_in_progress_run_preserved(self):
+        # Group B + Planner speedup: back-to-back Jira sub-statuses mapping to the same ADO state
+        # are coalesced on fresh runs, while an already-started run without coalesced_noops preserves indices.
+        from jira2ado.importer import load_meta
+        from jira2ado.util import write_json
+
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        iss = sample.subtask()
+        iss["key"] = "DEMO-99"
+        iss["fields"]["issuetype"] = {"name": "Story"}
+        iss["fields"]["status"] = {"name": "Done"}
+        iss["changelog"] = [
+            {"created": "2024-01-06T10:00:00.000-0500", "author": sample.U1,
+             "items": [sample.item("status", "To Do", "In Progress")]},
+            {"created": "2024-01-06T11:00:00.000-0500", "author": sample.U1,
+             "items": [sample.item("status", "In Progress", "In Review")]},  # also maps to Committed -> pure no-op!
+            {"created": "2024-01-06T12:00:00.000-0500", "author": sample.U1,
+             "items": [sample.item("status", "In Review", "Done")]},
+        ]
+        write_json(os.path.join(folder, "issues", "DEMO-99.json"), iss)
+
+        cfg = cfg_for(folder)
+        cfg["mapping"]["history_notes"] = False
+        sdir = tempfile.mkdtemp()
+        cfg["paths"]["state_dir"] = sdir
+
+        fresh_revs = Planner(cfg, load_meta(cfg), USERS).plan(iss)["revisions"]
+        # Create (New) -> Committed -> Done = 3 revisions (In Review duplicate Committed skipped)
+        self.assertEqual(len(fresh_revs), 3)
+
+        # Simulate an in-progress run created before coalesced_noops
+        with open(os.path.join(sdir, "import-state.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write('{"t": "rev", "k": "DEMO-99", "id": 500, "n": 2, "d": "2024-01-06T15:00:00.000Z"}\n')
+        write_json(os.path.join(sdir, "preview.json"), {"issues": 1, "tickets": []})
+        legacy_revs = Planner(cfg, load_meta(cfg), USERS).plan(iss)["revisions"]
+        self.assertEqual(len(legacy_revs), 4)
+
+    def test_parallel_import_workers_and_bulk_batch_verify_and_export(self):
+        import threading
+        from jira2ado.exporter import export
+        from jira2ado.util import write_json
+
+        # 1. Bulk export via search_issues_batch
+        exp_dir = tempfile.mkdtemp()
+        cfg = cfg_for(exp_dir)
+        cfg["jira"]["jql"] = 'project = "DEMO"'
+        cfg["mapping"]["import_workers"] = 4
+
+        class BulkFakeJira:
+            def __init__(self):
+                self.batch_calls = 0
+                self.single_calls = 0
+            def fields(self):
+                return [{"id": "customfield_10020", "name": "Sprint"}, {"id": "customfield_10016", "name": "Story point estimate"}]
+            def statuses(self):
+                return [{"name": "In Review", "statusCategory": {"key": "indeterminate"}}]
+            def search_key_timestamps(self, jql):
+                return [(f"DEMO-{i}", "2024-01-06T09:00:00.000-0500") for i in range(1, 9)]
+            def search_issues_batch(self, keys):
+                self.batch_calls += 1
+                out = {}
+                for k in keys:
+                    st = sample.subtask()
+                    st["key"] = k
+                    st["fields"]["parent"] = None
+                    st["changelog"] = {"total": 0, "histories": []}
+                    st["fields"]["comment"] = {"total": 0, "comments": []}
+                    st["fields"]["worklog"] = {"total": 0, "worklogs": []}
+                    out[k] = st
+                return out
+            def issue(self, key):
+                self.single_calls += 1
+                raise AssertionError("Should use search_issues_batch instead of single issue GET")
+            def remote_links(self, key):
+                return []
+            def dev_links(self, issue_id):
+                return []
+
+        fj = BulkFakeJira()
+        done_cnt, skip_cnt = export(fj, cfg, log=lambda *a, **k: None)
+        self.assertEqual((done_cnt, skip_cnt), (8, 0))
+        self.assertEqual(fj.batch_calls, 1)
+        self.assertEqual(fj.single_calls, 0)
+
+        # 2. Parallel 4-worker import + bulk get_items_batch verify
+        class ThreadSafeFakeAdo(sample.FakeAdo):
+            def __init__(self):
+                super().__init__()
+                self._lk = threading.Lock()
+                self.batch_get_calls = 0
+            def create_item(self, wit, ops):
+                with self._lk:
+                    return super().create_item(wit, ops)
+            def update_item(self, item_id, ops):
+                with self._lk:
+                    return super().update_item(item_id, ops)
+            def get_items_batch(self, item_ids):
+                self.batch_get_calls += 1
+                return {iid: self.get_item(iid) for iid in item_ids}
+
+        ado = ThreadSafeFakeAdo()
+        stats = import_items(ado, cfg, USERS, log=lambda *a, **k: None)
+        self.assertEqual(stats["created"], 8)
+        self.assertEqual(stats["failed"], [])
+        report = os.path.join(exp_dir, "verify.csv")
+        total, bad = verify(ado, cfg, USERS, report, log=lambda *a, **k: None)
+        self.assertEqual((total, bad), (8, 0))
+        self.assertEqual(ado.batch_get_calls, 1)
+
+    def test_round4_partial_only_import_preserves_sprint_collision_disambiguation(self):
+        # Finding #2 & #8: Importing only={"DEMO-1"} when DEMO-2 has a colliding "Sprint 1" (id 20)
+        # still creates the suffixed iteration "Sprint 1 (10)" and surfaces subscription warnings.
+        from jira2ado.util import write_json
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        iss1 = sample.story()
+        iss1["key"] = "DEMO-1"
+        iss1["changelog"] = []
+        iss1["fields"]["customfield_10020"] = [{
+            "id": 10, "name": "Sprint 1", "state": "closed",
+            "startDate": "2024-01-01T00:00:00.000Z", "endDate": "2024-01-14T00:00:00.000Z",
+        }]
+        iss2 = sample.subtask()
+        iss2["key"] = "DEMO-2"
+        iss2["fields"]["status"] = {"name": "Done"}
+        iss2["fields"]["customfield_10020"] = [{
+            "id": 20, "name": "Sprint 1", "state": "closed",
+            "startDate": "2025-01-01T00:00:00.000Z", "endDate": "2025-01-14T00:00:00.000Z",
+        }]
+        write_json(os.path.join(folder, "issues", "DEMO-1.json"), iss1)
+        write_json(os.path.join(folder, "issues", "DEMO-2.json"), iss2)
+
+        cfg = cfg_for(folder)
+        cfg["mapping"]["history"] = False
+        ado = sample.FakeAdo()
+        ado.subscribe_team_iteration = lambda path, team=None: False
+        logs = []
+        stats = import_items(ado, cfg, USERS, only={"DEMO-1"}, log=logs.append)
+        self.assertEqual(stats["created"], 1)
+        self.assertIn(("Sprint 1 (10)", "2024-01-01T00:00:00.000Z", "2024-01-14T00:00:00.000Z"), ado.iterations)
+        self.assertEqual(ado.items[101]["fields"]["System.IterationPath"], "Shop\\Sprint 1 (10)")
+        self.assertTrue(any("could not subscribe team sprint board" in m for m in logs))
+
+    def test_round4_delta_export_retries_missing_attachment_on_unchanged_ticket(self):
+        # Finding #4: If an attachment download fails on Export 1, Export 2 retries that ticket even
+        # when its Jira updated timestamp has not changed.
+        from jira2ado.exporter import export
+        from jira2ado.util import read_json
+        folder = tempfile.mkdtemp()
+        cfg = cfg_for(folder)
+        cfg["jira"]["jql"] = 'project = "DEMO"'
+        story_v1 = sample.story()
+        story_v1["fields"]["attachment"] = [{
+            "id": "900", "filename": "shot.png", "created": "2024-01-03T10:00:00.000-0500",
+            "author": sample.U1, "content": "https://demo.atlassian.net/rest/api/3/attachment/content/900",
+        }]
+
+        class FlakyAttJira:
+            def __init__(self):
+                self.fail_download = True
+            def fields(self):
+                return [{"id": "customfield_10020", "name": "Sprint"}, {"id": "customfield_10016", "name": "Story point estimate"}]
+            def statuses(self):
+                return [{"name": "Done", "statusCategory": {"key": "done"}}]
+            def search_key_timestamps(self, jql):
+                yield "DEMO-1", story_v1["fields"]["updated"]
+            def issue(self, key):
+                return copy.deepcopy(story_v1)
+            def changelog(self, key):
+                return []
+            def comments(self, key):
+                return []
+            def worklogs(self, key):
+                return []
+            def remote_links(self, key):
+                return []
+            def download(self, url, dest):
+                if self.fail_download:
+                    raise RuntimeError("transient network error")
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as fh:
+                    fh.write(b"png-bytes")
+
+        fj = FlakyAttJira()
+        q = lambda *a, **k: None
+        done1, skip1 = export(fj, cfg, log=q)
+        self.assertEqual((done1, skip1), (1, 0))
+        self.assertNotIn("local_path", read_json(os.path.join(folder, "issues", "DEMO-1.json"))["fields"]["attachment"][0])
+
+        # Now network recovers; second delta export (without --force) must retry DEMO-1 and save local_path!
+        fj.fail_download = False
+        done2, skip2 = export(fj, cfg, log=q)
+        self.assertEqual((done2, skip2), (1, 0))
+        self.assertIn("local_path", read_json(os.path.join(folder, "issues", "DEMO-1.json"))["fields"]["attachment"][0])
+
+        # Third export skips cleanly now that the attachment is on disk
+        done3, skip3 = export(fj, cfg, log=q)
+        self.assertEqual((done3, skip3), (0, 1))
+
+    def test_round4_journal_persists_planning_mode_without_preview_json_and_sync_rollback_keeps_manual_links(self):
+        # Finding #9 & #1: Legacy journal without preview.json still preserves uncoalesced revisions,
+        # and sync rollback removes only migration-added relations while preserving post-sync manual links.
+        from jira2ado.importer import load_meta, rollback_run
+        from jira2ado.util import write_json
+        folder = tempfile.mkdtemp()
+        sample.write_export(folder)
+        iss = sample.subtask()
+        iss["key"] = "DEMO-99"
+        iss["fields"]["issuetype"] = {"name": "Story"}
+        iss["fields"]["status"] = {"name": "Done"}
+        iss["changelog"] = [
+            {"created": "2024-01-06T10:00:00.000-0500", "author": sample.U1,
+             "items": [sample.item("status", "To Do", "In Progress")]},
+            {"created": "2024-01-06T11:00:00.000-0500", "author": sample.U1,
+             "items": [sample.item("status", "In Progress", "In Review")]},
+            {"created": "2024-01-06T12:00:00.000-0500", "author": sample.U1,
+             "items": [sample.item("status", "In Review", "Done")]},
+        ]
+        write_json(os.path.join(folder, "issues", "DEMO-99.json"), iss)
+        sdir = tempfile.mkdtemp()
+        cfg = cfg_for(folder)
+        cfg["paths"]["state_dir"] = sdir
+        cfg["mapping"]["history_notes"] = False
+        # Write a legacy journal WITHOUT preview.json at all!
+        with open(os.path.join(sdir, "import-state.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write('{"t": "rev", "k": "DEMO-99", "id": 500, "n": 2, "d": "2024-01-06T15:00:00.000Z"}\n')
+        self.assertEqual(len(Planner(cfg, load_meta(cfg), USERS).plan(iss)["revisions"]), 4)
+
+        # Finding #1: Delta sync adds DEMO-1's attachment; human adds an external hyperlink in ADO after sync;
+        # rollback removes DEMO-1's synced attachment but keeps the human's manual hyperlink!
+        q = lambda *a, **k: None
+        ado = sample.FakeAdo()
+        pre_id = ado.create_item("Product Backlog Item", [
+            {"op": "add", "path": "/fields/System.Title", "value": "Existing Item"},
+            {"op": "add", "path": "/fields/System.State", "value": "New"},
+            {"op": "add", "path": "/fields/System.Tags", "value": "DEMO-1"},
+        ])["id"]
+        sync_cfg = cfg_for(folder)
+        sync_cfg["paths"]["state_dir"] = tempfile.mkdtemp()
+        sync_cfg["mapping"]["ticket_actions"] = {"DEMO-1": "sync"}
+        import_items(ado, sync_cfg, USERS, only={"DEMO-1"}, log=q)
+        # Human adds an unrelated link in ADO after the sync
+        manual_url = "https://external.example/manual-spec"
+        ado.items[pre_id]["relations"].append({"rel": "Hyperlink", "url": manual_url})
+        rb = rollback_run(ado, sync_cfg, log=q)
+        self.assertEqual(len(rb["restored"]), 1)
+        remaining_urls = [r.get("url") for r in ado.items[pre_id]["relations"]]
+        self.assertIn(manual_url, remaining_urls)
+        self.assertFalse(any("shot.png" in (u or "") for u in remaining_urls))
+
+    def test_round4_jira_download_rejects_foreign_host_and_surfaces_non_404_errors(self):
+        # Finding #5 & #6: JiraClient.download refuses non-Jira hosts, and worklogs/remote_links
+        # return [] on 404 (disabled feature) while surfacing 500/401 server errors.
+        from jira2ado.jira_client import JiraClient
+
+        class MockResp:
+            def __init__(self, code, payload="{}"):
+                self.status_code = code
+                self.text = payload
+                self.headers = {}
+            def json(self):
+                return json.loads(self.text)
+
+        class MockSession:
+            def __init__(self, code):
+                self.code = code
+                self.auth = None
+                self.headers = {}
+            def request(self, method, url, **kw):
+                return MockResp(self.code, "error")
+
+        jc_404 = JiraClient("https://demo.atlassian.net", "a@b.com", "tok", session=MockSession(404))
+        self.assertEqual(jc_404.worklogs("DEMO-1"), [])
+        self.assertEqual(jc_404.remote_links("DEMO-1"), [])
+
+        jc_401 = JiraClient("https://demo.atlassian.net", "a@b.com", "tok", session=MockSession(401))
+        with self.assertRaises(RuntimeError):
+            jc_401.worklogs("DEMO-1")
+        with self.assertRaises(RuntimeError):
+            jc_401.remote_links("DEMO-1")
+        with self.assertRaises(RuntimeError) as ctx:
+            jc_401.download("https://evil.example.com/attachment/content/1", os.path.join(tempfile.mkdtemp(), "x"))
+        self.assertIn("untrusted attachment URL", str(ctx.exception))
+
+
+class BoardsToAreasAndTeamsTests(unittest.TestCase):
+    """Per-board Area Paths, nested Board\\Sprint Iterations, and auto-created ADO Teams."""
+
+    def _make_issue(self, key, summary="Task", status="In Progress", sprints=None, changelog=None):
+        return {
+            "key": key,
+            "fields": {
+                "summary": summary,
+                "issuetype": {"name": "Story"},
+                "status": {"name": status},
+                "priority": {"name": "Medium"},
+                "creator": sample.U1, "reporter": sample.U1, "assignee": sample.U1,
+                "labels": [], "components": [], "fixVersions": [],
+                "customfield_10020": sprints or [],
+                "created": "2024-02-01T10:00:00.000-0500",
+                "updated": "2024-02-05T10:00:00.000-0500",
+                "description": None, "attachment": [], "issuelinks": [],
+            },
+            "renderedFields": {},
+            "changelog": changelog or [],
+            "comments": [],
+        }
+
+    def _make_fake_ado(self, existing_areas=None, existing_iters=None, existing_teams=None, team_error=None):
+        class TeamFakeAdo(sample.FakeAdo):
+            def __init__(self):
+                super().__init__()
+                self._existing_areas = list(existing_areas or [])
+                self._existing_iters = list(existing_iters or [])
+                self._existing_teams = list(existing_teams or [])
+                self.area_paths_calls = 0
+                self.iter_paths_calls = 0
+                self.created_teams = []
+                self.configured_areas = []
+                self.configured_backlogs = []
+                self.created_iters_full = []
+
+            def area_paths(self):
+                self.area_paths_calls += 1
+                return list(self._existing_areas)
+
+            def iteration_paths(self):
+                self.iter_paths_calls += 1
+                return list(self._existing_iters)
+
+            def create_iteration(self, name, start=None, finish=None, parent=None):
+                full = f"{parent}\\{name}" if parent else name
+                self.created_iters_full.append((full, start, finish))
+                return super().create_iteration(name, start=start, finish=finish, parent=parent)
+
+            def teams(self):
+                return [{"id": f"tid-{i}", "name": n} for i, n in enumerate(self._existing_teams)]
+
+            def create_team(self, name, description=""):
+                if team_error is not None:
+                    raise team_error
+                self.created_teams.append((name, description))
+                self._existing_teams.append(name)
+                return {"id": f"new-{name}", "name": name}
+
+            def configure_team_area(self, team, area_path, include_children=True, replace=False):
+                self.configured_areas.append((team, area_path, include_children, replace))
+                return True
+
+            def configure_team_backlog_iteration(self, team, rel_iter_path):
+                self.configured_backlogs.append((team, rel_iter_path))
+                return True
+
+        return TeamFakeAdo()
+
+    def test_multi_board_scrum_kanban_orphan_tiebreak_and_team_auto_creation(self):
+        from jira2ado.exporter import export
+        from jira2ado.util import read_json
+
+        # 3 boards: broad All-Project board (4 tickets), Scrum Alpha (2 tickets), Kanban Ops (1 ticket)
+        s_alpha_1 = {"id": 101, "name": "Sprint 1", "state": "active",
+                     "startDate": "2024-02-01T00:00:00.000Z", "endDate": "2024-02-14T00:00:00.000Z", "originBoardId": 10}
+        s_alpha_closed = {"id": 100, "name": "Sprint 0", "state": "closed",
+                          "startDate": "2024-01-15T00:00:00.000Z", "endDate": "2024-01-31T00:00:00.000Z", "originBoardId": 10}
+        issues_map = {
+            "APP-1": self._make_issue("APP-1", "Active Scrum story", "In Progress", sprints=[s_alpha_1]),
+            "APP-2": self._make_issue("APP-2", "Open ticket from closed sprint (backlog rule)", "To Do", sprints=[s_alpha_closed]),
+            "APP-3": self._make_issue("APP-3", "Kanban card", "In Progress", sprints=[]),
+            "APP-4": self._make_issue("APP-4", "Orphaned ticket", "To Do", sprints=[]),
+        }
+
+        class FakeJira:
+            def fields(self):
+                return [{"id": "customfield_10020", "name": "Sprint"}]
+            def statuses(self):
+                return [
+                    {"name": "To Do", "statusCategory": {"key": "new"}},
+                    {"name": "In Progress", "statusCategory": {"key": "indeterminate"}},
+                    {"name": "Done", "statusCategory": {"key": "done"}},
+                ]
+            def search_key_timestamps(self, jql):
+                return [(k, "2024-02-05T10:00:00.000-0500") for k in sorted(issues_map)]
+            def search_keys(self, jql):
+                if "ALL_BOARD" in jql:
+                    return ["APP-1", "APP-2", "APP-3", "APP-99"]  # broad board; APP-99 outside export
+                if "SCRUM_ALPHA" in jql:
+                    return ["APP-1", "APP-2"]
+                if "KANBAN_OPS" in jql:
+                    return ["APP-3"]
+                return []
+            def boards(self, project=None):
+                return [
+                    {"id": 1, "name": "All Project Board", "type": "kanban"},
+                    {"id": 10, "name": "Scrum Alpha", "type": "scrum"},
+                    {"id": 20, "name": "Kanban Ops", "type": "kanban"},
+                ]
+            def board_filter_jql(self, board_id):
+                return {1: "labels = ALL_BOARD", 10: "labels = SCRUM_ALPHA", 20: "labels = KANBAN_OPS"}[board_id]
+            def board_sprints(self, board_id, board_name=None):
+                if board_id == 10:
+                    return [s_alpha_1, s_alpha_closed]
+                return []
+            def issue(self, key):
+                return copy.deepcopy(issues_map[key])
+
+        folder = tempfile.mkdtemp()
+        cfg = cfg_for(folder)
+        cfg["jira"]["jql"] = 'project = "APP" ORDER BY key ASC'
+        cfg["run"] = {"mode": "project", "from": "APP", "to": "Shop"}
+        cfg["mapping"]["boards_to_areas"] = True
+        cfg["mapping"]["history"] = False
+        cfg["ado"]["create_board_teams"] = True
+        q = lambda *a, **k: None
+
+        export(FakeJira(), cfg, log=q)
+        meta = read_json(os.path.join(folder, "meta.json"))
+        # Tie-breaker: APP-3 matched both All Project Board (3 exported matches) & Kanban Ops (1 match) -> Kanban Ops wins
+        self.assertEqual(meta["ticket_boards"]["APP-3"], "Kanban Ops")
+        self.assertEqual(meta["ticket_boards"]["APP-2"], "Scrum Alpha")
+        self.assertNotIn("APP-4", meta["ticket_boards"])
+        self.assertEqual(meta["sprint_boards"]["101"], "Scrum Alpha")
+
+        ado = self._make_fake_ado()
+        stats = import_items(ado, cfg, USERS, log=q)
+        self.assertEqual((stats["created"], stats["failed"]), (4, []))
+
+        by_key = {}
+        for it in ado.items.values():
+            tags = it["fields"].get("System.Tags", "")
+            for k in issues_map:
+                if k in tags:
+                    by_key[k] = it["fields"]
+        # Sprinted ticket -> Board Area + nested Board\Sprint Iteration
+        self.assertEqual(by_key["APP-1"]["System.AreaPath"], "Shop\\Scrum Alpha")
+        self.assertEqual(by_key["APP-1"]["System.IterationPath"], "Shop\\Scrum Alpha\\Sprint 1")
+        # Open ticket whose only sprint is closed -> Backlog Rule puts it at Board Area & Board Iteration
+        self.assertEqual(by_key["APP-2"]["System.AreaPath"], "Shop\\Scrum Alpha")
+        self.assertEqual(by_key["APP-2"]["System.IterationPath"], "Shop\\Scrum Alpha")
+        # Kanban ticket -> Board Area & Board Iteration
+        self.assertEqual(by_key["APP-3"]["System.AreaPath"], "Shop\\Kanban Ops")
+        self.assertEqual(by_key["APP-3"]["System.IterationPath"], "Shop\\Kanban Ops")
+        # Orphaned ticket -> Project root for both
+        self.assertEqual(by_key["APP-4"]["System.AreaPath"], "Shop")
+        self.assertEqual(by_key["APP-4"]["System.IterationPath"], "Shop")
+
+        # Verify Areas, nested Iterations, and Teams were created & configured
+        self.assertEqual(ado.area_paths_calls, 1)
+        self.assertEqual(ado.iter_paths_calls, 1)
+        self.assertEqual(sorted(ado.areas), ["Kanban Ops", "Scrum Alpha"])
+        created_iter_paths = [p for p, _, _ in ado.created_iters_full]
+        self.assertIn("Kanban Ops", created_iter_paths)
+        self.assertIn("Scrum Alpha", created_iter_paths)
+        self.assertIn("Scrum Alpha\\Sprint 1", created_iter_paths)
+        self.assertEqual(sorted(t for t, _ in ado.created_teams), ["Kanban Ops", "Scrum Alpha"])
+        self.assertIn(("Scrum Alpha", "Shop\\Scrum Alpha", True, True), ado.configured_areas)
+        self.assertIn(("Kanban Ops", "Shop\\Kanban Ops", True, True), ado.configured_areas)
+        self.assertIn(("Scrum Alpha", "Scrum Alpha"), ado.configured_backlogs)
+        self.assertIn(("Kanban Ops", "Kanban Ops"), ado.configured_backlogs)
+        # Sprint 1 subscribed specifically to the Scrum Alpha team!
+        self.assertIn(("Scrum Alpha\\Sprint 1", "Scrum Alpha"), ado.subscribed_iterations)
+
+        # Verify passes with 0 problems (including System.AreaPath check)
+        total, bad = verify(ado, cfg, USERS, os.path.join(folder, "verify.csv"), log=q)
+        self.assertEqual((total, bad), (4, 0))
+
+        # Re-running import is 100% idempotent (no duplicate teams, areas, or iterations)
+        ado.created_teams.clear()
+        ado.created_iters_full.clear()
+        ado.areas.clear()
+        again = import_items(ado, cfg, USERS, log=q)
+        self.assertEqual((again["created"], again["complete"]), (0, 4))
+        self.assertEqual(ado.created_teams, [])
+        self.assertEqual(ado.created_iters_full, [])
+        self.assertEqual(ado.areas, [])
+
+    def test_same_name_sprints_across_boards_vs_same_board_collision(self):
+        # Board A has TWO "Sprint 1"s (ids 101 & 102) -> disambiguated on Board A.
+        # Board B has ONE "Sprint 1" (id 201) -> stays clean "Board B\\Sprint 1" without (201)!
+        meta = {
+            **sample.META,
+            "boards": [
+                {"id": 10, "name": "Board A", "type": "scrum", "area": "Board A"},
+                {"id": 20, "name": "Board B", "type": "scrum", "area": "Board B"},
+            ],
+            "sprint_boards": {"101": "Board A", "102": "Board A", "201": "Board B"},
+            "ticket_boards": {},
+            "sprints": [
+                {"id": 101, "name": "Sprint 1", "state": "closed"},
+                {"id": 102, "name": "Sprint 1", "state": "active"},
+                {"id": 201, "name": "Sprint 1", "state": "active"},
+            ],
+        }
+        i_a1 = self._make_issue("X-1", "A1", "Done", sprints=[{"id": 101, "name": "Sprint 1", "state": "closed"}])
+        i_a2 = self._make_issue("X-2", "A2", "In Progress", sprints=[{"id": 102, "name": "Sprint 1", "state": "active"}])
+        i_b1 = self._make_issue("X-3", "B1", "In Progress", sprints=[{"id": 201, "name": "Sprint 1", "state": "active"}])
+        cfg = cfg_for("x")
+        cfg["mapping"]["boards_to_areas"] = True
+        cfg["mapping"]["history"] = False
+
+        planner = Planner(cfg, meta, USERS, issues=[i_a1, i_a2, i_b1])
+        p_a1 = planner.plan(i_a1)["revisions"][0]["fields"]
+        p_a2 = planner.plan(i_a2)["revisions"][0]["fields"]
+        p_b1 = planner.plan(i_b1)["revisions"][0]["fields"]
+
+        self.assertEqual(p_a1["System.AreaPath"], "Shop\\Board A")
+        self.assertEqual(p_a1["System.IterationPath"], "Shop\\Board A\\Sprint 1 (101)")
+        self.assertEqual(p_a2["System.AreaPath"], "Shop\\Board A")
+        self.assertEqual(p_a2["System.IterationPath"], "Shop\\Board A\\Sprint 1 (102)")
+        self.assertEqual(p_b1["System.AreaPath"], "Shop\\Board B")
+        self.assertEqual(p_b1["System.IterationPath"], "Shop\\Board B\\Sprint 1")
+
+        # History replay: ticket moved from Board A's Sprint 1 (id 101) to Board B's Sprint 1 (id 201)
+        i_moved = self._make_issue(
+            "X-4", "Moved across boards", "In Progress",
+            sprints=[
+                {"id": 101, "name": "Sprint 1", "state": "closed"},
+                {"id": 201, "name": "Sprint 1", "state": "active"},
+            ],
+            changelog=[
+                {"created": "2024-02-02T10:00:00.000-0500", "author": sample.U1,
+                 "items": [sample.item("Sprint", "", "Sprint 1", "", "101")]},
+                {"created": "2024-02-04T10:00:00.000-0500", "author": sample.U1,
+                 "items": [sample.item("Sprint", "Sprint 1", "Sprint 1, Sprint 1", "101", "101, 201")]},
+            ],
+        )
+        cfg_hist = cfg_for("x")
+        cfg_hist["mapping"]["boards_to_areas"] = True
+        cfg_hist["mapping"]["history"] = True
+        pl_hist = Planner(cfg_hist, meta, USERS, issues=[i_a1, i_a2, i_b1, i_moved])
+        revs_m = pl_hist.plan(i_moved)["revisions"]
+        self.assertEqual(revs_m[0]["fields"]["System.AreaPath"], "Shop\\Board B")
+        self.assertEqual(revs_m[0]["fields"]["System.IterationPath"], "Shop\\Board B")
+        self.assertEqual(revs_m[1]["fields"]["System.IterationPath"], "Shop\\Board A\\Sprint 1 (101)")
+        self.assertEqual(revs_m[2]["fields"]["System.IterationPath"], "Shop\\Board B\\Sprint 1")
+        self.assertFalse(any("did not add up" in w for w in pl_hist.warnings))
+
+    def test_duplicate_board_names_and_zero_board_fallback(self):
+        from jira2ado.exporter import export
+        from jira2ado.util import read_json
+
+        # 1. Duplicate sanitized board names ("Platform/Core" and "Platform&Core") get (id) suffix
+        iss = self._make_issue("DUP-1", "Story", "In Progress")
+
+        class DupBoardJira:
+            def fields(self):
+                return [{"id": "customfield_10020", "name": "Sprint"}]
+            def statuses(self):
+                return [{"name": "In Progress", "statusCategory": {"key": "indeterminate"}}]
+            def search_key_timestamps(self, jql):
+                return [("DUP-1", "2024-02-05T10:00:00.000-0500")]
+            def boards(self, project=None):
+                return [
+                    {"id": 11, "name": "Platform/Core", "type": "kanban"},
+                    {"id": 22, "name": "Platform&Core", "type": "kanban"},
+                ]
+            def board_keys(self, board_id):
+                return ["DUP-1"] if board_id == 22 else []
+            def issue(self, key):
+                return copy.deepcopy(iss)
+
+        folder = tempfile.mkdtemp()
+        cfg = cfg_for(folder)
+        cfg["jira"]["jql"] = 'project = "DUP"'
+        cfg["mapping"]["boards_to_areas"] = True
+        export(DupBoardJira(), cfg, log=lambda *a, **k: None)
+        meta = read_json(os.path.join(folder, "meta.json"))
+        self.assertEqual([b["area"] for b in meta["boards"]], ["Platform-Core (11)", "Platform-Core (22)"])
+        self.assertEqual(meta["ticket_boards"]["DUP-1"], "Platform-Core (22)")
+
+        # 2. Zero-board project falls back cleanly to <ADO Project>
+        class ZeroBoardJira(DupBoardJira):
+            def boards(self, project=None):
+                return []
+
+        folder0 = tempfile.mkdtemp()
+        cfg0 = cfg_for(folder0)
+        cfg0["jira"]["jql"] = 'project = "DUP"'
+        cfg0["mapping"]["boards_to_areas"] = True
+        export(ZeroBoardJira(), cfg0, log=lambda *a, **k: None)
+        meta0 = read_json(os.path.join(folder0, "meta.json"))
+        self.assertEqual(meta0["boards"], [])
+        plan0 = Planner(cfg0, meta0, USERS).plan(iss)["revisions"][0]["fields"]
+        self.assertEqual(plan0["System.AreaPath"], "Shop")
+        self.assertEqual(plan0["System.IterationPath"], "Shop")
+
+    def test_explicit_area_and_iteration_overrides_win_over_boards(self):
+        meta = {
+            **sample.META,
+            "boards": [{"id": 10, "name": "Board A", "type": "scrum", "area": "Board A"}],
+            "sprint_boards": {"101": "Board A"},
+            "ticket_boards": {"OV-1": "Board A"},
+        }
+        iss = self._make_issue("OV-1", "Override test", "In Progress",
+                               sprints=[{"id": 101, "name": "Sprint 1", "state": "active"}])
+        cfg = cfg_for("x")
+        cfg["mapping"]["boards_to_areas"] = True
+        cfg["mapping"]["history"] = False
+        cfg["ado"]["area_path"] = "Shop\\ExplicitArea"
+        cfg["mapping"]["iteration_override"] = "Release 9"
+
+        f = Planner(cfg, meta, USERS).plan(iss)["revisions"][0]["fields"]
+        self.assertEqual(f["System.AreaPath"], "Shop\\ExplicitArea")
+        self.assertEqual(f["System.IterationPath"], "Shop\\Release 9")
+
+    def test_team_403_permission_error_warns_and_continues_importing_areas_and_items(self):
+        from jira2ado.ado_client import AdoError
+        from jira2ado.util import write_json
+
+        folder = tempfile.mkdtemp()
+        meta = {
+            **sample.META,
+            "boards": [
+                {"id": 10, "name": "Team A", "type": "scrum", "area": "Team A"},
+                {"id": 20, "name": "Team B", "type": "kanban", "area": "Team B"},
+            ],
+            "sprint_boards": {"101": "Team A"},
+            "ticket_boards": {"P-1": "Team A", "P-2": "Team B"},
+        }
+        write_json(os.path.join(folder, "meta.json"), meta)
+        write_json(os.path.join(folder, "keys.json"), ["P-1", "P-2"])
+        write_json(os.path.join(folder, "issues", "P-1.json"),
+                   self._make_issue("P-1", "Story A", "In Progress", sprints=[{"id": 101, "name": "Sprint 1", "state": "active"}]))
+        write_json(os.path.join(folder, "issues", "P-2.json"),
+                   self._make_issue("P-2", "Kanban B", "To Do", sprints=[]))
+
+        cfg = cfg_for(folder)
+        cfg["mapping"]["boards_to_areas"] = True
+        cfg["mapping"]["history"] = False
+        cfg["ado"]["create_board_teams"] = True
+
+        ado = self._make_fake_ado(team_error=AdoError("HTTP 403 missing Project & Team scope", 403))
+        stats = import_items(ado, cfg, USERS, log=lambda *a, **k: None)
+        # Work items, Areas, and nested Iterations STILL succeed!
+        self.assertEqual((stats["created"], stats["failed"]), (2, []))
+        self.assertEqual(sorted(ado.areas), ["Team A", "Team B"])
+        self.assertIn("Team A\\Sprint 1", [p for p, _, _ in ado.created_iters_full])
+        self.assertTrue(any("Project and Team" in w for w in stats["warnings"]))
+
+    def test_existing_team_and_existing_nodes_not_recreated_and_ado_client_team_apis(self):
+        from jira2ado.ado_client import AdoClient
+        from jira2ado.util import write_json
+
+        # 1. Importer skips creating already-existing areas/iterations/teams and uses replace=False for pre-existing team
+        folder = tempfile.mkdtemp()
+        meta = {
+            **sample.META,
+            "boards": [{"id": 10, "name": "Existing Team", "type": "kanban", "area": "Existing Team"}],
+            "sprint_boards": {},
+            "ticket_boards": {"EX-1": "Existing Team"},
+        }
+        write_json(os.path.join(folder, "meta.json"), meta)
+        write_json(os.path.join(folder, "keys.json"), ["EX-1"])
+        write_json(os.path.join(folder, "issues", "EX-1.json"), self._make_issue("EX-1", "Card", "To Do"))
+        cfg = cfg_for(folder)
+        cfg["mapping"]["boards_to_areas"] = True
+        cfg["mapping"]["history"] = False
+        ado = self._make_fake_ado(
+            existing_areas=["Existing Team"],
+            existing_iters=["Existing Team"],
+            existing_teams=["Existing Team"],
+        )
+        stats = import_items(ado, cfg, USERS, log=lambda *a, **k: None)
+        self.assertEqual((stats["created"], stats["failed"]), (1, []))
+        self.assertIsNone(ado.areas)  # area already existed, create_area never called
+        self.assertEqual(ado.created_iters_full, [])  # iteration already existed
+        self.assertEqual(ado.created_teams, [])  # team already existed
+        # Pre-existing team configured with replace=False so existing team areas are preserved
+        self.assertEqual(ado.configured_areas, [("Existing Team", "Shop\\Existing Team", True, False)])
+        self.assertEqual(ado.configured_backlogs, [("Existing Team", "Existing Team")])
+
+        # 2. AdoClient REST methods for create_team, configure_team_area, configure_team_backlog_iteration, 409 subscribe
+        calls = []
+
+        class MockResp:
+            def __init__(self, code, payload):
+                self.status_code = code
+                self.headers = {"Content-Type": "application/json"}
+                self._p = payload
+                self.text = json.dumps(payload)
+            def json(self):
+                return self._p
+
+        class MockSession:
+            headers = {}
+            def request(self, method, url, **kw):
+                calls.append((method, url, kw.get("json")))
+                if method == "POST" and url.endswith("/teams"):
+                    return MockResp(201, {"id": "t-1", "name": kw["json"]["name"]})
+                if method == "GET" and url.endswith("/teamfieldvalues"):
+                    return MockResp(200, {"defaultValue": "Shop\\Old", "values": [{"value": "Shop\\Old", "includeChildren": True}]})
+                if method == "PATCH" and url.endswith("/teamfieldvalues"):
+                    return MockResp(200, kw["json"])
+                if method == "GET" and "/classificationnodes/Iterations/" in url:
+                    return MockResp(200, {"identifier": "guid-iter-1", "name": "Board A"})
+                if method == "PATCH" and url.endswith("/teamsettings"):
+                    return MockResp(200, kw["json"])
+                if method == "POST" and url.endswith("/teamsettings/iterations"):
+                    return MockResp(409, {"message": "already exists"})
+                return MockResp(200, {})
+
+        client = AdoClient("https://dev.azure.com/org", "Shop", "tok", session=MockSession())
+        created = client.create_team("Board A", description="From Jira")
+        self.assertEqual(created["name"], "Board A")
+        # replace=True sets only the board area
+        client.configure_team_area("Board A", "Shop\\Board A", replace=True)
+        self.assertEqual(calls[-1][2], {
+            "defaultValue": "Shop\\Board A",
+            "values": [{"value": "Shop\\Board A", "includeChildren": True}],
+        })
+        # replace=False merges with pre-existing team areas
+        client.configure_team_area("Board A", "Shop\\Board A", replace=False)
+        self.assertEqual(calls[-1][2]["defaultValue"], "Shop\\Old")
+        self.assertEqual(len(calls[-1][2]["values"]), 2)
+        # Backlog iteration sets GUID from classification node
+        self.assertTrue(client.configure_team_backlog_iteration("Board A", "Board A"))
+        self.assertEqual(calls[-1][2], {"backlogIteration": "guid-iter-1"})
+        # 409 on already-subscribed sprint iteration returns True cleanly
+        self.assertTrue(client.subscribe_team_iteration("Board A\\Sprint 1", team="Board A"))
+
+    def test_prepare_project_mode_defaults_and_cli_flags(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        import yaml
+        from jira2ado import ado_client, cli, jira_client
+
+        tmp = tempfile.mkdtemp()
+        old_cwd = os.getcwd()
+        os.chdir(tmp)
+        old_env = {k: os.environ.get(k) for k in ("JIRA_EMAIL", "JIRA_API_TOKEN", "ADO_PAT", "JIRA_BASE_URL", "ADO_ORG_URL")}
+        orig_jira, orig_ado = jira_client.JiraClient, ado_client.AdoClient
+
+        class StubJira:
+            def __init__(self, *a, **k):
+                pass
+            def project_sprints(self, *a, **k):
+                return []
+
+        class StubAdo:
+            def __init__(self, *a, **k):
+                pass
+            def project_name(self):
+                return "Shop"
+
+        try:
+            os.environ.update(JIRA_EMAIL="a@b.com", JIRA_API_TOKEN="t", ADO_PAT="p",
+                              JIRA_BASE_URL="https://demo.atlassian.net", ADO_ORG_URL="https://dev.azure.com/org")
+            jira_client.JiraClient, ado_client.AdoClient = StubJira, StubAdo
+
+            def run_prep(*extra):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    cli.main(["prepare", "--from", "APP", "--to", "Shop", *extra])
+                cfg_path = out.getvalue().strip()
+                with open(cfg_path, encoding="utf-8") as fh:
+                    return yaml.safe_load(fh)
+
+            # Project mode defaults both boards_to_areas and create_board_teams to True
+            c_proj = run_prep("--mode", "project")
+            self.assertTrue(c_proj["mapping"]["boards_to_areas"])
+            self.assertTrue(c_proj["ado"]["create_board_teams"])
+            self.assertTrue(c_proj["run"]["boards_to_areas"])
+            self.assertTrue(c_proj["run"]["create_board_teams"])
+
+            # --no-boards-to-areas and --no-create-board-teams disable them
+            c_no_b = run_prep("--mode", "project", "--no-boards-to-areas", "--no-create-board-teams")
+            self.assertFalse(c_no_b["mapping"]["boards_to_areas"])
+            self.assertFalse(c_no_b["ado"]["create_board_teams"])
+            self.assertFalse(c_no_b["run"]["boards_to_areas"])
+            self.assertFalse(c_no_b["run"]["create_board_teams"])
+        finally:
+            os.chdir(old_cwd)
+            jira_client.JiraClient, ado_client.AdoClient = orig_jira, orig_ado
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+class ZephyrSquadAndSecretsTests(unittest.TestCase):
+    """Zephyr Squad Cloud steps, Tested By links, Azure Test Plans/Suites, backfill sync, and git-ignored .env."""
+
+    def test_git_ignores_secret_files_and_dotenv_auto_connect_never_leaks_tokens(self):
+        import subprocess
+        from jira2ado.ui import server
+
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for secret_name in (".env", ".secrets.env", "secrets.env", "secrets.yaml"):
+            proc = subprocess.run(
+                ["git", "check-ignore", "-q", secret_name],
+                cwd=repo_dir, capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"{secret_name} MUST be git-ignored!")
+
+        # Write a temporary .env file with all 3 services' keys and verify auto_connect_from_env + /api/state
+        tmp = tempfile.mkdtemp()
+        env_path = os.path.join(tmp, ".env")
+        with open(env_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                'JIRA_BASE_URL="https://demo.atlassian.net"\n'
+                'JIRA_EMAIL="qa@example.com"\n'
+                'JIRA_API_TOKEN="SECRET_JIRA_TOKEN_XYZ"\n'
+                'ADO_ORG_URL="https://dev.azure.com/demo"\n'
+                'ADO_PAT="SECRET_ADO_PAT_XYZ"\n'
+                'ZEPHYR_ACCESS_KEY="SECRET_Z_ACCESS_XYZ"\n'
+                'ZEPHYR_SECRET_KEY="SECRET_Z_SECRET_XYZ"\n'
+            )
+        parsed = config.read_dotenv(env_path)
+        self.assertEqual(parsed["JIRA_API_TOKEN"], "SECRET_JIRA_TOKEN_XYZ")
+        self.assertEqual(parsed["ADO_PAT"], "SECRET_ADO_PAT_XYZ")
+        self.assertEqual(parsed["ZEPHYR_ACCESS_KEY"], "SECRET_Z_ACCESS_XYZ")
+        self.assertEqual(parsed["ZEPHYR_SECRET_KEY"], "SECRET_Z_SECRET_XYZ")
+
+        orig_jc, orig_ac, orig_zc = server.JiraClient, server.AdoClient, server.ZephyrSquadClient
+        orig_tokens, orig_names = dict(server.S.tokens), dict(server.S.names)
+        orig_from_env = server.S.connected_from_env
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+
+            class StubJ:
+                def __init__(self, *a, **k):
+                    pass
+                def myself_details(self):
+                    return {"accountId": "acc-qa-1", "displayName": "QA Admin"}
+
+            class StubA:
+                def __init__(self, *a, **k):
+                    pass
+                def whoami(self):
+                    return "QA ADO"
+
+            class StubZ:
+                def __init__(self, ak, sk, acc_id, base_url=None):
+                    assert ak == "SECRET_Z_ACCESS_XYZ"
+                    assert sk == "SECRET_Z_SECRET_XYZ"
+                    assert acc_id == "acc-qa-1"
+                def check_access(self):
+                    return True
+
+            server.JiraClient, server.AdoClient, server.ZephyrSquadClient = StubJ, StubA, StubZ
+            res = server.auto_connect_from_env(env_path)
+            self.assertEqual(res["jira"], "QA Admin")
+            self.assertEqual(res["ado"], "QA ADO")
+            self.assertEqual(res["zephyr"], "Zephyr Squad Cloud")
+            self.assertTrue(res["connected_from_env"])
+            self.assertEqual(res["problems"], {})
+
+            state_json = json.dumps(server.api("GET", "/api/state", {}, {}))
+            for raw_secret in ("SECRET_JIRA_TOKEN_XYZ", "SECRET_ADO_PAT_XYZ", "SECRET_Z_ACCESS_XYZ", "SECRET_Z_SECRET_XYZ"):
+                self.assertNotIn(raw_secret, state_json)
+            self.assertIn('"connected_from_env": true', state_json)
+        finally:
+            os.chdir(orig_cwd)
+            server.JiraClient, server.AdoClient, server.ZephyrSquadClient = orig_jc, orig_ac, orig_zc
+            server.S.tokens.clear()
+            server.S.tokens.update(orig_tokens)
+            server.S.names.clear()
+            server.S.names.update(orig_names)
+            server.S.connected_from_env = orig_from_env
+
+    def test_zephyr_jwt_qsh_signing_and_https_enforcement(self):
+        import base64
+        import hashlib
+        import hmac
+        from jira2ado.zephyr_client import ZephyrError, ZephyrSquadClient, build_jwt
+
+        tok = build_jwt(
+            "my-access-key", "my-secret-key", "acc-123", "GET",
+            "/public/rest/api/1.0/teststep/1001",
+            params={"projectId": "200", "a": "hello world"},
+            ttl=180, now=1700000000,
+        )
+        parts = tok.split(".")
+        self.assertEqual(len(parts), 3)
+        pad = lambda s: s + "=" * (-len(s) % 4)
+        hdr = json.loads(base64.urlsafe_b64decode(pad(parts[0])))
+        pay = json.loads(base64.urlsafe_b64decode(pad(parts[1])))
+        self.assertEqual(hdr, {"alg": "HS256", "typ": "JWT"})
+        self.assertEqual(pay["iss"], "my-access-key")
+        self.assertEqual(pay["sub"], "acc-123")
+        self.assertEqual(pay["iat"], 1700000000)
+        self.assertEqual(pay["exp"], 1700000180)
+        want_canon = "GET&/public/rest/api/1.0/teststep/1001&a=hello%20world&projectId=200"
+        self.assertEqual(pay["qsh"], hashlib.sha256(want_canon.encode()).hexdigest())
+        want_sig = base64.urlsafe_b64encode(
+            hmac.new(b"my-secret-key", f"{parts[0]}.{parts[1]}".encode(), hashlib.sha256).digest()
+        ).rstrip(b"=").decode()
+        self.assertEqual(parts[2], want_sig)
+
+        with self.assertRaises(ZephyrError):
+            ZephyrSquadClient("ak", "sk", "acc", base_url="http://insecure.example/connect")
+
+    def test_steps_to_ado_xml_action_validate_data_escaping_and_attachments(self):
+        import xml.etree.ElementTree as ET
+        from jira2ado.zephyr import step_attachment_key, step_count_from_ado_xml, steps_to_ado_xml
+
+        self.assertIsNone(steps_to_ado_xml([]))
+        steps = [
+            {
+                "id": "s2", "order": 2,
+                "step": "Click <Submit> & verify \"OK\"", "data": "", "result": "",
+                "attachments": [],
+            },
+            {
+                "id": "s1", "order": 1,
+                "step": "Enter credentials", "data": "user=a@b.com", "result": "Dashboard loads",
+                "attachments": [{"id": "att9", "filename": "creds.png"}],
+            },
+        ]
+        att_urls = {step_attachment_key("s1", "att9"): "https://ado.example/_apis/wit/attachments/77"}
+        xml_str = steps_to_ado_xml(steps, att_urls=att_urls)
+        self.assertEqual(step_count_from_ado_xml(xml_str), 2)
+        root = ET.fromstring(xml_str)
+        self.assertEqual(root.attrib["id"], "0")
+        self.assertEqual(root.attrib["last"], "3")
+        step_nodes = list(root.findall("step"))
+        self.assertEqual(step_nodes[0].attrib, {"id": "2", "type": "ValidateStep"})
+        self.assertEqual(step_nodes[1].attrib, {"id": "3", "type": "ActionStep"})
+        p0 = [el.text or "" for el in step_nodes[0].findall("parameterizedString")]
+        self.assertIn("Enter credentials", p0[0])
+        self.assertIn("Test Data:", p0[0])
+        self.assertIn("user=a@b.com", p0[0])
+        self.assertIn("https://ado.example/_apis/wit/attachments/77", p0[0])
+        self.assertIn("Dashboard loads", p0[1])
+        p1 = [el.text or "" for el in step_nodes[1].findall("parameterizedString")]
+        self.assertIn("&lt;Submit&gt; &amp; verify", p1[0])
+        self.assertEqual(p1[1], "")
+
+    def test_full_zephyr_pipeline_steps_attachments_tested_by_links_test_plans_and_verify(self):
+        from jira2ado.exporter import export
+        from jira2ado.importer import import_test_plans
+
+        def mk(key, itype, summary, links=None, rlinks=None, iid="1001"):
+            return {
+                "id": iid, "key": key,
+                "fields": {
+                    "summary": summary,
+                    "project": {"id": "10500", "key": "QA"},
+                    "issuetype": {"name": itype},
+                    "status": {"name": "Done"},
+                    "priority": {"name": "High"},
+                    "creator": sample.U1, "reporter": sample.U1, "assignee": sample.U1,
+                    "labels": [], "components": [], "fixVersions": [],
+                    "created": "2024-03-01T10:00:00.000-0500",
+                    "updated": "2024-03-02T10:00:00.000-0500",
+                    "description": None, "attachment": [],
+                    "issuelinks": links or [],
+                },
+                "renderedFields": {},
+                "changelog": [], "comments": [],
+                "remotelinks": rlinks or [],
+            }
+
+        issues_src = {
+            "QA-1": mk(
+                "QA-1", "Test", "Verify Checkout", iid="5001",
+                links=[
+                    {"type": {"name": "Relates"}, "outwardIssue": {"key": "QA-3"}},   # Test -> Story => TestedBy-Reverse
+                    {"type": {"name": "Relates"}, "outwardIssue": {"key": "QA-2"}},   # Test -> Test => Related
+                    {"type": {"name": "Relates"}, "outwardIssue": {"key": "QA-99"}},  # Test -> pre-existing ADO Story!
+                ],
+                rlinks=[
+                    {"object": {"url": "https://demo.atlassian.net/plugins/servlet/ac/com.thed.zephyr.je/general", "title": "Zephyr"}},
+                    {"object": {"url": "https://docs.example/spec", "title": "Spec"}},
+                ],
+            ),
+            "QA-2": mk("QA-2", "Test", "Verify Refund", iid="5002"),
+            "QA-3": mk("QA-3", "Story", "Checkout Flow", iid="5003",
+                       links=[{"type": {"name": "Relates"}, "outwardIssue": {"key": "QA-2"}}]),  # Story -> Test => TestedBy-Forward
+        }
+
+        class FakeJira:
+            def fields(self):
+                return [{"id": "customfield_10020", "name": "Sprint"}]
+            def statuses(self):
+                return [{"name": "Done", "statusCategory": {"key": "done"}}]
+            def project_info(self, key):
+                return {"id": "10500", "key": key, "name": "QA"}
+            def project_versions(self, key):
+                return [{"id": "201", "name": "Release 1.0", "startDate": "2024-03-01", "releaseDate": "2024-03-31", "description": "R1"}]
+            def search_key_timestamps(self, jql):
+                return [(k, "2024-03-02T10:00:00.000-0500") for k in sorted(issues_src)]
+            def issue(self, key):
+                return copy.deepcopy(issues_src[key])
+
+        class FakeZephyr:
+            def test_steps(self, issue_id, project_id):
+                if str(issue_id) == "5001":
+                    return [
+                        {"id": "st1", "order": 1, "step": "Open cart", "data": "item=SKU1", "result": "Cart visible",
+                         "html_step": "", "html_data": "", "html_result": "", "attachments": []},
+                        {"id": "st2", "order": 2, "step": "Click Pay", "data": "", "result": "",
+                         "html_step": "", "html_data": "", "html_result": "", "attachments": []},
+                    ]
+                if str(issue_id) == "5002":
+                    return [{"id": "st9", "order": 1, "step": "Trigger refund", "data": "", "result": "Refunded",
+                             "html_step": "", "html_data": "", "html_result": "", "attachments": []}]
+                return []
+            def step_attachments(self, step_id, issue_id, project_id):
+                if str(step_id) == "st1":
+                    return [{"id": "a55", "filename": "cart.png", "size": 9}]
+                return []
+            def download_attachment(self, att_id, step_id, issue_id, project_id, dest):
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as fh:
+                    fh.write(b"png-bytes")
+            def cycles(self, project_id, version_id="-1"):
+                if str(version_id) == "201":
+                    return [{"id": "cyc1", "name": "Regression Cycle", "description": "Full reg", "startDate": "", "endDate": ""}]
+                return []
+            def folders(self, cycle_id, project_id, version_id="-1"):
+                if str(cycle_id) == "cyc1":
+                    return [{"id": "fld1", "name": "Checkout Folder", "description": ""}]
+                return []
+            def folder_execution_keys(self, folder_id, cycle_id, project_id, version_id="-1"):
+                return ["QA-1"] if str(folder_id) == "fld1" else []
+            def cycle_execution_keys(self, cycle_id, project_id, version_id="-1"):
+                # QA-1 is in fld1, QA-2 is directly in cyc1
+                return ["QA-1", "QA-2"]
+
+        class PlanFakeAdo(sample.FakeAdo):
+            available_types = ["Product Backlog Item", "Bug", "Task", "Epic", "Feature", "Test Case"]
+            type_states = {
+                "Product Backlog Item": ["New", "Approved", "Committed", "Done", "Removed"],
+                "Bug": ["New", "Approved", "Committed", "Done", "Removed"],
+                "Task": ["To Do", "In Progress", "Done", "Removed"],
+                "Test Case": ["Design", "Ready", "Closed"],
+            }
+            def __init__(self):
+                super().__init__()
+                self.plans = []
+                self.suites = {}
+                self.suite_assignments = []
+                self._next_plan = 500
+                self._next_suite = 600
+            def list_test_plans(self):
+                return list(self.plans)
+            def create_test_plan(self, name, **kw):
+                self._next_plan += 1
+                self._next_suite += 1
+                p = {"id": self._next_plan, "name": name, "rootSuite": {"id": self._next_suite, "name": name}, **kw}
+                self.plans.append(p)
+                self.suites[p["id"]] = [{"id": p["rootSuite"]["id"], "name": name, "parentSuite": None}]
+                return p
+            def list_test_suites(self, plan_id):
+                return list(self.suites.get(plan_id, []))
+            def create_static_suite(self, plan_id, parent_suite_id, name):
+                self._next_suite += 1
+                s = {"id": self._next_suite, "name": name, "parentSuite": {"id": parent_suite_id}}
+                self.suites.setdefault(plan_id, []).append(s)
+                return s
+            def add_test_cases_to_suite(self, plan_id, suite_id, work_item_ids):
+                self.suite_assignments.append((plan_id, suite_id, list(work_item_ids)))
+                return len(work_item_ids)
+
+        folder = tempfile.mkdtemp()
+        cfg = cfg_for(folder)
+        cfg["jira"]["jql"] = 'project = "QA"'
+        cfg["run"] = {"mode": "project", "from": "QA", "to": "Shop"}
+        cfg["mapping"]["types"]["Test"] = "Test Case"
+        cfg["mapping"]["history"] = False
+        cfg["zephyr"]["enabled"] = True
+        cfg["zephyr"]["include_test_plans"] = True
+        q = lambda *a, **k: None
+
+        export(FakeJira(), cfg, log=q, zephyr=FakeZephyr())
+
+        ado = PlanFakeAdo()
+        # Pre-existing ADO Story QA-99 migrated in an earlier run
+        pre_story_id = ado.create_item("Product Backlog Item", [
+            {"op": "add", "path": "/fields/System.Title", "value": "Earlier Story"},
+            {"op": "add", "path": "/fields/System.State", "value": "New"},
+            {"op": "add", "path": "/fields/System.Tags", "value": "QA-99"},
+        ])["id"]
+
+        stats = import_items(ado, cfg, USERS, log=q)
+        self.assertEqual((stats["created"], stats["failed"]), (3, []))
+        lstats = import_links(ado, cfg, log=q)
+        self.assertEqual(lstats["added"], 4)
+
+        by_key = {}
+        for iid, it in ado.items.items():
+            tags = it["fields"].get("System.Tags", "")
+            for k in ("QA-1", "QA-2", "QA-3", "QA-99"):
+                if k in tags:
+                    by_key[k] = (iid, it)
+
+        qa1_id, qa1 = by_key["QA-1"]
+        qa2_id, qa2 = by_key["QA-2"]
+        qa3_id, qa3 = by_key["QA-3"]
+        # Test Steps XML + uploaded step attachment URL embedded!
+        self.assertIn("<steps id=\"0\" last=\"3\">", qa1["fields"]["Microsoft.VSTS.TCM.Steps"])
+        self.assertIn("https://ado.example/_apis/wit/attachments/1", qa1["fields"]["Microsoft.VSTS.TCM.Steps"])
+        # Internal Zephyr servlet remote link filtered out, real Spec link kept
+        hyperlinks = [r["url"] for r in qa1["relations"] if r["rel"] == "Hyperlink"]
+        self.assertIn("https://docs.example/spec", hyperlinks)
+        self.assertFalse(any("com.thed.zephyr.je" in u for u in hyperlinks))
+        # TestedBy link promotion + cross-run QA-99 resolution!
+        qa1_rels = {(r["rel"], r["url"]) for r in qa1["relations"]}
+        self.assertIn(("Microsoft.VSTS.Common.TestedBy-Reverse", ado.item_url(qa3_id)), qa1_rels)
+        self.assertIn(("Microsoft.VSTS.Common.TestedBy-Reverse", ado.item_url(pre_story_id)), qa1_rels)
+        self.assertIn(("System.LinkTypes.Related", ado.item_url(qa2_id)), qa1_rels)
+        qa3_rels = {(r["rel"], r["url"]) for r in qa3["relations"]}
+        self.assertIn(("Microsoft.VSTS.Common.TestedBy-Forward", ado.item_url(qa2_id)), qa3_rels)
+
+        # Azure Test Plans & Suites creation (Release 1.0 -> Regression Cycle -> Checkout Folder)
+        pstats = import_test_plans(ado, cfg, log=q)
+        self.assertEqual((pstats["plans_created"], pstats["suites_created"], pstats["cases_added"]), (1, 2, 2))
+        self.assertEqual(ado.plans[0]["name"], "Release 1.0")
+        suite_names = {s["id"]: s["name"] for s in ado.suites[ado.plans[0]["id"]]}
+        assigned_by_suite = {suite_names[sid]: ids for _, sid, ids in ado.suite_assignments}
+        # QA-1 in Checkout Folder only (deduplicated from Regression Cycle); QA-2 directly in Regression Cycle
+        self.assertEqual(assigned_by_suite["Checkout Folder"], [qa1_id])
+        self.assertEqual(assigned_by_suite["Regression Cycle"], [qa2_id])
+
+        # Re-running import_test_plans is 100% idempotent
+        pstats2 = import_test_plans(ado, cfg, log=q)
+        self.assertEqual((pstats2["plans_created"], pstats2["suites_created"], pstats2["cases_added"]), (0, 0, 0))
+
+        # Verify passes with 0 problems (counting steps AND TestedBy links!)
+        total, bad = verify(ado, cfg, USERS, os.path.join(folder, "verify.csv"), log=q)
+        self.assertEqual((total, bad), (3, 0))
+
+    def test_test_plans_403_warns_cleanly_and_sync_zephyr_backfills_idempotently(self):
+        from jira2ado.ado_client import AdoError
+        from jira2ado.importer import import_test_plans, sync_zephyr_steps
+        from jira2ado.util import write_json
+
+        folder = tempfile.mkdtemp()
+        write_json(os.path.join(folder, "meta.json"), sample.META)
+        write_json(os.path.join(folder, "keys.json"), ["QA-10", "QA-11"])
+        write_json(os.path.join(folder, "issues", "QA-10.json"), {
+            "id": "9010", "key": "QA-10",
+            "fields": {
+                "summary": "Login Test", "issuetype": {"name": "Test"}, "status": {"name": "Done"},
+                "priority": {"name": "High"}, "creator": sample.U1, "reporter": sample.U1, "assignee": sample.U1,
+                "labels": [], "components": [], "fixVersions": [],
+                "created": "2024-03-01T10:00:00.000-0500", "updated": "2024-03-02T10:00:00.000-0500",
+                "description": None, "attachment": [],
+                "issuelinks": [{"type": {"name": "Relates"}, "outwardIssue": {"key": "QA-11"}}],
+            },
+            "renderedFields": {}, "changelog": [], "comments": [],
+            "zephyr_steps": [{"id": "1", "order": 1, "step": "Sign in", "data": "", "result": "Welcome page", "attachments": []}],
+        })
+        write_json(os.path.join(folder, "issues", "QA-11.json"), {
+            "id": "9011", "key": "QA-11",
+            "fields": {
+                "summary": "Login Story", "issuetype": {"name": "Story"}, "status": {"name": "Done"},
+                "priority": {"name": "High"}, "creator": sample.U1, "reporter": sample.U1, "assignee": sample.U1,
+                "labels": [], "components": [], "fixVersions": [],
+                "created": "2024-03-01T10:00:00.000-0500", "updated": "2024-03-02T10:00:00.000-0500",
+                "description": None, "attachment": [], "issuelinks": [],
+            },
+            "renderedFields": {}, "changelog": [], "comments": [],
+        })
+        write_json(os.path.join(folder, "zephyr-cycles.json"), {
+            "project_key": "QA", "project_id": "1",
+            "versions": [{"id": "-1", "name": "Unscheduled", "cycles": [
+                {"id": "c1", "name": "Smoke", "direct_keys": ["QA-10"], "folders": []}
+            ]}],
+        })
+
+        cfg = cfg_for(folder)
+        cfg["mapping"]["types"]["Test"] = "Test Case"
+        cfg["zephyr"]["enabled"] = True
+        cfg["zephyr"]["include_test_plans"] = True
+        q = lambda *a, **k: None
+
+        class NoTestPlanPermAdo(sample.FakeAdo):
+            def list_test_plans(self):
+                raise AdoError("HTTP 403 missing Test Management scope", 403)
+            def create_test_plan(self, *a, **k):
+                raise AdoError("HTTP 403", 403)
+            def create_static_suite(self, *a, **k):
+                raise AdoError("HTTP 403", 403)
+
+        ado = NoTestPlanPermAdo()
+        # Simulate already-migrated Test Case (without steps!) and already-migrated Story
+        tc_id = ado.create_item("Test Case", [
+            {"op": "add", "path": "/fields/System.Title", "value": "Login Test"},
+            {"op": "add", "path": "/fields/System.State", "value": "Ready"},
+            {"op": "add", "path": "/fields/System.Tags", "value": "QA-10"},
+        ])["id"]
+        st_id = ado.create_item("Product Backlog Item", [
+            {"op": "add", "path": "/fields/System.Title", "value": "Login Story"},
+            {"op": "add", "path": "/fields/System.State", "value": "Done"},
+            {"op": "add", "path": "/fields/System.Tags", "value": "QA-11"},
+        ])["id"]
+
+        res = sync_zephyr_steps(ado, cfg, USERS, log=q)
+        self.assertEqual(res["updated"], 1)
+        self.assertEqual(res["links_added"], 1)
+        self.assertIn("Sign in", ado.items[tc_id]["fields"]["Microsoft.VSTS.TCM.Steps"])
+        self.assertIn(
+            ("Microsoft.VSTS.Common.TestedBy-Reverse", ado.item_url(st_id)),
+            {(r["rel"], r["url"]) for r in ado.items[tc_id]["relations"]},
+        )
+        # 403 on Test Plans warned clearly without raising or losing steps/links
+        self.assertTrue(any("Test Management (Read & write)" in w for w in res["warnings"]))
+        # Second backfill run is a no-op on steps & links
+        res2 = sync_zephyr_steps(ado, cfg, USERS, log=q)
+        self.assertEqual((res2["updated"], res2["unchanged"], res2["links_added"]), (0, 1, 0))
+
+    def test_adf_table_macro_fallback_and_ado_test_plan_rest_client(self):
+        from jira2ado.ado_client import AdoClient
+        from jira2ado.planner import _description_html
+
+        iss = {
+            "fields": {
+                "description": {
+                    "type": "doc",
+                    "content": [{
+                        "type": "table",
+                        "content": [{
+                            "type": "tableRow",
+                            "content": [{"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Precond A"}]}]}],
+                        }],
+                    }],
+                },
+                "attachment": [],
+            },
+            "renderedFields": {"description": "<p>Intro</p><!-- ADF macro (type = 'table') -->"},
+        }
+        html = _description_html(iss)
+        self.assertIn("<table", html)
+        self.assertIn("Precond A", html)
+
+        calls = []
+
+        class MockResp:
+            def __init__(self, code, payload):
+                self.status_code = code
+                self.headers = {"Content-Type": "application/json"}
+                self._p = payload
+                self.text = json.dumps(payload)
+            def json(self):
+                return self._p
+
+        class MockSession:
+            headers = {}
+            def request(self, method, url, **kw):
+                calls.append((method, url, kw.get("json")))
+                if method == "GET" and url.endswith("/_apis/testplan/plans"):
+                    return MockResp(200, {"value": []})
+                if method == "POST" and url.endswith("/_apis/testplan/plans"):
+                    return MockResp(200, {"id": 10, "name": kw["json"]["name"], "rootSuite": {"id": 11}})
+                if method == "GET" and url.endswith("/_apis/testplan/Plans/10/suites"):
+                    return MockResp(200, {"value": [{"id": 11, "name": "R1"}]})
+                if method == "POST" and url.endswith("/_apis/testplan/Plans/10/suites"):
+                    return MockResp(200, {"id": 12, "name": kw["json"]["name"], "parentSuite": kw["json"]["parentSuite"]})
+                if method == "POST" and "/testcases/" in url:
+                    return MockResp(409, {"message": "already exists"})
+                return MockResp(200, {})
+
+        c = AdoClient("https://dev.azure.com/org", "Shop", "tok", session=MockSession())
+        self.assertEqual(c.list_test_plans(), [])
+        p = c.create_test_plan("R1", area_path="Shop", iteration="Shop")
+        self.assertEqual((p["id"], p["rootSuite"]["id"]), (10, 11))
+        self.assertEqual(len(c.list_test_suites(10)), 1)
+        s = c.create_static_suite(10, 11, "Cycle 1")
+        self.assertEqual(s["id"], 12)
+        self.assertEqual(calls[-1][2]["suiteType"], "staticTestSuite")
+        self.assertEqual(c.add_test_cases_to_suite(10, 12, [101, 102]), 2)
 
 
 if __name__ == "__main__":

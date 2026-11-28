@@ -34,6 +34,15 @@ def resolve_config_path(path):
 
 DEFAULTS = {
     "jira": {"base_url": "", "jql": "", "board_id": None, "board_name": None},
+    "zephyr": {
+        "enabled": False,
+        "provider": "squad",
+        "base_url": "https://prod-api.zephyr4jiracloud.com/connect",
+        "include_step_attachments": True,
+        "link_as_tested_by": True,
+        "include_test_plans": True,
+        "test_issue_types": ["Test", "Test Case"],
+    },
     "ado": {
         "org_url": "",
         "project": "",
@@ -41,6 +50,7 @@ DEFAULTS = {
         "area_path": None,
         "create_area": False,
         "subscribe_team_iterations": True,
+        "create_board_teams": True,
         "api_version": "7.1",
         # Ask for the project's name instead of "yes" before writing. Keep true for production projects.
         "confirm_with_project_name": True,
@@ -138,6 +148,7 @@ DEFAULTS = {
         "points_jira_names": ["Story Points", "Story point estimate"],
         "sprint_jira_name": "Sprint",
         "sprints_to_iterations": True,
+        "boards_to_areas": False,
         "tags": {"labels": True, "components": "component:", "versions": "version:", "jira_key": True},
         "jira_key_field": None,  # e.g. Custom.JiraKey, if you add that field to the process
         "links": {
@@ -158,23 +169,59 @@ DEFAULTS = {
 }
 
 
-def load_dotenv(path=".env"):
-    """Load key=value pairs from a local .env file if present, without overwriting existing env vars."""
-    if not os.path.exists(path):
-        return
+def _dotenv_candidates(path=None):
+    """Return candidate secret file paths in priority order (never committed to git)."""
+    if path:
+        return [path]
+    cands = []
+    env_override = (os.environ.get("JIRA2ADO_SECRETS_FILE") or "").strip()
+    if env_override:
+        cands.append(os.path.expanduser(env_override))
+    for name in (".env", ".secrets.env"):
+        cands.append(name)
+        bundled = os.path.join(BUNDLE_DIR, name)
+        if os.path.abspath(bundled) != os.path.abspath(name):
+            cands.append(bundled)
+    return cands
+
+
+def find_dotenv(path=None):
+    """Return the first existing local credentials file path, or None."""
+    for cand in _dotenv_candidates(path):
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
+
+def read_dotenv(path=None):
+    """Parse key=value pairs from the local credentials file without mutating os.environ."""
+    found = find_dotenv(path)
+    if not found:
+        return {}
+    out = {}
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(found, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip().strip('"').strip("'")
-                if k and k not in os.environ:
-                    os.environ[k] = v
+                if k:
+                    out[k] = v
     except OSError:
-        pass
+        return {}
+    return out
+
+
+def load_dotenv(path=None):
+    """Load key=value pairs from a local .env / secrets file if present, without overwriting existing env vars."""
+    for k, v in read_dotenv(path).items():
+        if k and k not in os.environ:
+            os.environ[k] = v
 
 
 def _merge(base, over):
@@ -207,8 +254,11 @@ def load(path):
         cfg["jira"]["base_url"] = os.environ["JIRA_BASE_URL"]
     if os.environ.get("ADO_ORG_URL") and not user.get("ado", {}).get("org_url"):
         cfg["ado"]["org_url"] = os.environ["ADO_ORG_URL"]
+    if os.environ.get("ZEPHYR_BASE_URL") and not user.get("zephyr", {}).get("base_url"):
+        cfg["zephyr"]["base_url"] = os.environ["ZEPHYR_BASE_URL"]
     cfg["jira"]["base_url"] = (cfg["jira"]["base_url"] or "").rstrip("/")
     cfg["ado"]["org_url"] = (cfg["ado"]["org_url"] or "").rstrip("/")
+    cfg["zephyr"]["base_url"] = (cfg["zephyr"].get("base_url") or "https://prod-api.zephyr4jiracloud.com/connect").rstrip("/")
     return cfg
 
 
@@ -218,3 +268,8 @@ def secret(name):
     if not v:
         raise SystemExit(f"Set the {name} environment variable first.")
     return v
+
+
+def secret_optional(name):
+    load_dotenv()
+    return (os.environ.get(name) or "").strip()

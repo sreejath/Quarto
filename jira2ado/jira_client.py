@@ -42,9 +42,41 @@ class JiraClient:
             return r
         raise RuntimeError(f"Jira {method} {url} kept failing after retries")
 
+    def myself_details(self):
+        """Return the raw /rest/api/3/myself profile dict (including accountId)."""
+        return self._request("GET", "/rest/api/3/myself").json()
+
     def myself(self):
-        me = self._request("GET", "/rest/api/3/myself").json()
+        me = self.myself_details()
         return me.get("displayName") or me.get("emailAddress") or me.get("accountId")
+
+    def project_info(self, project_key):
+        """Return {id, key, name} for a single Jira project."""
+        data = self._request("GET", f"/rest/api/3/project/{project_key}").json()
+        return {"id": str(data.get("id") or ""), "key": data.get("key") or project_key, "name": data.get("name") or ""}
+
+    def project_versions(self, project_key):
+        """Return all Jira project releases/versions: [{id, name, released, releaseDate, startDate, description}]."""
+        try:
+            data = self._request("GET", f"/rest/api/3/project/{project_key}/versions").json()
+        except RuntimeError as e:
+            if " 404 " in str(e) or " 403 " in str(e):
+                return []
+            raise
+        if not isinstance(data, list):
+            return []
+        return [
+            {
+                "id": str(v.get("id")),
+                "name": (v.get("name") or "").strip(),
+                "released": bool(v.get("released")),
+                "startDate": v.get("startDate") or "",
+                "releaseDate": v.get("releaseDate") or "",
+                "description": v.get("description") or "",
+            }
+            for v in data
+            if isinstance(v, dict) and v.get("id") is not None and v.get("name")
+        ]
 
     def projects(self):
         """Every Jira project this account can see: [{key, name}], sorted by key."""
@@ -162,6 +194,31 @@ class JiraClient:
             "GET", f"/rest/api/3/issue/{key}", params={"fields": "*all", "expand": "renderedFields,changelog"}
         ).json()
 
+    def search_issues_batch(self, keys):
+        """Fetch up to 50 full issues in a single HTTP request via /rest/api/3/search/jql."""
+        if not keys:
+            return {}
+        quoted = ",".join(f'"{k}"' for k in keys)
+        jql = f"key in ({quoted})"
+        out, token = {}, None
+        while True:
+            body = {
+                "jql": jql,
+                "maxResults": max(50, len(keys)),
+                "fields": ["*all"],
+                "expand": "renderedFields,changelog",
+            }
+            if token:
+                body["nextPageToken"] = token
+            data = self._request("POST", "/rest/api/3/search/jql", json=body).json()
+            for iss in data.get("issues") or []:
+                if iss.get("key"):
+                    out[iss["key"]] = iss
+            token = data.get("nextPageToken")
+            if not token or data.get("isLast"):
+                break
+        return out
+
     def _paged(self, path, list_key, params=None):
         start, out = 0, []
         while True:
@@ -184,16 +241,20 @@ class JiraClient:
         """Full worklog list for time-tracking migration."""
         try:
             return self._paged(f"/rest/api/3/issue/{key}/worklog", "worklogs", {"expand": "renderedBody"})
-        except RuntimeError:
-            return []
+        except RuntimeError as e:
+            if " 404 " in str(e) or " 403 " in str(e):
+                return []  # time tracking disabled on this Jira project
+            raise
 
     def remote_links(self, key):
         """Remote issue links (Confluence pages, web links, external tickets, PRs)."""
         try:
             data = self._request("GET", f"/rest/api/3/issue/{key}/remotelink").json()
             return data if isinstance(data, list) else []
-        except RuntimeError:
-            return []
+        except RuntimeError as e:
+            if " 404 " in str(e) or " 403 " in str(e):
+                return []  # remote links disabled on this Jira project
+            raise
 
     def dev_links(self, issue_id):
         """Extract Git PRs, branches, and commits from Jira's development panel if available."""
@@ -252,11 +313,30 @@ class JiraClient:
         return self._request("GET", "/rest/api/3/status").json()
 
     def download(self, url, dest):
+        from urllib.parse import urlparse
+        if url.startswith("http"):
+            base_p = urlparse(self.base)
+            target_p = urlparse(url)
+            if target_p.scheme.lower() != "https" or target_p.netloc.lower() != base_p.netloc.lower():
+                raise RuntimeError(f"Refusing to send Jira credentials to untrusted attachment URL: {url}")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         # redirect=false makes Jira serve the file itself instead of sending the
         # client on to api.media.atlassian.com, which many networks block.
         params = {"redirect": "false"} if "/attachment/content/" in url else None
-        r = self._request("GET", url, stream=True, params=params)
+        r = self._request("GET", url, stream=True, params=params, allow_redirects=False)
+        if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+            loc = r.headers["Location"]
+            loc_p = urlparse(loc)
+            base_p = urlparse(self.base)
+            if not loc.startswith("http") or loc_p.netloc.lower() == base_p.netloc.lower():
+                r = self._request("GET", loc, stream=True)
+            elif loc_p.scheme.lower() == "https":
+                # Follow pre-signed media redirect WITHOUT sending Jira Basic Auth credentials
+                r = requests.get(loc, stream=True, timeout=120)
+                if r.status_code >= 400:
+                    raise RuntimeError(f"Jira attachment redirect failed: {r.status_code}")
+            else:
+                raise RuntimeError(f"Refusing insecure attachment redirect: {loc}")
         tmp = dest + ".part"
         with open(tmp, "wb") as fh:
             for chunk in r.iter_content(1 << 20):

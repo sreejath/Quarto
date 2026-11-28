@@ -13,6 +13,11 @@ dist/
 .env
 .env.*
 !.env.example
+.secrets.env
+secrets.env
+secrets.yaml
+secrets.yml
+credentials.env
 ui-settings.json
 *users*.csv
 configs/local/

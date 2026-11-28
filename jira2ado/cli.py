@@ -24,12 +24,17 @@ def _ado(cfg):
     return AdoClient(cfg["ado"]["org_url"], cfg["ado"]["project"], config.secret("ADO_PAT"), cfg["ado"]["api_version"])
 
 
+def _zephyr(cfg, jira=None):
+    from .zephyr_client import make_zephyr_client
+    return make_zephyr_client(cfg, jira=jira)
+
+
 def _users(cfg):
     return load_users_file(cfg["paths"]["users_file"]) or {"ids": {}, "names": {}}
 
 
 def cmd_access(cfg, a):
-    """Confirm both tokens work before anything else runs."""
+    """Confirm tokens work before anything else runs."""
     problems, jira = [], None
     try:
         jira = _jira(cfg)
@@ -46,6 +51,13 @@ def cmd_access(cfg, a):
                 problems.append("No Jira tickets match the query, so there is nothing to migrate.")
         except Exception as e:
             problems.append(f"Jira did not accept the query. {e}")
+    if (cfg.get("zephyr") or {}).get("enabled"):
+        try:
+            z = _zephyr(cfg, jira=jira)
+            z.check_access()
+            print("Zephyr Squad: API keys accepted")
+        except BaseException as e:
+            problems.append(f"Zephyr Squad access failed: {e}")
     try:
         who = _ado(cfg).check_access()
         print(f"Azure DevOps: reached project '{cfg['ado']['project']}'" + (f", signed in as {who}" if who else ""))
@@ -181,14 +193,34 @@ def cmd_prepare(a):
                                        users_file="users.csv")
     m = raw.setdefault("mapping", {})
     m.update(only_sprints=only_sprints, skip_future_sprints=False, iteration_override=a.iteration or None)
+    b2a = getattr(a, "boards_to_areas", None)
+    if b2a is None:
+        b2a = (mode == "project")
+    m["boards_to_areas"] = bool(b2a)
+    cbt = getattr(a, "create_board_teams", None)
+    if cbt is not None:
+        raw.setdefault("ado", {})["create_board_teams"] = bool(cbt)
+    elif b2a:
+        raw.setdefault("ado", {}).setdefault("create_board_teams", True)
     if getattr(a, "include_hierarchy", False):
         m["include_hierarchy"] = True
     if getattr(a, "history", None) in ("true", "false"):
         m["history"] = a.history == "true"
+    z_cfg = raw.setdefault("zephyr", {})
+    inc_z = getattr(a, "include_zephyr", None)
+    if inc_z is not None:
+        z_cfg["enabled"] = bool(inc_z)
+    inc_tp = getattr(a, "include_test_plans", None)
+    if inc_tp is not None:
+        z_cfg["include_test_plans"] = bool(inc_tp)
     raw["run"] = {"mode": mode, "from": source, "to": project, "board_id": board_id, "board_name": board_name,
                   "include_done": bool(a.include_done),
                   "include_hierarchy": bool(m.get("include_hierarchy", False)),
                   "history": bool(m.get("history", True)),
+                  "boards_to_areas": bool(m.get("boards_to_areas", False)),
+                  "create_board_teams": bool(raw.get("ado", {}).get("create_board_teams", True)),
+                  "include_zephyr": bool(z_cfg.get("enabled", False)),
+                  "include_test_plans": bool(z_cfg.get("include_test_plans", True)),
                   "iteration": a.iteration or None,
                   "sprints": [{"id": s["id"], "number": s["id"], "name": s["name"], "state": s.get("state"),
                                "goal": s.get("goal", ""),
@@ -218,6 +250,9 @@ def cmd_prepare(a):
         say(f"Jira scope:   Entire project {source} ({len(chosen)} sprint(s) discovered)")
     say(f"From:         Jira project {source}, " + ("all statuses" if a.include_done else "status not Done"))
     say(f"To:           Azure DevOps project {project}" + (f" (settings from {a.targets})" if match else ""))
+    if m.get("boards_to_areas"):
+        say("Boards:       per-board Area Paths & nested Sprint Iterations"
+            + (" + auto-create ADO Teams" if raw["ado"].get("create_board_teams", True) else ""))
     if a.iteration:
         say(f"Iteration:    every ticket goes to {a.iteration}")
     else:
@@ -304,7 +339,8 @@ def _below_root(path, project):
 
 
 def cmd_export(cfg, a):
-    export(_jira(cfg), cfg, force=a.force)
+    jira = _jira(cfg)
+    export(jira, cfg, force=a.force, zephyr=_zephyr(cfg, jira=jira))
 
 
 def cmd_users(cfg, a):
@@ -370,7 +406,7 @@ def cmd_check(cfg, a):
         write_json(os.path.join(state_dir(cfg), "ado-meta.json"), ado_meta)
 
     types, pairs, places, plans, issues = Counter(), Counter(), Counter(), [], []
-    planner = Planner(cfg, meta, users, valid_states_by_type=valid, available_wits=available_wits)
+    planner = Planner(cfg, meta, users, valid_states_by_type=valid, available_wits=available_wits, issues=raw_issues)
     for issue in raw_issues:
         wit = type_for(issue, cfg, available_wits)
         types[(issue["fields"]["issuetype"]["name"], wit)] += 1
@@ -392,6 +428,9 @@ def cmd_check(cfg, a):
     report = {"project": project, "org_url": cfg["ado"]["org_url"], "jql": cfg["jira"]["jql"],
               "jira_url": cfg["jira"]["base_url"], "area_path": cfg["ado"].get("area_path"),
               "confirm_with_project_name": bool(cfg["ado"].get("confirm_with_project_name")),
+              "boards_to_areas": bool(cfg["mapping"].get("boards_to_areas")),
+              "create_board_teams": bool(cfg["ado"].get("create_board_teams", True)),
+              "boards": list(meta.get("boards") or []),
               "online": bool(a.online), "issues": len(plans), "run": cfg.get("run"),
               "available_wits": available_wits or sorted(used_wits)}
 
@@ -448,16 +487,44 @@ def cmd_check(cfg, a):
 
     print("\nWhere the items will go:")
     report["places"] = []
+    known_iters = None
+    known_areas = None
+    if a.online and ado:
+        if getattr(ado, "iteration_paths", None):
+            try:
+                known_iters = {"\\".join(name_key(p) for p in x.replace("/", "\\").split("\\") if p) for x in (ado.iteration_paths() or [])}
+            except Exception:
+                known_iters = None
+        if getattr(ado, "area_paths", None):
+            try:
+                known_areas = {"\\".join(name_key(p) for p in x.replace("/", "\\").split("\\") if p) for x in (ado.area_paths() or [])}
+            except Exception:
+                known_areas = None
     for (area, it), c in sorted(places.items()):
-        note, exists = "", None
-        if a.online and getattr(ado, "node_exists", None):
-            rel = _below_root(it, project)
-            exists = True if not rel else ado.node_exists("Iterations", rel)
-            if not exists:
+        note, exists, area_exists = "", None, None
+        if a.online and ado:
+            rel_it = _below_root(it, project)
+            if known_iters is not None:
+                norm_it = "\\".join(name_key(p) for p in rel_it.replace("/", "\\").split("\\") if p)
+                exists = True if not rel_it else norm_it in known_iters
+            elif getattr(ado, "node_exists", None):
+                exists = True if not rel_it else ado.node_exists("Iterations", rel_it)
+            rel_area = _below_root(area, project)
+            if known_areas is not None:
+                norm_area = "\\".join(name_key(p) for p in rel_area.replace("/", "\\").split("\\") if p)
+                area_exists = True if not rel_area else norm_area in known_areas
+            elif getattr(ado, "node_exists", None):
+                area_exists = True if not rel_area else ado.node_exists("Areas", rel_area)
+            if area_exists is False and exists is False:
+                note = "   <-- area & iteration do not exist yet; the import creates them"
+            elif area_exists is False:
+                note = "   <-- area does not exist yet; the import creates it"
+            elif exists is False:
                 note = "   <-- iteration does not exist yet; the import creates it (needs 'Create child nodes')"
-            elif rel:
+            elif rel_it:
                 note = "   (iteration exists)"
-        report["places"].append({"area": area, "iteration": it, "count": c, "iteration_exists": exists})
+        report["places"].append({"area": area, "iteration": it, "count": c,
+                                 "iteration_exists": exists, "area_exists": area_exists})
         print(f"  {c} item(s): area {area}, iteration {it}{note}")
 
     journal = Journal(journal_path(cfg), readonly=True)
@@ -547,6 +614,17 @@ def cmd_check(cfg, a):
             "comments": len(issue.get("comments") or []),
             "attachments": len(f.get("attachment") or []),
             "worklogs": len(issue.get("worklogs") or []),
+            "test_steps": len(issue.get("zephyr_steps") or []),
+            "zephyr_steps_preview": [
+                {
+                    "order": st.get("order"),
+                    "step": (st.get("step") or "")[:240],
+                    "data": (st.get("data") or "")[:240],
+                    "result": (st.get("result") or "")[:240],
+                    "attachments_count": len(st.get("attachments") or []),
+                }
+                for st in (issue.get("zephyr_steps") or [])[:20]
+            ],
             "links": len(f.get("issuelinks") or []) + (1 if (f.get("parent") or {}).get("key") else 0) + len(issue.get("remotelinks") or []) + len(issue.get("devlinks") or []),
             "hierarchy_auto_included": bool(issue.get("hierarchy_auto_included")),
             "outcome": outcome,
@@ -560,6 +638,17 @@ def cmd_check(cfg, a):
         })
     report["tickets"] = tickets
     report["same_summary"] = same_groups
+    cyc_data = read_json(os.path.join(out, "zephyr-cycles.json"), {}) or {}
+    z_versions = cyc_data.get("versions") or []
+    report["zephyr"] = {
+        "enabled": bool((cfg.get("zephyr") or {}).get("enabled")),
+        "include_test_plans": bool((cfg.get("zephyr") or {}).get("include_test_plans", True)),
+        "cases_with_steps": sum(1 for t in tickets if t.get("test_steps", 0) > 0),
+        "total_steps": sum(t.get("test_steps", 0) for t in tickets),
+        "versions": len(z_versions),
+        "cycles": sum(len(v.get("cycles") or []) for v in z_versions),
+        "folders": sum(len(c.get("folders") or []) for v in z_versions for c in (v.get("cycles") or [])),
+    }
 
     people = collect_users(out, issues=issues)
     rows = load_users_file(cfg["paths"]["users_file"], raw=True)
@@ -576,6 +665,7 @@ def cmd_check(cfg, a):
     ]
     report["mode"] = "full history" if cfg["mapping"]["history"] else "current values, comments and attachments"
     report["links"] = cfg["mapping"].get("link_mode", "all")
+    report["coalesced_noops"] = bool(planner.coalesce_noops)
     report["warnings"] = list(planner.warnings)
     print(f"\nMode: {report['mode']}; links: {report['links']}")
     print(f"\nWarnings: {len(planner.warnings)}")
@@ -603,7 +693,7 @@ def cmd_plan(cfg, a):
 
 
 def cmd_import(cfg, a):
-    from .importer import import_items, import_links, state_dir
+    from .importer import import_items, import_links, import_test_plans, state_dir
     ado = _ado(cfg)
     stats = import_items(ado, cfg, _users(cfg), only=set(a.keys) or None, limit=a.limit,
                          possible_duplicates=a.possible_duplicates)
@@ -614,6 +704,15 @@ def cmd_import(cfg, a):
           + (f", created and tagged 'Possible duplicate': {tagged}" if tagged else "")
           + (f", delta synced: {len(stats.get('synced', []))}" if stats.get("synced") else "")
           + f", revisions written {stats['revisions']}, failed {len(stats['failed'])}, warnings {len(stats['warnings'])}")
+    if not a.no_links:
+        # Link every work item that already has a valid ADO id in journal.items (even if a later revision on that item needs retry)
+        links = import_links(ado, cfg)
+        write_json(os.path.join(state_dir(cfg), "link-report.json"), links)
+    if (cfg.get("zephyr") or {}).get("enabled") and (cfg.get("zephyr") or {}).get("include_test_plans", True):
+        pstats = import_test_plans(ado, cfg)
+        write_json(os.path.join(state_dir(cfg), "test-plans-report.json"), pstats)
+        if pstats.get("warnings"):
+            stats["warnings"] = list(stats["warnings"]) + list(pstats["warnings"])
     write_json(os.path.join(state_dir(cfg), "import-warnings.json"),
                {"failed": stats["failed"], "warnings": stats["warnings"]})
     write_json(os.path.join(state_dir(cfg), "import-result.json"), {
@@ -625,13 +724,51 @@ def cmd_import(cfg, a):
         "remaining": stats.get("remaining", 0),
         "paused": bool(stats.get("paused")),
         "tagged": sorted(set(stats["possible"]) - set(stats["held"]) - set(stats.get("synced", [])))})
-    if not a.no_links:
-        links = import_links(ado, cfg, skip_keys=set(stats["failed"]))
-        write_json(os.path.join(state_dir(cfg), "link-report.json"), links)
     if stats["failed"]:
         sys.exit(1)
     if stats.get("paused"):
         sys.exit(2)
+
+
+def cmd_sync_zephyr(cfg, a):
+    """Fetch Zephyr Squad steps/cycles (unless --no-fetch) and backfill them onto existing ADO Test Cases."""
+    from .exporter import _attach_zephyr_steps, export_zephyr_cycles, issue_path
+    from .importer import load_meta, state_dir, sync_zephyr_steps
+    from .zephyr import is_test_case_issue
+    cfg.setdefault("zephyr", {})["enabled"] = True
+    if getattr(a, "no_test_plans", False):
+        cfg["zephyr"]["include_test_plans"] = False
+    out = cfg["paths"]["export_dir"]
+    meta = load_meta(cfg)
+    if not getattr(a, "no_fetch", False):
+        jira = _jira(cfg)
+        z = _zephyr(cfg, jira=jira)
+        z.check_access()
+        all_issues = list(load_issues(out))
+        proj_key = ((cfg.get("run") or {}).get("from") or "").strip().upper()
+        if not meta.get("project_id") and proj_key and getattr(jira, "project_info", None):
+            try:
+                meta["project_id"] = str((jira.project_info(proj_key) or {}).get("id") or "")
+            except Exception:
+                pass
+        fetched = 0
+        for iss in all_issues:
+            if not is_test_case_issue(iss, cfg):
+                continue
+            if _attach_zephyr_steps(z, iss, out, cfg, meta=meta):
+                write_json(issue_path(out, iss["key"]), iss)
+                fetched += 1
+        print(f"Fetched Zephyr steps for {fetched} Test Case issue(s).")
+        if cfg["zephyr"].get("include_test_plans", True):
+            export_zephyr_cycles(jira, z, cfg, out, meta, keys=[i["key"] for i in all_issues])
+        write_json(os.path.join(out, "meta.json"), meta)
+    res = sync_zephyr_steps(_ado(cfg), cfg, _users(cfg))
+    write_json(os.path.join(state_dir(cfg), "zephyr-sync-report.json"), res)
+    print(f"Zephyr backfill finished: {res['updated']} updated, {res['unchanged']} already up to date, "
+          f"{res['links_added']} link(s) added, {res['plans_created']} plan(s) & {res['suites_created']} suite(s) created, "
+          f"{len(res['failed'])} failed.")
+    if res["failed"]:
+        sys.exit(1)
 
 
 def cmd_links(cfg, a):
@@ -672,6 +809,22 @@ def main(argv=None):
     s.add_argument("--include-done", action="store_true", help="also take tickets whose status is Done")
     s.add_argument("--include-hierarchy", action="store_true", help="auto-include parent Epics and child Sub-tasks")
     s.add_argument("--history", choices=["true", "false"], help="override history mode (true or false)")
+    s.add_argument("--boards-to-areas", dest="boards_to_areas", action="store_true", default=None,
+                   help="organize tickets into per-board Area Paths & nested Iteration Paths (default on for --mode project)")
+    s.add_argument("--no-boards-to-areas", dest="boards_to_areas", action="store_false",
+                   help="keep tickets at the project/configured Area Path and flat sprint iterations")
+    s.add_argument("--create-board-teams", dest="create_board_teams", action="store_true", default=None,
+                   help="auto-create an ADO Team per Jira board when --boards-to-areas is active (default on)")
+    s.add_argument("--no-create-board-teams", dest="create_board_teams", action="store_false",
+                   help="do not auto-create ADO Teams for Jira boards")
+    s.add_argument("--include-zephyr", dest="include_zephyr", action="store_true", default=None,
+                   help="fetch Zephyr Squad test steps, step attachments, Tested By links, and Test Cycles")
+    s.add_argument("--no-include-zephyr", dest="include_zephyr", action="store_false",
+                   help="disable Zephyr Squad test step migration")
+    s.add_argument("--include-test-plans", dest="include_test_plans", action="store_true", default=None,
+                   help="migrate Zephyr Test Cycles & Folders into Azure Test Plans & Suites (default on with --include-zephyr)")
+    s.add_argument("--no-include-test-plans", dest="include_test_plans", action="store_false",
+                   help="skip Azure Test Plans & Suites creation")
     s.add_argument("--jira-url", help="Atlassian Jira base URL")
     s.add_argument("--ado-url", help="Azure DevOps organization URL")
     s.add_argument("--base", default=os.path.join("configs", "enterprise-development.yaml"))
@@ -698,13 +851,16 @@ def main(argv=None):
     s.add_argument("--report", default="verify-report.csv")
     s.add_argument("keys", nargs="*", help="only verify these Jira keys and merge into existing report")
     sub.add_parser("rollback", help="undo the run by deleting work items it created in ADO")
+    s = sub.add_parser("sync-zephyr", help="backfill Zephyr Squad test steps, Tested By links, and Test Plans onto existing ADO Test Cases")
+    s.add_argument("--no-fetch", action="store_true", help="use already-exported Zephyr steps/cycles on disk without calling Zephyr")
+    s.add_argument("--no-test-plans", action="store_true", help="skip Azure Test Plans & Suites creation")
     a = p.parse_args(argv)
     if a.cmd == "prepare":
         return cmd_prepare(a)
     cfg = config.load(a.config)
     {"show": cmd_show, "duplicates": cmd_duplicates, "access": cmd_access, "export": cmd_export, "users": cmd_users,
      "check": cmd_check, "plan": cmd_plan, "import": cmd_import, "links": cmd_links, "verify": cmd_verify,
-     "rollback": cmd_rollback}[a.cmd](cfg, a)
+     "rollback": cmd_rollback, "sync-zephyr": cmd_sync_zephyr}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":

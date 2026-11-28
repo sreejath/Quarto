@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
@@ -26,6 +27,7 @@ import yaml
 from .. import config
 from ..ado_client import AdoClient, AdoError
 from ..jira_client import JiraClient
+from ..zephyr_client import DEFAULT_SQUAD_URL, ZephyrError, ZephyrSquadClient
 
 if getattr(sys, "frozen", False):
     BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -58,8 +60,9 @@ class State:
     def __init__(self):
         self.key = secrets.token_urlsafe(24)
         self.port = None
-        self.tokens = {}     # jira_url, jira_email, jira_token, ado_url, ado_token
-        self.names = {}      # jira, ado: signed-in names
+        self.tokens = {}     # jira_url, jira_email, jira_token, ado_url, ado_token, zephyr_*
+        self.names = {}      # jira, ado, zephyr: signed-in names
+        self.connected_from_env = False
         self.jobs = {}
         self.current = None  # the job that is running, if any
         self.lock = threading.Lock()
@@ -106,6 +109,129 @@ def active_jira_url():
 
 def active_ado_url():
     return _norm_url(S.tokens.get("ado_url") or load_settings().get("ado_url") or base_cfg()["ado"]["org_url"])
+
+
+def active_zephyr_url():
+    return _norm_url(
+        S.tokens.get("zephyr_base_url")
+        or load_settings().get("zephyr_base_url")
+        or (base_cfg().get("zephyr") or {}).get("base_url")
+        or DEFAULT_SQUAD_URL
+    )
+
+
+_PLACEHOLDER_PREFIXES = ("your_", "https://your-org.", "you@company.com")
+
+
+def _is_placeholder(val):
+    v = (val or "").strip().lower()
+    return (not v) or any(v.startswith(p) for p in _PLACEHOLDER_PREFIXES)
+
+
+def _find_local_env_file():
+    for cand in (
+        (os.environ.get("JIRA2ADO_SECRETS_FILE") or "").strip(),
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(KIT, ".env"),
+        os.path.join(os.getcwd(), ".secrets.env"),
+        os.path.join(KIT, ".secrets.env"),
+    ):
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _connect_credentials(j_url, email, jt, a_url, at, z_ak="", z_sk="", z_url="", from_env=False):
+    out, problems = {}, {}
+    account_id = ""
+    if _is_double_paste(jt):
+        problems["jira"] = "That looks like the Jira API token pasted twice. Paste it once."
+    else:
+        try:
+            jc = JiraClient(j_url, email, jt)
+            if getattr(jc, "myself_details", None):
+                me = jc.myself_details() or {}
+                out["jira"] = me.get("displayName") or me.get("emailAddress") or me.get("accountId") or email
+                account_id = (me.get("accountId") or "").strip()
+            else:
+                out["jira"] = jc.myself()
+        except Exception as e:
+            problems["jira"] = ("Jira did not accept the email and API token. Check both and paste the token once."
+                                if " 401 " in str(e) or " 403 " in str(e) else f"Could not reach Jira at {j_url}: {e}")
+    if _is_double_paste(at):
+        problems["ado"] = "That looks like the Azure DevOps token pasted twice. Paste it once."
+    else:
+        try:
+            out["ado"] = AdoClient(a_url, "", at).whoami() or "your account"
+        except AdoError as e:
+            problems["ado"] = str(e)
+        except Exception as e:
+            problems["ado"] = f"Could not reach Azure DevOps at {a_url}: {e}"
+    z_ak = (z_ak or "").strip()
+    z_sk = (z_sk or "").strip()
+    z_url = _norm_url(z_url or active_zephyr_url())
+    if z_ak or z_sk:
+        if not (z_ak and z_sk):
+            problems["zephyr"] = "Provide both the Zephyr Squad Access Key and Secret Key."
+        elif _is_double_paste(z_ak) or _is_double_paste(z_sk):
+            problems["zephyr"] = "That looks like a Zephyr key pasted twice. Paste each key once."
+        else:
+            try:
+                ZephyrSquadClient(z_ak, z_sk, account_id, base_url=z_url).check_access()
+                out["zephyr"] = "Zephyr Squad Cloud"
+            except ZephyrError as e:
+                problems["zephyr"] = str(e)
+            except Exception as e:
+                problems["zephyr"] = f"Could not reach Zephyr Squad at {z_url}: {e}"
+    if "jira" in out:
+        S.tokens.update(jira_url=j_url, jira_email=email, jira_token=jt)
+        if account_id:
+            S.tokens["zephyr_account_id"] = account_id
+        S.names["jira"] = out["jira"]
+    if "ado" in out:
+        S.tokens.update(ado_url=a_url, ado_token=at)
+        S.names["ado"] = out["ado"]
+    if "zephyr" in out:
+        S.tokens.update(zephyr_access_key=z_ak, zephyr_secret_key=z_sk, zephyr_base_url=z_url)
+        S.names["zephyr"] = out["zephyr"]
+    elif not (z_ak or z_sk):
+        for k in ("zephyr_access_key", "zephyr_secret_key", "zephyr_base_url"):
+            S.tokens.pop(k, None)
+        S.names.pop("zephyr", None)
+    S.connected_from_env = bool(from_env and "jira" in out and "ado" in out)
+    save_settings(jira_email=email, jira_url=j_url, ado_url=a_url,
+                  zephyr_base_url=z_url if (z_ak and z_sk) else None)
+    return {
+        "jira": S.names.get("jira"),
+        "ado": S.names.get("ado"),
+        "zephyr": S.names.get("zephyr"),
+        "jira_url": j_url,
+        "ado_url": a_url,
+        "zephyr_url": z_url,
+        "connected_from_env": S.connected_from_env,
+        "problems": problems,
+    }
+
+
+def auto_connect_from_env(path=None):
+    """Read Jira, ADO, and optional Zephyr keys from the git-ignored local .env file and connect in memory."""
+    env_path = path or _find_local_env_file()
+    if not env_path:
+        return None
+    vals = config.read_dotenv(env_path)
+    b = base_cfg()
+    s = load_settings()
+    j_url = _norm_url(vals.get("JIRA_BASE_URL") or s.get("jira_url") or b["jira"]["base_url"])
+    email = (vals.get("JIRA_EMAIL") or s.get("jira_email") or "").strip()
+    jt = (vals.get("JIRA_API_TOKEN") or "").strip()
+    a_url = _norm_url(vals.get("ADO_ORG_URL") or s.get("ado_url") or b["ado"]["org_url"])
+    at = (vals.get("ADO_PAT") or "").strip()
+    z_ak = "" if _is_placeholder(vals.get("ZEPHYR_ACCESS_KEY")) else (vals.get("ZEPHYR_ACCESS_KEY") or "").strip()
+    z_sk = "" if _is_placeholder(vals.get("ZEPHYR_SECRET_KEY")) else (vals.get("ZEPHYR_SECRET_KEY") or "").strip()
+    z_url = (vals.get("ZEPHYR_BASE_URL") or "").strip()
+    if any(_is_placeholder(x) for x in (j_url, email, jt, a_url, at)):
+        return None
+    return _connect_credentials(j_url, email, jt, a_url, at, z_ak=z_ak, z_sk=z_sk, z_url=z_url, from_env=True)
 
 
 def jira():
@@ -165,10 +291,14 @@ class Job:
         self.stopped = False
         self.paused = False
         self.config_path = None
+        self.started_at = time.time()
+        self.finished_at = None
 
     def public(self, since=0):
+        end_ts = self.finished_at if self.finished_at is not None else time.time()
         return {"id": self.id, "kind": self.kind, "status": self.status, "error": self.error,
-                "steps": self.steps, "log": self.log[since:], "next": len(self.log), "result": self.result}
+                "steps": self.steps, "log": self.log[since:], "next": len(self.log), "result": self.result,
+                "started_at": self.started_at, "elapsed_seconds": round(max(0.0, end_ts - self.started_at), 1)}
 
 
 def env_with_tokens():
@@ -182,6 +312,12 @@ def env_with_tokens():
         PYTHONUNBUFFERED="1",
         PYTHONIOENCODING="utf-8",
     )
+    if S.tokens.get("zephyr_access_key") and S.tokens.get("zephyr_secret_key"):
+        env["ZEPHYR_ACCESS_KEY"] = S.tokens["zephyr_access_key"]
+        env["ZEPHYR_SECRET_KEY"] = S.tokens["zephyr_secret_key"]
+        env["ZEPHYR_BASE_URL"] = active_zephyr_url()
+        if S.tokens.get("zephyr_account_id"):
+            env["ZEPHYR_ACCOUNT_ID"] = S.tokens["zephyr_account_id"]
     return env
 
 
@@ -256,6 +392,8 @@ def start(job, target):
         except Exception as e:  # shown in the page instead of a silent failure
             job.status = "failed"
             job.error = job.error or str(e)
+        finally:
+            job.finished_at = time.time()
 
     threading.Thread(target=body, daemon=True).start()
     return job
@@ -297,6 +435,22 @@ def check_job(params, existing_cfg=None):
                 args += ["--include-hierarchy"]
             if params.get("history") is not None:
                 args += ["--history", "true" if params["history"] else "false"]
+            if params.get("boards_to_areas") is True:
+                args += ["--boards-to-areas"]
+            elif params.get("boards_to_areas") is False:
+                args += ["--no-boards-to-areas"]
+            if params.get("create_board_teams") is True:
+                args += ["--create-board-teams"]
+            elif params.get("create_board_teams") is False:
+                args += ["--no-create-board-teams"]
+            if params.get("include_zephyr") is True:
+                args += ["--include-zephyr"]
+            elif params.get("include_zephyr") is False:
+                args += ["--no-include-zephyr"]
+            if params.get("include_test_plans") is True:
+                args += ["--include-test-plans"]
+            elif params.get("include_test_plans") is False:
+                args += ["--no-include-test-plans"]
             code, out = run_step(job, 0, args)
             if code != 0:
                 job.status, job.error = "failed", last_message(job)
@@ -413,35 +567,27 @@ def import_job(params):
             raise ApiError(f"Invalid Jira ticket key '{k}'.", 400)
     apply_overrides_to_config(cfg_path, params)
     _clear_pause_file(cfg_path)
-    job = Job("import", ["Apply status & duplicate overrides", "Create & sync work items in Azure DevOps", "Verify migrated items"])
+    job = Job("import", ["Create & sync work items in Azure DevOps", "Verify migrated items"])
     job.config_path = cfg_path
 
     def work(job):
-        code, _ = run_step(job, 0, ["-c", cfg_path, "plan"], ok=(0,))
-        if code != 0:
-            job.status, job.error = "failed", last_message(job)
-            return
-        if job.paused:
-            _clear_pause_file(cfg_path)
-            job.status = "paused"
-            return
         imp_args = ["-c", cfg_path, "import", "--possible-duplicates", choice]
         if batch_size > 0:
             imp_args += ["--limit", str(batch_size)]
         if only_keys:
             imp_args += only_keys
-        code, _ = run_step(job, 1, imp_args, ok=(0, 2))
+        code, _ = run_step(job, 0, imp_args, ok=(0, 2))
         report = os.path.join(os.path.dirname(cfg_path), "verify.csv")
         res_pre = read_json_file(os.path.join(os.path.dirname(full_cfg), "import-result.json")) or {}
         batch_keys = res_pre.get("batch_keys") or []
         if os.path.exists(os.path.join(os.path.dirname(full_cfg), "import-state.jsonl")):
             if batch_size > 0:
                 if batch_keys:
-                    run_step(job, 2, ["-c", cfg_path, "verify", "--report", report] + list(batch_keys), ok=(0, 1))
+                    run_step(job, 1, ["-c", cfg_path, "verify", "--report", report] + list(batch_keys), ok=(0, 1))
                 else:
-                    job.steps[2]["status"] = "done"
+                    job.steps[1]["status"] = "done"
             else:
-                run_step(job, 2, ["-c", cfg_path, "verify", "--report", report], ok=(0, 1))
+                run_step(job, 1, ["-c", cfg_path, "verify", "--report", report], ok=(0, 1))
         r_data = run_data(cfg_path)
         job.result["run"] = r_data
         res_info = r_data.get("result") or {}
@@ -473,6 +619,28 @@ def rollback_job(params):
 
     def work(job):
         code, _ = run_step(job, 0, ["-c", cfg_path, "rollback"], ok=(0,))
+        job.result["run"] = run_data(cfg_path)
+        if code != 0:
+            job.status, job.error = "failed", last_message(job)
+            return
+
+    return start(job, work)
+
+
+def sync_zephyr_job(params):
+    cfg_path = params.get("config") or ""
+    inside_runs(cfg_path)
+    if not (S.tokens.get("zephyr_access_key") and S.tokens.get("zephyr_secret_key")):
+        raise ApiError("Connect Zephyr Squad API keys first (or add them to your local .env file).", 400)
+    include_plans = params.get("include_test_plans", True)
+    job = Job("sync_zephyr", ["Fetch Zephyr Squad steps/cycles & sync to Azure DevOps"])
+    job.config_path = cfg_path
+
+    def work(job):
+        args = ["-c", cfg_path, "sync-zephyr"]
+        if include_plans is False:
+            args += ["--no-test-plans"]
+        code, _ = run_step(job, 0, args, ok=(0,))
         job.result["run"] = run_data(cfg_path)
         if code != 0:
             job.status, job.error = "failed", last_message(job)
@@ -532,6 +700,16 @@ def run_data(cfg_path, include_preview=True):
                      if os.path.exists(os.path.join(full_folder, name))}}
     if include_preview:
         out["preview"] = read_json_file(os.path.join(full_folder, "preview.json"))
+    else:
+        export_dir = os.path.join(KIT, (cfg.get("paths") or {}).get("export_dir", ""))
+        keys_list = read_json_file(os.path.join(export_dir, "keys.json"))
+        if isinstance(keys_list, list) and keys_list:
+            issues_dir = os.path.join(export_dir, "issues")
+            try:
+                exp_count = sum(1 for fn in os.listdir(issues_dir) if fn.endswith(".json")) if os.path.isdir(issues_dir) else 0
+            except OSError:
+                exp_count = 0
+            out["export_progress"] = {"exported": min(exp_count, len(keys_list)), "total": len(keys_list)}
     return out
 
 
@@ -552,6 +730,7 @@ def ticket_detail(cfg_path, key):
     return {
         "key": key,
         "description_html": _description_html(iss, users.get("names") or "") or "",
+        "zephyr_steps": iss.get("zephyr_steps") or [],
     }
 
 
@@ -649,14 +828,29 @@ def api(method, path, query, body):
     if path == "/api/state":
         s = load_settings()
         b = base_cfg()
+        env_file = _find_local_env_file()
         return {
             "jira": S.names.get("jira"),
             "ado": S.names.get("ado"),
+            "zephyr": S.names.get("zephyr"),
             "jira_url": S.tokens.get("jira_url") or s.get("jira_url") or b["jira"].get("base_url") or "",
             "ado_url": S.tokens.get("ado_url") or s.get("ado_url") or b["ado"].get("org_url") or "",
+            "zephyr_url": S.tokens.get("zephyr_base_url") or s.get("zephyr_base_url") or (b.get("zephyr") or {}).get("base_url") or DEFAULT_SQUAD_URL,
+            "has_env_file": bool(env_file),
+            "env_file_name": os.path.basename(env_file) if env_file else "",
+            "connected_from_env": S.connected_from_env,
             "settings": s,
             "running": S.current if S.current and S.jobs[S.current].status == "running" else None,
         }
+
+    if path == "/api/connect-env" and method == "POST":
+        env_file = _find_local_env_file()
+        if not env_file:
+            raise ApiError("No local .env credentials file found. Copy .env.example to .env and fill in your keys.", 404)
+        res = auto_connect_from_env(env_file)
+        if res is None:
+            raise ApiError(f"{os.path.basename(env_file)} is missing Jira or Azure DevOps credentials (or still has placeholder values).", 400)
+        return res
 
     if path == "/api/connect" and method == "POST":
         email = (body.get("jira_email") or "").strip()
@@ -669,37 +863,18 @@ def api(method, path, query, body):
         a_url = _norm_url(body.get("ado_url") or s.get("ado_url") or b["ado"]["org_url"])
         if not j_url or not a_url:
             raise ApiError("Provide both the Atlassian Jira URL and Azure DevOps Organization URL.")
-        out, problems = {}, {}
-        if _is_double_paste(jt):
-            problems["jira"] = "That looks like the Jira API token pasted twice. Paste it once."
-        else:
-            try:
-                out["jira"] = JiraClient(j_url, email, jt).myself()
-            except Exception as e:
-                problems["jira"] = ("Jira did not accept the email and API token. Check both and paste the token once."
-                                    if " 401 " in str(e) or " 403 " in str(e) else f"Could not reach Jira at {j_url}: {e}")
-        if _is_double_paste(at):
-            problems["ado"] = "That looks like the Azure DevOps token pasted twice. Paste it once."
-        else:
-            try:
-                out["ado"] = AdoClient(a_url, "", at).whoami() or "your account"
-            except AdoError as e:
-                problems["ado"] = str(e)
-            except Exception as e:
-                problems["ado"] = f"Could not reach Azure DevOps at {a_url}: {e}"
-        if "jira" in out:
-            S.tokens.update(jira_url=j_url, jira_email=email, jira_token=jt)
-            S.names["jira"] = out["jira"]
-        if "ado" in out:
-            S.tokens.update(ado_url=a_url, ado_token=at)
-            S.names["ado"] = out["ado"]
-        save_settings(jira_email=email, jira_url=j_url, ado_url=a_url)
-        return {"jira": S.names.get("jira"), "ado": S.names.get("ado"),
-                "jira_url": j_url, "ado_url": a_url, "problems": problems}
+        return _connect_credentials(
+            j_url, email, jt, a_url, at,
+            z_ak=body.get("zephyr_access_key") or "",
+            z_sk=body.get("zephyr_secret_key") or "",
+            z_url=body.get("zephyr_base_url") or "",
+            from_env=False,
+        )
 
     if path == "/api/disconnect" and method == "POST":
         S.tokens.clear()
         S.names.clear()
+        S.connected_from_env = False
         return {"ok": True}
 
     if path == "/api/jira/projects":
@@ -810,6 +985,10 @@ def api(method, path, query, body):
             "include_done": bool(body.get("include_done")),
             "include_hierarchy": bool(body.get("include_hierarchy")),
             "history": body.get("history", True),
+            "boards_to_areas": body.get("boards_to_areas") if "boards_to_areas" in body else None,
+            "create_board_teams": body.get("create_board_teams") if "create_board_teams" in body else None,
+            "include_zephyr": body.get("include_zephyr") if "include_zephyr" in body else None,
+            "include_test_plans": body.get("include_test_plans") if "include_test_plans" in body else None,
             "force_export": bool(body.get("force_export")),
         }).public()
 
@@ -869,6 +1048,11 @@ def api(method, path, query, body):
             raise ApiError("Connect to Azure DevOps first.", 401)
         return rollback_job(body).public()
 
+    if path == "/api/sync-zephyr" and method == "POST":
+        if not (S.tokens.get("jira_token") and S.tokens.get("ado_token")):
+            raise ApiError("Connect to Jira and Azure DevOps first.", 401)
+        return sync_zephyr_job(body).public()
+
     if path.startswith("/api/jobs/"):
         parts = path.split("/")
         job = S.jobs.get(parts[3]) if len(parts) > 3 else None
@@ -888,7 +1072,7 @@ def api(method, path, query, body):
                         fh.write("pause\n")
                 except Exception:
                     pass
-            job.log.append("Pause requested — finishing current ticket cleanly...")
+            job.log.append("Pause requested — finishing in-flight tickets cleanly...")
             return job.public()
         return job.public(int((query.get("since") or ["0"])[0]))
 
@@ -1005,6 +1189,13 @@ class Handler(BaseHTTPRequestHandler):
 def serve(port=0, open_browser=True, host=None):
     os.makedirs(KIT, exist_ok=True)
     os.chdir(KIT)
+    try:
+        env_res = auto_connect_from_env()
+        if env_res and env_res.get("jira") and env_res.get("ado"):
+            z_msg = f", Zephyr: {env_res['zephyr']}" if env_res.get("zephyr") else ""
+            print(f"Loaded credentials from local .env (Jira: {env_res['jira']}, ADO: {env_res['ado']}{z_msg})")
+    except Exception:
+        pass
     bind_host = host or os.environ.get("JIRA2ADO_UI_HOST") or "127.0.0.1"
     S.server = ThreadingHTTPServer((bind_host, port), Handler)
     S.port = S.server.server_address[1]

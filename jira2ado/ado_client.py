@@ -3,6 +3,7 @@ import os
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from .util import backoff_sleep
 
@@ -29,7 +30,13 @@ class AdoClient:
         self.org, self.project, self.v = (org_url or "").strip().rstrip("/"), project or "", api_version
         if self.org.lower().startswith("http://"):
             raise AdoError("Azure DevOps URL must use https:// so your access token is never sent over plain HTTP.")
-        self.s = session or requests.Session()
+        if session is None:
+            self.s = requests.Session()
+            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+            self.s.mount("https://", adapter)
+            self.s.mount("http://", adapter)
+        else:
+            self.s = session
         self.s.headers["Authorization"] = "Basic " + base64.b64encode(f":{pat}".encode()).decode()
         self.proj = f"{self.org}/{quote(self.project)}" if self.project else self.org
 
@@ -83,6 +90,22 @@ class AdoClient:
         url = f"{self.org}/_apis/wit/workitems/{item_id}"
         return self._request("GET", url, params={"$expand": "relations"}).json()
 
+    def get_items_batch(self, item_ids):
+        """Fetch work items in bulk (up to 200 per HTTP request) with relations expanded. Returns {id: item_dict}."""
+        out = {}
+        ids = [int(x) for x in item_ids if x]
+        for i in range(0, len(ids), 200):
+            chunk = ids[i:i + 200]
+            r = self._request("GET", f"{self.org}/_apis/wit/workitems", params={
+                "ids": ",".join(str(x) for x in chunk),
+                "$expand": "relations",
+                "errorPolicy": "omit",
+            }).json()
+            for item in r.get("value") or []:
+                if item and item.get("id") is not None:
+                    out[item["id"]] = item
+        return out
+
     def comment_count(self, item_id):
         url = f"{self.proj}/_apis/wit/workItems/{item_id}/comments"
         return self._request("GET", url, params={"api-version": self.v + "-preview.4", "$top": 1}).json().get("totalCount", 0)
@@ -132,6 +155,55 @@ class AdoClient:
             return [{"id": t["id"], "name": t["name"]} for t in (data.get("value") or []) if t.get("name")]
         except AdoError:
             return []
+
+    def create_team(self, name, description=""):
+        """Create an Azure DevOps team in this project (or return it if it already exists).
+        Requires the Project and Team (Read & write) PAT scope."""
+        url = f"{self.org}/_apis/projects/{quote(self.project)}/teams"
+        body = {"name": name}
+        if description:
+            body["description"] = description
+        try:
+            return self._request("POST", url, json=body).json()
+        except AdoError as e:
+            if e.status == 409 or "already exists" in str(e).lower():
+                for t in self.teams():
+                    if t["name"].casefold() == name.casefold():
+                        return t
+                return {"name": name}
+            raise
+
+    def configure_team_area(self, team, area_path, include_children=True, replace=False):
+        """Assign an Area Path to a team so work items under that area appear on the team's board/backlog."""
+        url = f"{self.org}/{quote(self.project)}/{quote(team)}/_apis/work/teamsettings/teamfieldvalues"
+        values = []
+        default_val = area_path
+        if not replace:
+            try:
+                cur = self._request("GET", url).json() or {}
+                existing_vals = list(cur.get("values") or [])
+                if existing_vals:
+                    values = existing_vals
+                    if not any((v.get("value") or "").casefold() == area_path.casefold() for v in values):
+                        values.append({"value": area_path, "includeChildren": include_children})
+                    if cur.get("defaultValue"):
+                        default_val = cur["defaultValue"]
+            except Exception:
+                values = []
+        if not values:
+            values = [{"value": area_path, "includeChildren": include_children}]
+        self._request("PATCH", url, json={"defaultValue": default_val, "values": values})
+        return True
+
+    def configure_team_backlog_iteration(self, team, rel_iter_path):
+        """Set a team's backlogIteration to the classification node at `rel_iter_path` below the project root."""
+        node = self.get_node("Iterations", rel_iter_path)
+        ident = node.get("identifier")
+        if not ident:
+            return False
+        url = f"{self.org}/{quote(self.project)}/{quote(team)}/_apis/work/teamsettings"
+        self._request("PATCH", url, json={"backlogIteration": ident})
+        return True
 
     def discover_users(self):
         """Discover ADO users (email -> identity, display_name -> unique identity) from project teams."""
@@ -211,7 +283,12 @@ class AdoClient:
                 return False
             url = (f"{self.org}/{quote(self.project)}/{quote(team)}/_apis/work/teamsettings/iterations"
                    if team else f"{self.proj}/_apis/work/teamsettings/iterations")
-            self._request("POST", url, json={"id": ident})
+            try:
+                self._request("POST", url, json={"id": ident})
+            except AdoError as e:
+                if e.status == 409 or "already exists" in str(e).lower():
+                    return True
+                raise
             return True
         except Exception:
             return False
@@ -335,3 +412,79 @@ class AdoClient:
 
     def states(self, wit):
         return [s["name"] for s in self.state_details(wit)]
+
+    # ---- Azure Test Plans & Suites (requires Test Management: Read & write PAT scope) ----
+
+    def list_test_plans(self):
+        """List Azure Test Plans in this project: [{id, name, rootSuite, areaPath, iteration}]."""
+        out, token = [], None
+        while True:
+            params = {}
+            if token:
+                params["continuationToken"] = token
+            r = self._request("GET", f"{self.proj}/_apis/testplan/plans", params=params)
+            data = r.json() or {}
+            out.extend(data.get("value") or [])
+            token = r.headers.get("x-ms-continuationtoken") or data.get("continuationToken")
+            if not token:
+                return out
+
+    def create_test_plan(self, name, area_path=None, iteration=None, description=None, start_date=None, end_date=None):
+        """Create an Azure Test Plan and return {id, name, rootSuite: {id, name}, ...}."""
+        body = {"name": name}
+        if area_path:
+            body["areaPath"] = area_path
+        if iteration:
+            body["iteration"] = iteration
+        if description:
+            body["description"] = description
+        if start_date:
+            body["startDate"] = start_date
+        if end_date:
+            body["endDate"] = end_date
+        return self._request("POST", f"{self.proj}/_apis/testplan/plans", json=body).json()
+
+    def list_test_suites(self, plan_id):
+        """List all Test Suites in an Azure Test Plan."""
+        out, token = [], None
+        while True:
+            params = {}
+            if token:
+                params["continuationToken"] = token
+            r = self._request("GET", f"{self.proj}/_apis/testplan/Plans/{plan_id}/suites", params=params)
+            data = r.json() or {}
+            out.extend(data.get("value") or [])
+            token = r.headers.get("x-ms-continuationtoken") or data.get("continuationToken")
+            if not token:
+                return out
+
+    def create_static_suite(self, plan_id, parent_suite_id, name):
+        """Create a Static Test Suite nested under `parent_suite_id` inside `plan_id`."""
+        body = {
+            "suiteType": "staticTestSuite",
+            "name": name,
+            "parentSuite": {"id": int(parent_suite_id)},
+            "inheritDefaultConfigurations": True,
+        }
+        return self._request("POST", f"{self.proj}/_apis/testplan/Plans/{plan_id}/suites", json=body).json()
+
+    def add_test_cases_to_suite(self, plan_id, suite_id, work_item_ids):
+        """Assign existing Test Case work item IDs to a Static Test Suite (in chunks of 50)."""
+        ids = [int(x) for x in (work_item_ids or []) if x]
+        added = 0
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            csv_ids = ",".join(str(x) for x in chunk)
+            try:
+                self._request(
+                    "POST",
+                    f"{self.proj}/_apis/test/Plans/{plan_id}/suites/{suite_id}/testcases/{csv_ids}",
+                    json={},
+                )
+                added += len(chunk)
+            except AdoError as e:
+                if e.status == 409 or "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                    added += len(chunk)
+                    continue
+                raise
+        return added

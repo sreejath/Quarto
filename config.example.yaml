@@ -16,7 +16,7 @@ paths:
   users_file: ./users.csv
 
 # Everything below is optional. These are the defaults for the Scrum process.
-# Run "jira2ado check" after exporting to see what still needs a mapping.
+# Run "quarto check" after exporting to see what still needs a mapping.
 mapping:
   types:
     Epic: Epic

@@ -236,7 +236,7 @@ def cmd_prepare(a):
     os.makedirs(target_dir, exist_ok=True)
     path = os.path.join(target_dir, "config.yaml")
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(f"# Written by jira2ado on {datetime.now():%Y-%m-%d %H:%M}. It is rewritten on every run,\n"
+        fh.write(f"# Written by quarto on {datetime.now():%Y-%m-%d %H:%M}. It is rewritten on every run,\n"
                  f"# so change {a.targets} or {base_path} instead of this file.\n")
         yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True, width=120)
 
@@ -791,7 +791,7 @@ def cmd_rollback(cfg, a):
 
 def main(argv=None):
     config.load_dotenv()
-    p = argparse.ArgumentParser(prog="jira2ado", description="Migrate Jira Cloud issues to Azure DevOps with full history.")
+    p = argparse.ArgumentParser(prog="quarto", description="Migrate Jira Cloud issues to Azure DevOps with full history.")
     p.add_argument("-c", "--config", default="config.yaml")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("export", help="copy issues, history, comments and attachments out of Jira")

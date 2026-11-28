@@ -1,4 +1,4 @@
-# Jira2ADO — Complete User & Admin Help Guide
+# Quarto — Complete User & Admin Help Guide
 
 This guide covers everything required to connect, validate, review, and migrate tickets from **Atlassian Jira Cloud** to **Azure DevOps Services** with 100% data fidelity — directly from your browser.
 
@@ -6,23 +6,23 @@ This guide covers everything required to connect, validate, review, and migrate 
 
 ## 1. Launching the Browser App (No Command Line Needed)
 
-Jira2ADO runs as a **100% local web application** bound exclusively to `127.0.0.1` on your machine. Your API tokens are held in memory only for your active session and are **never saved to disk**.
+Quarto runs as a **100% local web application** bound exclusively to `127.0.0.1` on your machine. Your API tokens are held in memory only for your active session and are **never saved to disk**.
 
-- **Standalone Click-to-Run App**: Download **`Jira2ADO-macOS.dmg`** (drag `Jira2ADO.app` to Applications) or **`Jira2ADO-Windows.exe`**. Runs without Python installed and saves run folders in `~/Documents/Jira2ADO`. *(First launch on macOS: if Gatekeeper blocks the app, open **System Settings → Privacy & Security → Open Anyway**.)*
-- **macOS (from source)**: Double-click **`Start jira2ado.command`** in Finder (or run `bash ui.sh`).
-- **Windows (from source)**: Double-click **`Start-Jira2ADO.bat`** in File Explorer.
+- **Standalone Click-to-Run App**: Download **`Quarto-macOS.dmg`** (drag `Quarto.app` to Applications) or **`Quarto-Windows.exe`**. Runs without Python installed and saves run folders in `~/Documents/Quarto`. *(First launch on macOS: if Gatekeeper blocks the app, open **System Settings → Privacy & Security → Open Anyway**.)*
+- **macOS (from source)**: Double-click **`Start Quarto.command`** in Finder (or run `bash ui.sh`).
+- **Windows (from source)**: Double-click **`Start-Quarto.bat`** in File Explorer.
 - **Python Package (Any OS)**:
   ```bash
   pip install -e .
-  jira2ado-ui
+  quarto-ui
   ```
 - **Docker**:
   ```bash
-  docker build -t jira2ado .
-  docker run --rm -p 127.0.0.1:8765:8765 -v "$(pwd)/runs:/app/runs" jira2ado
+  docker build -t quarto .
+  docker run --rm -p 127.0.0.1:8765:8765 -v "$(pwd)/runs:/app/runs" quarto
   ```
 
-Your default browser will automatically open the Jira2ADO web interface. You can also click the **`? Help & Setup Guide`** button in the top-right corner of the app at any time.
+Your default browser will automatically open the Quarto web interface. You can also click the **`? Help & Setup Guide`** button in the top-right corner of the app at any time.
 
 ---
 
@@ -33,7 +33,7 @@ Your default browser will automatically open the Jira2ADO web interface. You can
 2. **Jira Email**: The email address of your Atlassian account.
 3. **Jira API Token**: Generate one at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
 4. **Permissions**:
-   - Jira2ADO is **strictly read-only on Jira** and never modifies your Jira issues.
+   - Quarto is **strictly read-only on Jira** and never modifies your Jira issues.
    - **Browse Projects** & **View Development Tools** on the source Jira projects (to read issues, sprints, boards, attachments, comments, worklogs, and Git PR/branch/commit links).
 
 ### 2.2 Azure DevOps Services
@@ -44,7 +44,7 @@ Your default browser will automatically open the Jira2ADO web interface. You can
    - **Project and Team**: `Read & write` (optional — needed only when auto-creating Sprint Iterations, Area Paths, and subscribing Team Boards)
    - **Graph / User Profile**: `Read` (optional — enables automatic verification of ADO user identities for assignee/author resolution)
 4. **Bypass Rules Permission (Required for Work Item Creation & History Replay)**:
-   - Jira2ADO uses `bypassRules=true` on work item writes so that migrated items preserve their original Jira `System.CreatedDate`, `System.ChangedDate`, `Microsoft.VSTS.Common.ClosedDate`, `System.CreatedBy`, and target workflow states (including setting completed/in-progress states directly on creation when full history replay is turned off).
+   - Quarto uses `bypassRules=true` on work item writes so that migrated items preserve their original Jira `System.CreatedDate`, `System.ChangedDate`, `Microsoft.VSTS.Common.ClosedDate`, `System.CreatedBy`, and target workflow states (including setting completed/in-progress states directly on creation when full history replay is turned off).
    - Ensure your ADO user account has **"Bypass rules on work item updates" = Allow**:
      1. Open **Project Settings → Permissions → Users** (or your security group).
      2. Set **Bypass rules on work item updates** to **Allow**.
@@ -62,7 +62,7 @@ Enter your **Atlassian Jira URL**, **Jira Email**, **Jira API Token**, **Azure D
 1. **Jira Project**: Select your source Jira project from the searchable dropdown.
 2. **Jira Board**: Select a specific Scrum/Kanban board (or leave on **All boards in project**).
 3. **Sprint(s)**: Check **one or more sprints** from the list (active sprints are listed first, followed by upcoming and closed sprints with date ranges and sprint goals).
-4. **Destination ADO Project**: Select the target Azure DevOps project. Jira2ADO discovers all projects in your ADO organization automatically.
+4. **Destination ADO Project**: Select the target Azure DevOps project. Quarto discovers all projects in your ADO organization automatically.
 5. **Options**:
    - **Include Done tickets**: Include Jira issues whose status is already `Done`.
    - **Include parent Epics/Stories outside sprint**: Automatically fetches parent Epics/Features/Stories that live outside the selected sprint so no Sub-task or Story loses its hierarchy link.
@@ -70,7 +70,7 @@ Enter your **Atlassian Jira URL**, **Jira Email**, **Jira API Token**, **Azure D
    - **Iteration & Area Path Overrides**: Optionally place all migrated tickets into a specific ADO Iteration or Area Path.
 
 ### Step 3: Validate & Review Tickets
-Click **Validate**. Without writing anything to Azure DevOps, Jira2ADO:
+Click **Validate**. Without writing anything to Azure DevOps, Quarto:
 1. Exports all matching tickets, attachments, comments, changelog history, worklogs, remote links, and Git development links from Jira.
 2. Discovers valid Work Item Types and Workflow States in the destination ADO project (auto-adapting across **Scrum**, **Agile**, **Basic**, **CMMI**, and **Inherited** processes).
 3. Scans the destination ADO project for existing work items to detect **duplicates**.
@@ -86,7 +86,7 @@ Click **Validate**. Without writing anything to Azure DevOps, Jira2ADO:
 
 ## 4. Duplicate Detection & Per-Ticket Resolution
 
-During **Validate**, Jira2ADO checks every ticket against the destination ADO project using three layers of detection:
+During **Validate**, Quarto checks every ticket against the destination ADO project using three layers of detection:
 1. **Exact Jira Key Match (`already in ADO`)**: An item in ADO already has this Jira key in `Custom.JiraKey` or `System.Tags`.
 2. **Jira Key in Title (`possible duplicate`)**: An item in ADO mentions `[KEY-123]` in `System.Title`.
 3. **Same Summary (`possible duplicate` / `same summary in run`)**: An item in ADO (or another ticket in the same sprint) has the same normalized title.
@@ -118,8 +118,8 @@ For any duplicate or existing ticket, you can choose its action **per-ticket** i
 
 ## 6. Post-Migration Verification, Idempotent Retry & Confirmed Rollback
 
-- **Automatic Verification (`verify.csv`)**: Immediately after migration, Jira2ADO reads back every migrated work item from Azure DevOps and verifies its title, state, iteration path, assignee, attachment count, comment count, and links.
-- **Idempotent Retry / Self-Healing Resume**: If a migration is stopped or encounters a network error, click **Retry / Resume Remaining**. Jira2ADO reconciles the local journal with live Azure DevOps revisions and resumes without creating duplicates.
+- **Automatic Verification (`verify.csv`)**: Immediately after migration, Quarto reads back every migrated work item from Azure DevOps and verifies its title, state, iteration path, assignee, attachment count, comment count, and links.
+- **Idempotent Retry / Self-Healing Resume**: If a migration is stopped or encounters a network error, click **Retry / Resume Remaining**. Quarto reconciles the local journal with live Azure DevOps revisions and resumes without creating duplicates.
 - **Confirmed Rollback**: If you did a test run into a sandbox project and want to undo it, click **Undo / Rollback Run** and confirm the project name to move all work items created by that run to the Azure DevOps Recycle Bin.
 
 ---
@@ -129,6 +129,6 @@ For any duplicate or existing ticket, you can choose its action **per-ticket** i
 - **"Azure DevOps did not accept the access token (HTTP 203 / 401)"**:
   - Your PAT may be expired, scoped to a different organization, or pasted twice. Create a PAT scoped to your target organization with `Work Items (Read & write)` (and `Project and Team (Read & write)` if auto-creating sprint iterations).
 - **"VS403474: You do not have permission to bypass rules"**:
-  - Grant **"Bypass rules on work item updates = Allow"** to your user in Azure DevOps Project Settings → Permissions → Users so Jira2ADO can write historical `CreatedDate`, `ChangedDate`, `ClosedDate`, and workflow states.
+  - Grant **"Bypass rules on work item updates = Allow"** to your user in Azure DevOps Project Settings → Permissions → Users so Quarto can write historical `CreatedDate`, `ChangedDate`, `ClosedDate`, and workflow states.
 - **"★ Highlighted Statuses"**:
   - Statuses marked with **`★ Recommended`** do not have an identically named state in the destination ADO project and are mapped to the closest matching state automatically. You can override any status using the dropdown in the Validation table, or add custom states in Azure DevOps (Organization Settings → Process) and click **Validate again**.

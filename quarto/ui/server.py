@@ -1,4 +1,4 @@
-"""Local browser view for jira2ado.
+"""Local browser view for quarto.
 
 It listens on 127.0.0.1 only, so nothing outside this computer can reach it. Every request to
 /api needs the random key that is printed when it starts, and the Host header must be this
@@ -32,7 +32,7 @@ from ..zephyr_client import DEFAULT_SQUAD_URL, ZephyrError, ZephyrSquadClient
 if getattr(sys, "frozen", False):
     BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     KIT = config.frozen_workspace_dir()
-    STATIC = os.path.join(BUNDLE_DIR, "jira2ado", "ui", "static")
+    STATIC = os.path.join(BUNDLE_DIR, "quarto", "ui", "static")
     if not os.path.isdir(STATIC):
         STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
     CMD = [sys.executable, "--cli"]
@@ -40,7 +40,7 @@ else:
     BUNDLE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     KIT = BUNDLE_DIR
     STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-    CMD = [sys.executable, "-m", "jira2ado"]  # the tests swap this for a stand-in Azure DevOps
+    CMD = [sys.executable, "-m", "quarto"]  # the tests swap this for a stand-in Azure DevOps
 
 BASE = os.path.join("configs", "enterprise-development.yaml")
 TARGETS = os.path.join("configs", "targets.yaml")
@@ -130,7 +130,7 @@ def _is_placeholder(val):
 
 def _find_local_env_file():
     for cand in (
-        (os.environ.get("JIRA2ADO_SECRETS_FILE") or "").strip(),
+        (os.environ.get("QUARTO_SECRETS_FILE") or "").strip(),
         os.path.join(os.getcwd(), ".env"),
         os.path.join(KIT, ".env"),
         os.path.join(os.getcwd(), ".secrets.env"),
@@ -322,13 +322,13 @@ def env_with_tokens():
 
 
 def run_step(job, index, args, ok=(0,)):
-    """Run one jira2ado command and stream its output into the job log. Returns (exit code, stdout of prepare)."""
+    """Run one quarto command and stream its output into the job log. Returns (exit code, stdout of prepare)."""
     step = job.steps[index]
     if job.stopped:
         step["status"] = "stopped"
         raise StopRun()
     step["status"] = "running"
-    job.log.append(f"$ jira2ado {' '.join(args)}")
+    job.log.append(f"$ quarto {' '.join(args)}")
     capture = args and args[0] == "prepare"  # prepare prints only the config path on stdout
     popen_kw = {
         "cwd": KIT,
@@ -1105,7 +1105,7 @@ def api(method, path, query, body):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "jira2ado"
+    server_version = "quarto"
 
     def log_message(self, fmt, *args):  # keep the terminal quiet; nothing here should reach a log
         pass
@@ -1127,7 +1127,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _host_ok(self):
-        extra_host = os.environ.get("JIRA2ADO_UI_HOST") or "127.0.0.1"
+        extra_host = os.environ.get("QUARTO_UI_HOST") or "127.0.0.1"
         return self.headers.get("Host", "") in (
             f"127.0.0.1:{S.port}",
             f"localhost:{S.port}",
@@ -1145,7 +1145,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(STATIC, name), "rb") as fh:
                 return self._send(200, fh.read(), ctype)
         qs = parse_qs(url.query)
-        req_key = self.headers.get("X-Jira2ado-Key", "")
+        req_key = self.headers.get("X-Quarto-Key", "")
         if not hmac.compare_digest(req_key, S.key):
             return self._send(403, {"error": "This page has an old key. Open the address shown in the Terminal window."})
         if url.path == "/api/download" and method == "GET":
@@ -1196,11 +1196,11 @@ def serve(port=0, open_browser=True, host=None):
             print(f"Loaded credentials from local .env (Jira: {env_res['jira']}, ADO: {env_res['ado']}{z_msg})")
     except Exception:
         pass
-    bind_host = host or os.environ.get("JIRA2ADO_UI_HOST") or "127.0.0.1"
+    bind_host = host or os.environ.get("QUARTO_UI_HOST") or "127.0.0.1"
     S.server = ThreadingHTTPServer((bind_host, port), Handler)
     S.port = S.server.server_address[1]
     url = f"http://127.0.0.1:{S.port}/#key={S.key}"
-    print(f"jira2ado is open in your browser at {url}")
+    print(f"quarto is open in your browser at {url}")
     print("Keep this window open while you use it. Close it, or press Ctrl+C, to stop.")
     prev_term = None
     if threading.current_thread() is threading.main_thread() and hasattr(signal, "SIGTERM"):
@@ -1219,14 +1219,14 @@ def serve(port=0, open_browser=True, host=None):
             signal.signal(signal.SIGTERM, prev_term)
         S.tokens.clear()
         S.server.server_close()
-        print("jira2ado has stopped.")
+        print("quarto has stopped.")
     return url
 
 
 def main():
-    port = int(os.environ.get("JIRA2ADO_UI_PORT") or 0)
-    host = os.environ.get("JIRA2ADO_UI_HOST") or "127.0.0.1"
-    serve(port, open_browser=os.environ.get("JIRA2ADO_UI_NO_BROWSER") != "1", host=host)
+    port = int(os.environ.get("QUARTO_UI_PORT") or 0)
+    host = os.environ.get("QUARTO_UI_HOST") or "127.0.0.1"
+    serve(port, open_browser=os.environ.get("QUARTO_UI_NO_BROWSER") != "1", host=host)
 
 
 if __name__ == "__main__":

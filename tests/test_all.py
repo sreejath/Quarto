@@ -9,11 +9,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import sample
-from jira2ado import config
-from jira2ado.adf import adf_to_html, rewrite_html
-from jira2ado.importer import import_items, import_links
-from jira2ado.planner import Planner
-from jira2ado.verify import verify
+from quarto import config
+from quarto.adf import adf_to_html, rewrite_html
+from quarto.importer import import_items, import_links
+from quarto.planner import Planner
+from quarto.verify import verify
 
 USERS = {"ids": {"acc-1": "ana@contoso.com"}, "names": {"acc-1": "Ana Lee", "acc-2": "Raj Rao"}}
 
@@ -53,7 +53,7 @@ class AdfTests(unittest.TestCase):
 
 class WikiTests(unittest.TestCase):
     def test_common_markup(self):
-        from jira2ado.wiki import wiki_to_html
+        from quarto.wiki import wiki_to_html
         src = ("h2. Steps\n{color:#bf2600}*Dev only*{color} and _note_ on 2026-04-22\n"
                "* one\n** nested [link|https://x.com/a?b=1&c=2]\n# first\n\n"
                "||Col A||Col B||\n|a [x|https://y.com]|b|\n!shot.png|thumbnail! !missing.png!\n"
@@ -73,7 +73,7 @@ class WikiTests(unittest.TestCase):
         self.assertIn("<p>line one<br> two</p>", html)
 
     def test_plain_text_is_safe(self):
-        from jira2ado.wiki import wiki_to_html
+        from quarto.wiki import wiki_to_html
         self.assertEqual(wiki_to_html("a <script> & b - c"), "<p>a &lt;script&gt; &amp; b - c</p>")
         self.assertEqual(wiki_to_html(""), "")
 
@@ -210,7 +210,7 @@ class ImportTests(unittest.TestCase):
 
 class AdoClientTests(unittest.TestCase):
     def test_rejected_token_gives_a_clear_message(self):
-        from jira2ado.ado_client import AdoClient, AdoError
+        from quarto.ado_client import AdoClient, AdoError
 
         class Resp:
             status_code, headers, text = 203, {"Content-Type": "text/html; charset=utf-8"}, "\r\n\r\n<!DOCTYPE html>"
@@ -229,7 +229,7 @@ class AdoClientTests(unittest.TestCase):
 
 class AdoRefusalTests(unittest.TestCase):
     def _client(self, status, ctype, body):
-        from jira2ado.ado_client import AdoClient
+        from quarto.ado_client import AdoClient
 
         class Resp:
             status_code, headers, text = status, {"Content-Type": ctype}, body
@@ -245,7 +245,7 @@ class AdoRefusalTests(unittest.TestCase):
         return AdoClient("https://dev.azure.com/contoso", "Proj", "tok", session=Session())
 
     def test_401_names_the_token(self):
-        from jira2ado.ado_client import AdoError
+        from quarto.ado_client import AdoError
         c = self._client(401, "application/json", '{"message": "TF400813: not authorized"}')
         with self.assertRaises(AdoError) as ctx:
             c.states("Bug")
@@ -254,7 +254,7 @@ class AdoRefusalTests(unittest.TestCase):
         self.assertIn("contoso organization", str(ctx.exception))
 
     def test_403_names_a_missing_permission_not_the_token(self):
-        from jira2ado.ado_client import AdoError
+        from quarto.ado_client import AdoError
         c = self._client(403, "application/json", '{"message": "VS403474: no permission to bypass rules"}')
         with self.assertRaises(AdoError) as ctx:
             c.states("Bug")
@@ -265,7 +265,7 @@ class AdoRefusalTests(unittest.TestCase):
 
 class ProjectNameTests(unittest.TestCase):
     def test_name_comes_from_the_root_iteration_and_a_missing_project_is_named(self):
-        from jira2ado.ado_client import AdoClient, AdoError
+        from quarto.ado_client import AdoClient, AdoError
         calls = []
 
         class Resp:
@@ -294,8 +294,8 @@ class AccessCommandTests(unittest.TestCase):
     def _run(self, jira_ok, ado_ok):
         import io
         from contextlib import redirect_stdout
-        from jira2ado import cli
-        from jira2ado.ado_client import AdoError
+        from quarto import cli
+        from quarto.ado_client import AdoError
 
         class J:
             def myself(self):
@@ -422,7 +422,7 @@ class ScopeTests(unittest.TestCase):
     def test_import_checks_fields_per_type(self):
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
-        from jira2ado.util import write_json
+        from quarto.util import write_json
         write_json(os.path.join(folder, "meta.json"), self.meta)
         write_json(os.path.join(folder, "issues", "DEMO-1.json"), dict(self.story(), comments=sample.story()["comments"]))
         self.cfg["paths"]["export_dir"] = folder
@@ -452,7 +452,7 @@ class ScopeTests(unittest.TestCase):
     def _export(self):
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
-        from jira2ado.util import write_json
+        from quarto.util import write_json
         write_json(os.path.join(folder, "meta.json"), self.meta)
         write_json(os.path.join(folder, "issues", "DEMO-1.json"), dict(self.story(), comments=sample.story()["comments"]))
         self.cfg["paths"]["export_dir"] = folder
@@ -487,7 +487,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(ado.uploads, [])
 
     def test_users_file_rewrites_domains(self):
-        from jira2ado.exporter import write_users_file
+        from quarto.exporter import write_users_file
         import csv
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
@@ -499,7 +499,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(rows["Raj Rao"], "")
 
     def test_users_file_keeps_a_blank_left_on_purpose(self):
-        from jira2ado.exporter import write_users_file
+        from quarto.exporter import write_users_file
         import csv
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
@@ -513,7 +513,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual((total, blank), (2, 2))
 
     def test_users_file_keeps_people_from_earlier_runs(self):
-        from jira2ado.exporter import write_users_file
+        from quarto.exporter import write_users_file
         import csv
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
@@ -539,14 +539,14 @@ SPRINTS = [
 
 class SprintLookupTests(unittest.TestCase):
     def test_names_match_the_way_ado_spells_them(self):
-        from jira2ado.cli import resolve_sprint
+        from quarto.cli import resolve_sprint
         self.assertEqual(resolve_sprint("Platform-Core Sprint 28", SPRINTS, "PROJ")["id"], 102)
         self.assertEqual(resolve_sprint("platform&core sprint 28", SPRINTS, "PROJ")["id"], 102)
         self.assertEqual(resolve_sprint("101", SPRINTS, "PROJ")["id"], 101)
         self.assertEqual(resolve_sprint("Core Sprint 27", SPRINTS, "PROJ")["id"], 101)  # one partial match is fine
 
     def test_unclear_or_unknown_names_stop_with_choices(self):
-        from jira2ado.cli import resolve_sprint
+        from quarto.cli import resolve_sprint
         with self.assertRaises(SystemExit) as ctx:
             resolve_sprint("Sprint 28", SPRINTS, "PROJ")
         self.assertIn("more than one sprint", str(ctx.exception))
@@ -576,8 +576,8 @@ class PrepareTests(unittest.TestCase):
             ADO_ORG_URL="https://dev.azure.com/contoso",
             ADO_PAT="a",
         )
-        import jira2ado.ado_client as ac
-        import jira2ado.jira_client as jc
+        import quarto.ado_client as ac
+        import quarto.jira_client as jc
         self.saved = ac.AdoClient, jc.JiraClient
 
         class FakeJira:
@@ -606,15 +606,15 @@ class PrepareTests(unittest.TestCase):
         ac.AdoClient, jc.JiraClient = FakeAdoClient, FakeJira
 
     def tearDown(self):
-        import jira2ado.ado_client as ac
-        import jira2ado.jira_client as jc
+        import quarto.ado_client as ac
+        import quarto.jira_client as jc
         ac.AdoClient, jc.JiraClient = self.saved
         os.chdir(self.home)
 
     def _prepare(self, *args):
         import io
         from contextlib import redirect_stderr, redirect_stdout
-        from jira2ado import cli
+        from quarto import cli
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             cli.main(["prepare", *args])
@@ -655,7 +655,7 @@ class PrepareTests(unittest.TestCase):
     def test_show_prints_values_for_run_sh(self):
         import io
         from contextlib import redirect_stdout
-        from jira2ado import cli
+        from quarto import cli
         path, _, _ = self._prepare("--from", "PROJ", "--to", "Sandbox", "--sprint", "102")
         for key, want in (("ado.project", "Sandbox"), ("ado.area_path", ""),
                           ("ado.confirm_with_project_name", "false")):
@@ -665,7 +665,7 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(buf.getvalue().strip(), want)
 
     def test_board_and_project_stable_folders_and_board_filter_jql(self):
-        import jira2ado.jira_client as jc
+        import quarto.jira_client as jc
         # 1. Project mode: toggling --include-done keeps the exact same run folder
         p_open, cfg_open, _ = self._prepare("--mode", "project", "--from", "PROJ", "--to", "Sandbox")
         p_done, cfg_done, _ = self._prepare("--mode", "project", "--from", "PROJ", "--to", "Sandbox", "--include-done")
@@ -725,7 +725,7 @@ class PlacementTests(unittest.TestCase):
     def test_import_creates_only_the_chosen_iteration_with_its_sprint_dates(self):
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
-        from jira2ado.util import write_json
+        from quarto.util import write_json
         write_json(os.path.join(folder, "issues", "DEMO-1.json"), self.issue)
         self.cfg["paths"]["export_dir"] = folder
         self.cfg["mapping"]["iteration_override"] = "Platform-Core Sprint 28"
@@ -799,8 +799,8 @@ class TargetSafetyTests(unittest.TestCase):
 
 class ExportScopeTests(unittest.TestCase):
     def test_only_the_latest_query_is_loaded(self):
-        from jira2ado.exporter import load_issues
-        from jira2ado.util import write_json
+        from quarto.exporter import load_issues
+        from quarto.util import write_json
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         self.assertEqual([i["key"] for i in load_issues(folder)], ["DEMO-1", "DEMO-2"])
@@ -814,7 +814,7 @@ class DuplicateMatchTests(unittest.TestCase):
         return {"id": i, "fields": {"System.Title": title, "System.Tags": tags, "System.State": "Committed", **extra}}
 
     def test_kinds_of_match(self):
-        from jira2ado.duplicates import KEY_IN_TITLE, SAME_KEY, SAME_TITLE, classify
+        from quarto.duplicates import KEY_IN_TITLE, SAME_KEY, SAME_TITLE, classify
         entries = [("PROJ-4200", "Fix  the Banner"), ("PROJ-3", "Other")]
         items = [self.item(1, "Anything", "NAV; proj-4200"),
                  self.item(2, "Anything", "", **{"Custom.JiraKey": "PROJ-4200"}),
@@ -829,7 +829,7 @@ class DuplicateMatchTests(unittest.TestCase):
         self.assertNotIn(4, [m["id"] for m in classify(entries, items, titles=False).get("PROJ-4200", [])])
 
     def test_descriptions_and_groups(self):
-        from jira2ado.duplicates import classify, describe, same_summary_groups
+        from quarto.duplicates import classify, describe, same_summary_groups
         m = classify([("PROJ-9", "Release prep")], [self.item(18500, "Release Prep", "PROJ-8")])["PROJ-9"][0]
         self.assertEqual(describe(m), "same title as #18500 (Committed, from PROJ-8)")
         self.assertEqual(same_summary_groups([("A-1", "Release prep"), ("A-2", "release  PREP "), ("A-3", "Other")]),
@@ -839,7 +839,7 @@ class DuplicateMatchTests(unittest.TestCase):
 class FindDuplicatesQueryTests(unittest.TestCase):
     def test_queries_sent_to_azure_devops(self):
         import json as _json
-        from jira2ado.ado_client import AdoClient
+        from quarto.ado_client import AdoClient
         sent = []
 
         class Resp:
@@ -918,12 +918,12 @@ class PossibleDuplicateImportTests(unittest.TestCase):
     def test_preview_report_and_count(self):
         import io
         from contextlib import redirect_stdout
-        from jira2ado import cli
-        from jira2ado.planner import Planner
-        from jira2ado.util import Journal
-        from jira2ado.importer import journal_path
+        from quarto import cli
+        from quarto.planner import Planner
+        from quarto.util import Journal
+        from quarto.importer import journal_path
         planner = Planner(self.cfg, sample.META, USERS)
-        from jira2ado.exporter import load_issues
+        from quarto.exporter import load_issues
         plans = [planner.plan(i) for i in load_issues(self.dir)]
         plans[1]["subtask"] = False
         plans.append({**plans[1], "key": "DEMO-3", "subtask": False})  # a second non-subtask ticket with the same summary
@@ -945,7 +945,7 @@ class PossibleDuplicateImportTests(unittest.TestCase):
 
 class IterationCreateTests(unittest.TestCase):
     def test_existing_iterations_are_not_reported_as_created(self):
-        from jira2ado.ado_client import AdoClient
+        from quarto.ado_client import AdoClient
         posts = []
 
         class Resp:
@@ -978,7 +978,7 @@ class BrowserViewTests(unittest.TestCase):
     def setUpClass(cls):
         import threading
         from http.server import ThreadingHTTPServer
-        from jira2ado.ui import server
+        from quarto.ui import server
         cls.server = server
         cls.saved = (server.JiraClient, server.AdoClient, server.SETTINGS)
         server.SETTINGS = os.path.join(tempfile.mkdtemp(), "ui-settings.json")
@@ -995,7 +995,7 @@ class BrowserViewTests(unittest.TestCase):
             def __init__(self, org, project, pat, *a, **k):
                 self.pat = pat
             def whoami(self):
-                from jira2ado.ado_client import AdoError
+                from quarto.ado_client import AdoError
                 if self.pat != "good":
                     raise AdoError("Azure DevOps did not accept the access token (it sent back its sign-in page, HTTP 203).", 203)
                 return "Test User"
@@ -1030,7 +1030,7 @@ class BrowserViewTests(unittest.TestCase):
         method = "GET" if body is None else "POST"
         hdrs = [f"{method} {path} HTTP/1.1", f"Host: {host or f'127.0.0.1:{self.server.S.port}'}"]
         if key:
-            hdrs.append(f"X-Jira2ado-Key: {self.server.S.key}")
+            hdrs.append(f"X-Quarto-Key: {self.server.S.key}")
         if body is not None:
             hdrs.append("Content-Type: application/json")
             hdrs.append(f"Content-Length: {len(raw_body)}")
@@ -1058,7 +1058,7 @@ class BrowserViewTests(unittest.TestCase):
     def test_page_loads_but_the_api_needs_the_key(self):
         status, page = self.call("/", key=False)
         self.assertEqual(status, 200)
-        self.assertIn(b"jira2ado", page)
+        self.assertIn(b"quarto", page)
         self.assertEqual(self.call("/api/state", key=False)[0], 403)
         self.assertEqual(self.call("/api/state")[0], 200)
 
@@ -1154,7 +1154,7 @@ class BrowserViewTests(unittest.TestCase):
         status, d = self.call("/api/rollback", {"config": rel})
         self.assertEqual(status, 400)
         self.assertIn("Type Shop exactly to confirm rollback", d["error"])
-        # M6: Session key in query string is rejected when X-Jira2ado-Key header is missing
+        # M6: Session key in query string is rejected when X-Quarto-Key header is missing
         self.assertEqual(self.call(f"/api/download?path={rel}&key={self.server.S.key}", key=False)[0], 403)
 
     def test_multi_mode_pages_and_saved_runs_recovery_api(self):
@@ -1237,7 +1237,7 @@ class BrowserViewTests(unittest.TestCase):
 
 class ClosestAdoStateTests(unittest.TestCase):
     def test_exact_synonym_and_category_matching(self):
-        from jira2ado.planner import closest_ado_state
+        from quarto.planner import closest_ado_state
         # 1. Exact case-insensitive match when ADO has an identically named state
         state, ok, reason = closest_ado_state("Ready for QA", "Product Backlog Item", ["New", "Ready for QA", "Done"])
         self.assertEqual((state, ok, reason), ("Ready for QA", True, "exact"))
@@ -1262,7 +1262,7 @@ class ClosestAdoStateTests(unittest.TestCase):
 
 class MultiProcessTypeTests(unittest.TestCase):
     def test_adapts_work_item_type_to_agile_basic_and_cmmi(self):
-        from jira2ado.planner import type_for
+        from quarto.planner import type_for
         cfg = cfg_for("x")
         story_issue = sample.story()
         bug_issue = copy.deepcopy(story_issue)
@@ -1280,7 +1280,7 @@ class MultiProcessTypeTests(unittest.TestCase):
 
 class MentionAndCrossRefTests(unittest.TestCase):
     def test_account_id_mentions_resolved_to_display_names(self):
-        from jira2ado.wiki import wiki_to_html
+        from quarto.wiki import wiki_to_html
         html = wiki_to_html("cc [~accountid:acc-1] and [~accountid:acc-2]", user_names=USERS["names"])
         self.assertIn("@Ana Lee", html)
         self.assertIn("@Raj Rao", html)
@@ -1341,7 +1341,7 @@ class DeltaSyncAndRollbackTests(unittest.TestCase):
         self.q = lambda *a, **k: None
 
     def test_delta_sync_updates_existing_item_and_rollback_deletes_created_items(self):
-        from jira2ado.importer import rollback_run
+        from quarto.importer import rollback_run
         ado = sample.FakeAdo()
         stats = import_items(ado, self.cfg, USERS, log=self.q)
         self.assertEqual(stats["created"], 2)
@@ -1434,7 +1434,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_m1_retried_attachment_upload_rewinds_file_stream(self):
         import io
         from unittest.mock import patch
-        from jira2ado.ado_client import AdoClient
+        from quarto.ado_client import AdoClient
 
         sent_Payloads = []
 
@@ -1464,7 +1464,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
         tmp.write(b"x" * 5000)
         tmp.close()
         try:
-            with patch("jira2ado.ado_client.backoff_sleep", return_value=None):
+            with patch("quarto.ado_client.backoff_sleep", return_value=None):
                 c = AdoClient("https://dev.azure.com/org", "Proj", "tok", session=Session())
                 url = c.upload_attachment(tmp.name, "test.bin")
             self.assertEqual(url, "https://ado.example/_apis/wit/attachments/1")
@@ -1475,8 +1475,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
             os.unlink(tmp.name)
 
     def test_m2_and_m5_https_enforced_and_jira_is_readonly(self):
-        from jira2ado.ado_client import AdoClient, AdoError
-        from jira2ado.jira_client import JiraClient
+        from quarto.ado_client import AdoClient, AdoError
+        from quarto.jira_client import JiraClient
         with self.assertRaises(RuntimeError):
             JiraClient("http://insecure.example.com", "a@b.com", "tok")
         with self.assertRaises(AdoError):
@@ -1485,7 +1485,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
 
     def test_m4_identities_checked_against_ado_and_ambiguous_names_excluded(self):
         import csv
-        from jira2ado.exporter import write_users_file
+        from quarto.exporter import write_users_file
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         path = os.path.join(folder, "users.csv")
@@ -1529,8 +1529,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
 
     def test_smaller5_http_date_retry_after_and_truncated_journal(self):
         from unittest.mock import patch
-        from jira2ado.util import Journal, backoff_sleep
-        with patch("jira2ado.util.time.sleep") as mock_sleep:
+        from quarto.util import Journal, backoff_sleep
+        with patch("quarto.util.time.sleep") as mock_sleep:
             backoff_sleep(0, "Wed, 21 Oct 2015 07:28:00 GMT")
             self.assertTrue(mock_sleep.called)
         jfile = os.path.join(tempfile.mkdtemp(), "state.jsonl")
@@ -1556,8 +1556,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
             self.assertIn("iteration is Shop\\WrongIteration, expected Shop\\Sprint 2-A", fh.read())
 
     def test_round2_sync_delta_comments_attachments_tags_and_rollback(self):
-        from jira2ado.importer import rollback_run
-        from jira2ado.util import read_json, write_json
+        from quarto.importer import rollback_run
+        from quarto.util import read_json, write_json
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         cfg = cfg_for(folder)
@@ -1626,7 +1626,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertEqual(ado.items[101]["fields"]["System.State"], "New")
 
     def test_round2_config_state_map_beats_same_name_state(self):
-        from jira2ado.planner import closest_ado_state
+        from quarto.planner import closest_ado_state
         cfg = cfg_for("x")
         cfg["mapping"]["states"]["default"]["In Progress"] = "Development"
         valid = ["To Do", "In Progress", "Development", "Done"]
@@ -1635,7 +1635,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
 
     def test_round2_empty_ado_user_discovery_does_not_guess_emails(self):
         import csv
-        from jira2ado.exporter import write_users_file
+        from quarto.exporter import write_users_file
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         path = os.path.join(folder, "users.csv")
@@ -1645,8 +1645,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertEqual(rows["Ana Lee"], "")
 
     def test_round2_per_destination_ado_meta_isolation_and_multi_sprint_slug(self):
-        from jira2ado.importer import load_meta
-        from jira2ado.util import sprint_folder_slug, write_json
+        from quarto.importer import load_meta
+        from quarto.util import sprint_folder_slug, write_json
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         dest_a = tempfile.mkdtemp()
@@ -1667,7 +1667,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertIn("25-sprints", folder_name)
 
     def test_round2_bundled_config_fallback_when_frozen(self):
-        from jira2ado import config
+        from quarto import config
         empty_cwd = tempfile.mkdtemp()
         saved_cwd = os.getcwd()
         try:
@@ -1684,15 +1684,15 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_packaging_workspace_and_clean_config_staging(self):
         import importlib.util
         from unittest.mock import patch
-        from jira2ado import config
+        from quarto import config
         build_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packaging", "build.py")
-        spec = importlib.util.spec_from_file_location("jira2ado_pkg_build", build_py)
+        spec = importlib.util.spec_from_file_location("quarto_pkg_build", build_py)
         pkg_build = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(pkg_build)
 
-        # 1. frozen_workspace_dir must resolve to JIRA2ADO_HOME (or ~/Documents/Jira2ADO), never read-only bundle dirs
+        # 1. frozen_workspace_dir must resolve to QUARTO_HOME (or ~/Documents/Quarto), never read-only bundle dirs
         custom_home = os.path.join(tempfile.mkdtemp(), "MyWorkspace")
-        with patch.dict(os.environ, {"JIRA2ADO_HOME": custom_home}):
+        with patch.dict(os.environ, {"QUARTO_HOME": custom_home}):
             ws = config.frozen_workspace_dir()
         self.assertEqual(ws, custom_home)
         self.assertTrue(os.path.isdir(ws))
@@ -1729,9 +1729,9 @@ class CodeReviewRegressionTests(unittest.TestCase):
                 self.assertNotIn(digest, forbidden_hashes, f"Forbidden token found in {rel}")
 
     def test_subtask_duplicates_checked_by_jira_key_only_never_by_title(self):
-        from jira2ado.cli import _duplicate_report
-        from jira2ado.importer import check_duplicates
-        from jira2ado.util import Journal, read_json
+        from quarto.cli import _duplicate_report
+        from quarto.importer import check_duplicates
+        from quarto.util import Journal, read_json
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         cfg = cfg_for(folder)
@@ -1779,8 +1779,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertEqual(possible2, {})
 
     def test_mode2_board_and_mode3_project_prepare_and_unsprinted_tickets(self):
-        from jira2ado.exporter import search_run_keys
-        from jira2ado.jira_client import JiraClient
+        from quarto.exporter import search_run_keys
+        from quarto.jira_client import JiraClient
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         cfg = cfg_for(folder)
@@ -1850,7 +1850,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertEqual(sp_iters[-1], "Shop\\Sprint 2-A")
 
     def test_batched_import_pause_and_resume(self):
-        from jira2ado.importer import pause_path
+        from quarto.importer import pause_path
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         cfg = cfg_for(folder)
@@ -1883,8 +1883,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
         self.assertEqual(len(ado.items), 2)
 
     def test_round3_export_reexports_only_tickets_whose_updated_timestamp_changed(self):
-        from jira2ado.exporter import export
-        from jira2ado.util import read_json, write_json
+        from quarto.exporter import export
+        from quarto.util import read_json, write_json
         folder = tempfile.mkdtemp()
         state_dir = tempfile.mkdtemp()
         cfg = cfg_for(folder)
@@ -2011,7 +2011,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_round3_same_name_sprints_with_different_ids_are_not_merged(self):
         # Serious #4: Two "Sprint 1"s on different boards, a year apart (ID 10 in 2024, ID 20 in 2025)
         # must create two distinct iterations with their own dates and keep their tickets separate.
-        from jira2ado.util import write_json
+        from quarto.util import write_json
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         iss1 = sample.story()
@@ -2044,7 +2044,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_round3_batched_import_reuses_duplicates_and_verifies_only_current_batch(self):
         # Serious #5: Across batches, duplicate search runs once (not repeated per batch) and
         # batch-scoped verify checks only the keys in the current batch.
-        from jira2ado.util import write_json
+        from quarto.util import write_json
         folder = tempfile.mkdtemp()
         write_json(os.path.join(folder, "meta.json"), sample.META)
         keys = [f"DEMO-{i}" for i in range(1, 7)]
@@ -2082,7 +2082,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_round3_stable_run_folders_and_tick_order_independence(self):
         # Medium #6: Run folder paths stay stable when include_done or board name changes,
         # and sprint folder names are independent of sprint tick order.
-        from jira2ado.util import sprint_folder_slug
+        from quarto.util import sprint_folder_slug
         s1 = {"id": 101, "name": "Sprint 27"}
         s2 = {"id": 102, "name": "Sprint 28"}
         self.assertEqual(sprint_folder_slug([s1, s2]), sprint_folder_slug([s2, s1]))
@@ -2092,8 +2092,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
         # 1) Two attachments with the same filename have distinct IDs and are both attached.
         # 2) Comments reformatted by ADO (e.g. <br/> instead of <br>) are not duplicated on re-sync.
         # 3) Rolling back a sync does not undo edits made in ADO after the sync or write read-only System.* fields.
-        from jira2ado.importer import rollback_run
-        from jira2ado.util import write_json
+        from quarto.importer import rollback_run
+        from quarto.util import write_json
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         os.makedirs(os.path.join(folder, "attachments", "DEMO-1"), exist_ok=True)
@@ -2141,8 +2141,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_sql_server_xx5z_rounding_bump_and_changeddate_auto_retry(self):
         # Group A fix: .xx5Z timestamps rounded to .xx7Z by SQL Server DATETIME never collide,
         # and a server-side ChangedDate rejection auto-recovers by reading live System.ChangedDate + 20ms.
-        from jira2ado.ado_client import AdoError
-        from jira2ado.util import bump, iso, parse_dt, write_json
+        from quarto.ado_client import AdoError
+        from quarto.util import bump, iso, parse_dt, write_json
 
         last = parse_dt("2023-08-24T21:02:44.325Z")
         nxt = bump(parse_dt("2023-08-24T21:02:44.100Z"), last)
@@ -2192,7 +2192,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
         ado = sample.FakeAdo()
         report = os.path.join(folder, "verify.csv")
 
-        with patch("jira2ado.importer.MAX_ATTACHMENT", 4), patch("jira2ado.verify.MAX_ATTACHMENT", 4):
+        with patch("quarto.importer.MAX_ATTACHMENT", 4), patch("quarto.verify.MAX_ATTACHMENT", 4):
             stats = import_items(ado, cfg, USERS, log=q)
             import_links(ado, cfg, log=q)
             total, bad = verify(ado, cfg, USERS, report, log=q)
@@ -2211,8 +2211,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_noop_intermediate_revisions_coalesced_and_in_progress_run_preserved(self):
         # Group B + Planner speedup: back-to-back Jira sub-statuses mapping to the same ADO state
         # are coalesced on fresh runs, while an already-started run without coalesced_noops preserves indices.
-        from jira2ado.importer import load_meta
-        from jira2ado.util import write_json
+        from quarto.importer import load_meta
+        from quarto.util import write_json
 
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
@@ -2248,8 +2248,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
 
     def test_parallel_import_workers_and_bulk_batch_verify_and_export(self):
         import threading
-        from jira2ado.exporter import export
-        from jira2ado.util import write_json
+        from quarto.exporter import export
+        from quarto.util import write_json
 
         # 1. Bulk export via search_issues_batch
         exp_dir = tempfile.mkdtemp()
@@ -2321,7 +2321,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_round4_partial_only_import_preserves_sprint_collision_disambiguation(self):
         # Finding #2 & #8: Importing only={"DEMO-1"} when DEMO-2 has a colliding "Sprint 1" (id 20)
         # still creates the suffixed iteration "Sprint 1 (10)" and surfaces subscription warnings.
-        from jira2ado.util import write_json
+        from quarto.util import write_json
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         iss1 = sample.story()
@@ -2355,8 +2355,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_round4_delta_export_retries_missing_attachment_on_unchanged_ticket(self):
         # Finding #4: If an attachment download fails on Export 1, Export 2 retries that ticket even
         # when its Jira updated timestamp has not changed.
-        from jira2ado.exporter import export
-        from jira2ado.util import read_json
+        from quarto.exporter import export
+        from quarto.util import read_json
         folder = tempfile.mkdtemp()
         cfg = cfg_for(folder)
         cfg["jira"]["jql"] = 'project = "DEMO"'
@@ -2411,8 +2411,8 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_round4_journal_persists_planning_mode_without_preview_json_and_sync_rollback_keeps_manual_links(self):
         # Finding #9 & #1: Legacy journal without preview.json still preserves uncoalesced revisions,
         # and sync rollback removes only migration-added relations while preserving post-sync manual links.
-        from jira2ado.importer import load_meta, rollback_run
-        from jira2ado.util import write_json
+        from quarto.importer import load_meta, rollback_run
+        from quarto.util import write_json
         folder = tempfile.mkdtemp()
         sample.write_export(folder)
         iss = sample.subtask()
@@ -2462,7 +2462,7 @@ class CodeReviewRegressionTests(unittest.TestCase):
     def test_round4_jira_download_rejects_foreign_host_and_surfaces_non_404_errors(self):
         # Finding #5 & #6: JiraClient.download refuses non-Jira hosts, and worklogs/remote_links
         # return [] on 404 (disabled feature) while surfacing 500/401 server errors.
-        from jira2ado.jira_client import JiraClient
+        from quarto.jira_client import JiraClient
 
         class MockResp:
             def __init__(self, code, payload="{}"):
@@ -2565,8 +2565,8 @@ class BoardsToAreasAndTeamsTests(unittest.TestCase):
         return TeamFakeAdo()
 
     def test_multi_board_scrum_kanban_orphan_tiebreak_and_team_auto_creation(self):
-        from jira2ado.exporter import export
-        from jira2ado.util import read_json
+        from quarto.exporter import export
+        from quarto.util import read_json
 
         # 3 boards: broad All-Project board (4 tickets), Scrum Alpha (2 tickets), Kanban Ops (1 ticket)
         s_alpha_1 = {"id": 101, "name": "Sprint 1", "state": "active",
@@ -2746,8 +2746,8 @@ class BoardsToAreasAndTeamsTests(unittest.TestCase):
         self.assertFalse(any("did not add up" in w for w in pl_hist.warnings))
 
     def test_duplicate_board_names_and_zero_board_fallback(self):
-        from jira2ado.exporter import export
-        from jira2ado.util import read_json
+        from quarto.exporter import export
+        from quarto.util import read_json
 
         # 1. Duplicate sanitized board names ("Platform/Core" and "Platform&Core") get (id) suffix
         iss = self._make_issue("DUP-1", "Story", "In Progress")
@@ -2814,8 +2814,8 @@ class BoardsToAreasAndTeamsTests(unittest.TestCase):
         self.assertEqual(f["System.IterationPath"], "Shop\\Release 9")
 
     def test_team_403_permission_error_warns_and_continues_importing_areas_and_items(self):
-        from jira2ado.ado_client import AdoError
-        from jira2ado.util import write_json
+        from quarto.ado_client import AdoError
+        from quarto.util import write_json
 
         folder = tempfile.mkdtemp()
         meta = {
@@ -2848,8 +2848,8 @@ class BoardsToAreasAndTeamsTests(unittest.TestCase):
         self.assertTrue(any("Project and Team" in w for w in stats["warnings"]))
 
     def test_existing_team_and_existing_nodes_not_recreated_and_ado_client_team_apis(self):
-        from jira2ado.ado_client import AdoClient
-        from jira2ado.util import write_json
+        from quarto.ado_client import AdoClient
+        from quarto.util import write_json
 
         # 1. Importer skips creating already-existing areas/iterations/teams and uses replace=False for pre-existing team
         folder = tempfile.mkdtemp()
@@ -2932,7 +2932,7 @@ class BoardsToAreasAndTeamsTests(unittest.TestCase):
         import io
         from contextlib import redirect_stderr, redirect_stdout
         import yaml
-        from jira2ado import ado_client, cli, jira_client
+        from quarto import ado_client, cli, jira_client
 
         tmp = tempfile.mkdtemp()
         old_cwd = os.getcwd()
@@ -2993,7 +2993,7 @@ class ZephyrSquadAndSecretsTests(unittest.TestCase):
 
     def test_git_ignores_secret_files_and_dotenv_auto_connect_never_leaks_tokens(self):
         import subprocess
-        from jira2ado.ui import server
+        from quarto.ui import server
 
         repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for secret_name in (".env", ".secrets.env", "secrets.env", "secrets.yaml"):
@@ -3074,7 +3074,7 @@ class ZephyrSquadAndSecretsTests(unittest.TestCase):
         import base64
         import hashlib
         import hmac
-        from jira2ado.zephyr_client import ZephyrError, ZephyrSquadClient, build_jwt
+        from quarto.zephyr_client import ZephyrError, ZephyrSquadClient, build_jwt
 
         tok = build_jwt(
             "my-access-key", "my-secret-key", "acc-123", "GET",
@@ -3104,7 +3104,7 @@ class ZephyrSquadAndSecretsTests(unittest.TestCase):
 
     def test_steps_to_ado_xml_action_validate_data_escaping_and_attachments(self):
         import xml.etree.ElementTree as ET
-        from jira2ado.zephyr import step_attachment_key, step_count_from_ado_xml, steps_to_ado_xml
+        from quarto.zephyr import step_attachment_key, step_count_from_ado_xml, steps_to_ado_xml
 
         self.assertIsNone(steps_to_ado_xml([]))
         steps = [
@@ -3139,8 +3139,8 @@ class ZephyrSquadAndSecretsTests(unittest.TestCase):
         self.assertEqual(p1[1], "")
 
     def test_full_zephyr_pipeline_steps_attachments_tested_by_links_test_plans_and_verify(self):
-        from jira2ado.exporter import export
-        from jira2ado.importer import import_test_plans
+        from quarto.exporter import export
+        from quarto.importer import import_test_plans
 
         def mk(key, itype, summary, links=None, rlinks=None, iid="1001"):
             return {
@@ -3334,9 +3334,9 @@ class ZephyrSquadAndSecretsTests(unittest.TestCase):
         self.assertEqual((total, bad), (3, 0))
 
     def test_test_plans_403_warns_cleanly_and_sync_zephyr_backfills_idempotently(self):
-        from jira2ado.ado_client import AdoError
-        from jira2ado.importer import import_test_plans, sync_zephyr_steps
-        from jira2ado.util import write_json
+        from quarto.ado_client import AdoError
+        from quarto.importer import import_test_plans, sync_zephyr_steps
+        from quarto.util import write_json
 
         folder = tempfile.mkdtemp()
         write_json(os.path.join(folder, "meta.json"), sample.META)
@@ -3414,8 +3414,8 @@ class ZephyrSquadAndSecretsTests(unittest.TestCase):
         self.assertEqual((res2["updated"], res2["unchanged"], res2["links_added"]), (0, 1, 0))
 
     def test_adf_table_macro_fallback_and_ado_test_plan_rest_client(self):
-        from jira2ado.ado_client import AdoClient
-        from jira2ado.planner import _description_html
+        from quarto.ado_client import AdoClient
+        from quarto.planner import _description_html
 
         iss = {
             "fields": {

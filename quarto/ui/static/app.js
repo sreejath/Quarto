@@ -1,4 +1,4 @@
-/* jira2ado browser view. Talks only to the local helper that served this page. */
+/* quarto browser view. Talks only to the local helper that served this page. */
 "use strict";
 
 const HASH_PARAMS = new URLSearchParams(location.hash.slice(1));
@@ -46,7 +46,7 @@ const S = {
 /* ------------------------------------------------------------ server calls */
 
 async function api(path, body) {
-  const opts = { headers: { "X-Jira2ado-Key": KEY } };
+  const opts = { headers: { "X-Quarto-Key": KEY } };
   if (body !== undefined) {
     opts.method = "POST";
     opts.headers["Content-Type"] = "application/json";
@@ -56,7 +56,7 @@ async function api(path, body) {
   try {
     res = await fetch(path, opts);
   } catch (e) {
-    throw new Error("The local jira2ado server is not responding. Start it again, then reload this page.");
+    throw new Error("The local quarto server is not responding. Start it again, then reload this page.");
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `The request failed (${res.status}).`);
@@ -67,7 +67,7 @@ async function downloadServerFile(path, filename) {
   let res;
   try {
     res = await fetch(`/api/download?path=${encodeURIComponent(path)}`, {
-      headers: { "X-Jira2ado-Key": KEY },
+      headers: { "X-Quarto-Key": KEY },
     });
   } catch (e) {
     toast("Could not reach the local server to download the file.");
@@ -1430,7 +1430,7 @@ function panelHtml(tab, pv) {
     const hasRecommended = pv.statuses.some((s) => s.needs_attention || s.match_reason === "fuzzy" || s.match_reason === "category");
     const banner = hasRecommended ? `
       <div class="banner warn">
-        <p><b>★ Highlighted Statuses:</b> Rows marked with <b>★ Recommended</b> do not have an identically named state on the destination work item type in <b>${esc(pv.project)}</b>. Jira2ADO has highlighted the closest matching Azure DevOps state automatically. You can override any status using the dropdown in the ticket table above, or add custom states in Azure DevOps (<i>Organization Settings → Process</i>) and click <b>Validate again</b>.</p>
+        <p><b>★ Highlighted Statuses:</b> Rows marked with <b>★ Recommended</b> do not have an identically named state on the destination work item type in <b>${esc(pv.project)}</b>. Quarto has highlighted the closest matching Azure DevOps state automatically. You can override any status using the dropdown in the ticket table above, or add custom states in Azure DevOps (<i>Organization Settings → Process</i>) and click <b>Validate again</b>.</p>
       </div>` : "";
     return `${banner}<table><thead><tr><th>ADO Work Item Type</th><th>Jira Status</th><th>Target ADO State</th><th>Match Type</th><th>Tickets</th><th>Status Guidance</th></tr></thead><tbody>
       ${pv.statuses.map((s) => {
@@ -1517,12 +1517,12 @@ function renderDrawer() {
   if (S.drawerMode === "help") {
     drawer.innerHTML = `
       <div class="drawer-head">
-        <h2>Jira2ADO — Help &amp; Setup Guide</h2>
+        <h2>Quarto — Help &amp; Setup Guide</h2>
         <button type="button" class="btn secondary btn-sm" data-action="close-drawer">Close</button>
       </div>
       <div class="drawer-body">
         <h3>1. Required Credentials &amp; Minimum Permissions</h3>
-        <p>Jira2ADO is <b>100% read-only on Jira</b> and writes only to your chosen Azure DevOps destination project:</p>
+        <p>Quarto is <b>100% read-only on Jira</b> and writes only to your chosen Azure DevOps destination project:</p>
         <ul>
           <li><b>Atlassian Jira URL</b>: <code>https://your-org.atlassian.net</code> (HTTPS required)</li>
           <li><b>Jira API Token</b>: Create one at <code>https://id.atlassian.com/manage-profile/security/api-tokens</code> (only read access to the source project and board is needed)</li>
@@ -1539,7 +1539,7 @@ function renderDrawer() {
         </ul>
 
         <h3>2. Enabling "Bypass Rules" in Azure DevOps</h3>
-        <p>Jira2ADO uses the Azure DevOps <code>bypassRules=true</code> flag so that migrated work items preserve their original Jira <code>CreatedDate</code>, <code>ChangedDate</code>, <code>ClosedDate</code>, and workflow states across all revisions:</p>
+        <p>Quarto uses the Azure DevOps <code>bypassRules=true</code> flag so that migrated work items preserve their original Jira <code>CreatedDate</code>, <code>ChangedDate</code>, <code>ClosedDate</code>, and workflow states across all revisions:</p>
         <ol>
           <li>Open your Azure DevOps Project → <b>Project Settings</b> → <b>Permissions</b> → <b>Users</b>.</li>
           <li>Select your user account.</li>
@@ -1547,15 +1547,15 @@ function renderDrawer() {
         </ol>
 
         <h3>3. Dynamic Status Discovery &amp; Highlighted Recommendations</h3>
-        <p>When you click <b>Validate</b>, Jira2ADO queries both Jira and your destination Azure DevOps project for all live statuses and state categories:</p>
+        <p>When you click <b>Validate</b>, Quarto queries both Jira and your destination Azure DevOps project for all live statuses and state categories:</p>
         <ul>
           <li><b>Identical Match (✓)</b>: If your ADO project has a state with the exact same name as Jira, it is selected automatically.</li>
-          <li><b>Highlighted Recommendation (★)</b>: When no identically named state exists in ADO, Jira2ADO highlights the closest matching state with a <b>★ Recommended</b> badge in both the ticket dropdown and the <i>Statuses</i> tab.</li>
+          <li><b>Highlighted Recommendation (★)</b>: When no identically named state exists in ADO, Quarto highlights the closest matching state with a <b>★ Recommended</b> badge in both the ticket dropdown and the <i>Statuses</i> tab.</li>
           <li><b>Interactive Override</b>: Change any ticket's target state via its dropdown, or click <i>Apply to all</i> to update every ticket with that Jira status.</li>
         </ul>
 
         <h3>4. Duplicate Detection &amp; Safe Resolution</h3>
-        <p>Jira2ADO checks three levels of duplicates before creating anything:</p>
+        <p>Quarto checks three levels of duplicates before creating anything:</p>
         <ul>
           <li><b>Exact Jira Key Match</b>: An item in ADO already carries the exact Jira key in its tags or <code>Custom.JiraKey</code> field.</li>
           <li><b>Possible Duplicate</b>: An ADO item's title contains the Jira key or matches the Jira summary.</li>
@@ -2412,14 +2412,14 @@ $("#quit").addEventListener("click", async () => {
   if (busy()) { toast("A run is still going. Stop it first, or wait for it to finish."); return; }
   try { await api("/api/quit", {}); } catch (e) { /* stopping */ }
   S.quitting = true;
-  document.body.innerHTML = `<div class="stopped-page"><h1>jira2ado has stopped</h1>
+  document.body.innerHTML = `<div class="stopped-page"><h1>quarto has stopped</h1>
     <p>All tokens have been cleared from memory. You can close this browser tab.</p></div>`;
 });
 
 async function init() {
   if (!KEY) {
-    document.body.innerHTML = `<div class="stopped-page"><h1>Open jira2ado from its launcher</h1>
-      <p>This page requires the session key printed in the terminal window that started jira2ado.</p></div>`;
+    document.body.innerHTML = `<div class="stopped-page"><h1>Open quarto from its launcher</h1>
+      <p>This page requires the session key printed in the terminal window that started quarto.</p></div>`;
     return;
   }
   try {

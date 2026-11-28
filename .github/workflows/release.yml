@@ -36,12 +36,12 @@ jobs:
         include:
           - os: windows-latest
             target: windows
-            asset_path: dist/Jira2ADO-Windows.exe
-            asset_name: Jira2ADO-Windows.exe
+            asset_path: dist/Quarto-Windows.exe
+            asset_name: Quarto-Windows.exe
           - os: macos-latest
             target: macos
-            asset_path: dist/Jira2ADO-macOS.dmg
-            asset_name: Jira2ADO-macOS.dmg
+            asset_path: dist/Quarto-macOS.dmg
+            asset_name: Quarto-macOS.dmg
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -75,5 +75,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/Jira2ADO-Windows.exe
-            release-assets/Jira2ADO-macOS.dmg
+            release-assets/Quarto-Windows.exe
+            release-assets/Quarto-macOS.dmg

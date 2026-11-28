@@ -1,4 +1,4 @@
-# Default base configuration template for Jira2ADO.
+# Default base configuration template for Quarto.
 # Connection URLs (jira.base_url and ado.org_url) can be configured directly
 # in the browser UI, via .env (JIRA_BASE_URL, ADO_ORG_URL), or in configs/local/base.yaml.
 # Statuses and work item types are discovered live from Jira and Azure DevOps during validation.

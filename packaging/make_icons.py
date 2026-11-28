@@ -1,4 +1,4 @@
-"""Generate crisp macOS (.icns) and Windows (.ico) app icons from the Jira2ADO logo geometry."""
+"""Generate crisp macOS (.icns) and Windows (.ico) app icons from the Quarto logo geometry."""
 import math
 import os
 import shutil
@@ -47,7 +47,7 @@ def _encode_png(width, height, rgba_bytes):
 
 
 def render_logo_png(size, path):
-    """Render the Jira2ADO 64x64 logo at size x size with 4x4 supersampling."""
+    """Render the Quarto 64x64 logo at size x size with 4x4 supersampling."""
     chevron = [(14, 32), (24, 22), (29, 27), (24, 32), (29, 37), (24, 42)]
     shield = [(44, 18), (52, 22), (52, 42), (44, 46)]
     bg = (15, 23, 42)       # #0F172A
@@ -116,11 +116,11 @@ def build_ico(ico_path, png_paths_by_size):
 
 
 def generate(assets_dir):
-    tmp = tempfile.mkdtemp(prefix="jira2ado-icons-")
+    tmp = tempfile.mkdtemp(prefix="quarto-icons-")
     try:
         master = os.path.join(tmp, "icon_512.png")
         render_logo_png(512, master)
-        iconset = os.path.join(tmp, "Jira2ADO.iconset")
+        iconset = os.path.join(tmp, "Quarto.iconset")
         os.makedirs(iconset, exist_ok=True)
         needed = {16: "icon_16x16.png", 32: "icon_32x32.png", 48: None, 64: None,
                   128: "icon_128x128.png", 256: "icon_256x256.png", 512: "icon_512x512.png"}
@@ -140,9 +140,9 @@ def generate(assets_dir):
         for lo, hi in ((16, 32), (32, 64), (128, 256), (256, 512)):
             shutil.copy2(sized[hi], os.path.join(iconset, f"icon_{lo}x{lo}@2x.png"))
 
-        build_ico(os.path.join(assets_dir, "Jira2ADO.ico"), {sz: sized[sz] for sz in (16, 32, 48, 256)})
+        build_ico(os.path.join(assets_dir, "Quarto.ico"), {sz: sized[sz] for sz in (16, 32, 48, 256)})
         if shutil.which("iconutil"):
-            subprocess.run(["iconutil", "-c", "icns", iconset, "-o", os.path.join(assets_dir, "Jira2ADO.icns")],
+            subprocess.run(["iconutil", "-c", "icns", iconset, "-o", os.path.join(assets_dir, "Quarto.icns")],
                            check=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

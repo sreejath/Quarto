@@ -1,7 +1,7 @@
 """A small fake Jira export used by the tests."""
 import os
 
-from jira2ado.util import write_json
+from quarto.util import write_json
 
 U1 = {"accountId": "acc-1", "displayName": "Ana Lee", "emailAddress": "ana@example.com"}
 U2 = {"accountId": "acc-2", "displayName": "Raj Rao"}
@@ -99,7 +99,7 @@ class FakeAdo:
         self.fail_after, self.calls = fail_after, 0
 
     def _apply(self, it, ops):
-        from jira2ado.ado_client import AdoError
+        from quarto.ado_client import AdoError
         self.calls += 1
         if self.fail_after is not None and self.calls > self.fail_after:
             raise AdoError("simulated outage", 503)
@@ -194,7 +194,7 @@ class FakeAdo:
         return None if self.type_field_map is None else self.type_field_map.get(wit, set())
 
     def find_duplicates(self, entries, key_field=None, titles=True):
-        from jira2ado.duplicates import classify
+        from quarto.duplicates import classify
         self.key_searches = getattr(self, "key_searches", []) + [(sorted(k for k, _ in entries), key_field)]
         items = [{"id": i, "fields": it["fields"]} for i, it in sorted(self.items.items())]
         return classify(entries, items, key_field, titles)

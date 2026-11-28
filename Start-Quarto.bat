@@ -1,7 +1,7 @@
 @echo off
-REM Double-click to start Jira2ADO in your default browser on Windows.
+REM Double-click to start Quarto in your default browser on Windows.
 cd /d "%~dp0"
-echo Starting Jira2ADO...
+echo Starting Quarto...
 if not exist ".venv" (
     echo Setting up Python virtual environment (first run only)...
     python -m venv .venv
@@ -13,5 +13,5 @@ if errorlevel 1 (
     python -m pip install --quiet --upgrade pip
     python -m pip install --quiet -r requirements.txt
 )
-python -m jira2ado.ui
+python -m quarto.ui
 pause

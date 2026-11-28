@@ -1,12 +1,12 @@
 #!/bin/bash
 # Migrate Jira tickets to Azure DevOps: check tokens, export, preview, then (after you confirm) import and verify.
-# Run from the jira2ado folder. Type  bash run.sh --help  for the options.
+# Run from the quarto folder. Type  bash run.sh --help  for the options.
 set -e
 cd "$(dirname "$0")"
 
 usage() {
   cat <<'USAGE'
-Usage, from the jira2ado folder:
+Usage, from the quarto folder:
   bash run.sh --from PROJ --to "Sandbox" --sprint "Platform Sprint 1"
 
   --from KEY         Jira project to export from, for example PROJ.
@@ -118,34 +118,34 @@ if [ -z "$C" ]; then
   for S in "${SPRINTS[@]}"; do PREP+=(--sprint "$S"); done
   if [ -n "$ITERATION" ]; then PREP+=(--iteration "$ITERATION"); fi
   if [ -n "$INCLUDE_DONE" ]; then PREP+=(--include-done); fi
-  C=$(python -m jira2ado prepare "${PREP[@]}")
+  C=$(python -m quarto prepare "${PREP[@]}")
 fi
 
 echo
 echo "== Checking the tokens and the query"
-python -m jira2ado -c "$C" access
-PROJECT=$(python -m jira2ado -c "$C" show ado.project)
-TARGET=$(python -m jira2ado -c "$C" show ado.area_path)
+python -m quarto -c "$C" access
+PROJECT=$(python -m quarto -c "$C" show ado.project)
+TARGET=$(python -m quarto -c "$C" show ado.area_path)
 [ -n "$TARGET" ] || TARGET="$PROJECT"
 echo
-echo "Jira query: $(python -m jira2ado -c "$C" show jira.jql)"
+echo "Jira query: $(python -m quarto -c "$C" show jira.jql)"
 echo "Target:     $TARGET"
 echo "Settings:   $C"
 
 echo
 echo "== Step 1 of 4: export from Jira"
-python -m jira2ado -c "$C" export --force
-python -m jira2ado -c "$C" users
+python -m quarto -c "$C" export --force
+python -m quarto -c "$C" users
 
 echo
 echo "== Step 2 of 4: preview. Nothing is sent to Azure DevOps"
-python -m jira2ado -c "$C" check --online
-python -m jira2ado -c "$C" plan
+python -m quarto -c "$C" check --online
+python -m quarto -c "$C" plan
 
 # Throw away anything typed while the steps above ran, so a stray Return is not taken as the answer.
 while read -r -t 1 -n 10000 DISCARD 2>/dev/null; do :; done
 DUPLICATES=()
-POSSIBLE=$(python -m jira2ado -c "$C" duplicates)
+POSSIBLE=$(python -m quarto -c "$C" duplicates)
 if [ "$POSSIBLE" != "0" ]; then
   echo
   echo "$POSSIBLE ticket(s) may already be in $PROJECT (see 'possible duplicate' in the preview above)."
@@ -161,7 +161,7 @@ if [ "$POSSIBLE" != "0" ]; then
   fi
 fi
 echo
-if [ "$(python -m jira2ado -c "$C" show ado.confirm_with_project_name)" = "true" ]; then
+if [ "$(python -m quarto -c "$C" show ado.confirm_with_project_name)" = "true" ]; then
   WANT="$PROJECT"
   read -r -p "To create these work items in $PROJECT, type the project name exactly: " ANSWER
 else
@@ -175,11 +175,11 @@ fi
 
 echo
 echo "== Step 3 of 4: import"
-python -m jira2ado -c "$C" import "${DUPLICATES[@]}"
+python -m quarto -c "$C" import "${DUPLICATES[@]}"
 
 echo
 echo "== Step 4 of 4: verify"
 REPORT="$(dirname "$C")/verify.csv"
-python -m jira2ado -c "$C" verify --report "$REPORT" || true
+python -m quarto -c "$C" verify --report "$REPORT" || true
 echo
 echo "Finished. The report is in $REPORT"

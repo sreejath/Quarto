@@ -10,7 +10,7 @@ BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.ab
 def frozen_workspace_dir():
     """Return a writable workspace directory for standalone packaged builds so
     read-only macOS .app / App Translocation or Program Files never fail."""
-    custom = (os.environ.get("JIRA2ADO_HOME") or "").strip()
+    custom = (os.environ.get("QUARTO_HOME") or "").strip()
     if custom:
         path = os.path.abspath(os.path.expanduser(custom))
         os.makedirs(path, exist_ok=True)
@@ -18,7 +18,7 @@ def frozen_workspace_dir():
     home = os.path.expanduser("~")
     docs = os.path.join(home, "Documents")
     base = docs if os.path.isdir(docs) and os.access(docs, os.W_OK) else home
-    path = os.path.join(base, "Jira2ADO")
+    path = os.path.join(base, "Quarto")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -174,7 +174,7 @@ def _dotenv_candidates(path=None):
     if path:
         return [path]
     cands = []
-    env_override = (os.environ.get("JIRA2ADO_SECRETS_FILE") or "").strip()
+    env_override = (os.environ.get("QUARTO_SECRETS_FILE") or "").strip()
     if env_override:
         cands.append(os.path.expanduser(env_override))
     for name in (".env", ".secrets.env"):

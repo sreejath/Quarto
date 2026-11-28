@@ -3,26 +3,32 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>jira2ado — Select Migration Mode</title>
+  <title>quarto — Mode 3: Whole Project Migration</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
 </head>
-<body data-page-mode="hub">
+<body data-page-mode="project">
   <header class="bar">
-    <div class="brand"><img src="/logo.svg" alt="" width="28" height="28" class="brand-logo">jira2ado<span class="brand-sub">Jira Cloud to Azure DevOps Migration Suite</span></div>
+    <div class="brand"><img src="/logo.svg" alt="" width="28" height="28" class="brand-logo">quarto<span class="mode-pill">Mode 3: Whole Project Migration</span></div>
     <div class="who" id="who"></div>
     <div class="bar-actions">
+      <button class="btn secondary btn-sm" type="button" data-action="go-mode" data-href="/">← Mode Selection</button>
+      <button class="btn secondary btn-sm" type="button" data-action="open-runs-drawer">↺ Recover Run</button>
       <button class="btn secondary btn-sm" id="help-btn" type="button" data-action="open-help">? Help &amp; Setup Guide</button>
       <button class="quiet" id="quit" type="button">Quit</button>
     </div>
   </header>
   <main class="layout" id="app">
-    <aside class="rail" aria-label="Connection settings">
+    <aside class="rail" aria-label="Run settings">
       <ol class="steps">
         <li class="step" id="step-connect"></li>
+        <li class="step" id="step-tickets"></li>
+        <li class="step" id="step-destination"></li>
+        <li class="step" id="step-check"></li>
+        <li class="step" id="step-import"></li>
       </ol>
     </aside>
-    <section class="manifest" id="manifest" aria-label="Migration Mode Selection"></section>
+    <section class="manifest" id="manifest" aria-label="Tickets in this run"></section>
   </main>
   <div class="drawer-backdrop hidden" id="drawer-backdrop" data-action="close-drawer"></div>
   <aside class="drawer hidden" id="drawer" aria-label="Details drawer"></aside>
